@@ -98,7 +98,7 @@ from a `oneshot` user unit.
 | `WAKE_AGENTS` | the local agent | Agents that may manage their own clocks over loom's piece API |
 | `WAKE_FIRE` | `$WAKE_DATA/fire`, else `local` | `local`, `house` or `mixed` |
 | `WAKE_MODEL` | `claude-sonnet-5` | The model a wake runs on unless it names one |
-| `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}", "--dangerously-skip-permissions"]` | The session a local wake starts. A JSON list (or a command line); `{prompt}` and `{model}` are whole arguments |
+| `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}"]` | The session a local wake starts. A JSON list (or a command line); `{prompt}` and `{model}` are whole arguments. The default can stop and ask for permission; an unattended agent that has decided otherwise adds its own flags here |
 | `WAKE_ALERT_COMMAND` | none (the log only) | How the clock reaches the owner when a wake keeps failing; the message is its last argument |
 | `WAKE_FIRE_GATE` | none | A command run before any wake: non-zero defers every wake an hour. For a standby that mirrors a primary and must never run the same lanes |
 | `WAKE_PREAMBLE_FILE` | the piece's own | The words every wake starts with: `{name} {where} {id} {kind} {created} {note} {lanes} {body}` |

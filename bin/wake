@@ -1322,7 +1322,9 @@ def house_ready(entry, body):
 
 
 # The session a local wake starts: {prompt} and {model} are filled in (a whole argument each).
-SESSION_DEFAULT = ["claude", "--bg", "{prompt}", "--model", "{model}", "--dangerously-skip-permissions"]
+# Safe by default: a session that can stop and ask. An agent that runs unattended and has decided to skip permission
+# prompts sets WAKE_SESSION_COMMAND itself, so that choice is written down where it's made.
+SESSION_DEFAULT = ["claude", "--bg", "{prompt}", "--model", "{model}"]
 
 
 def session_argv(prompt, model):

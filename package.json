@@ -68,7 +68,7 @@
       {
         "name": "WAKE_SESSION_COMMAND",
         "label": "The session a local wake starts",
-        "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\", \"--dangerously-skip-permissions\"]"
+        "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\"]"
       },
       {
         "name": "WAKE_ALERT_COMMAND",
