@@ -1,0 +1,101 @@
+{
+  "name": "loom-clock",
+  "version": "0.1.0",
+  "private": true,
+  "description": "loom's clock piece: an agent's self-set wakes, recurring schedules, the household's lanes and agent-to-agent relays, on systemd user timers",
+  "bin": {
+    "loom-clock": "bin/wake",
+    "wake": "bin/wake"
+  },
+  "files": [
+    "bin/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "python3 test/test_wake.py && sh test/smoke.sh"
+  },
+  "license": "AGPL-3.0-or-later",
+  "loom": {
+    "name": "clock",
+    "role": "clock",
+    "label": "Clock",
+    "description": "Wakes an agent: self-set alarms, recurring schedules, the household's lanes assigned to an agent, and relays between agents, each run in a house or as a session here.",
+    "settings": [
+      {
+        "name": "WAKE_LOCAL_AGENT",
+        "label": "The agent this machine runs sessions for",
+        "hint": "an agent's id; its lane files are in the repo below, and its wakes may run here. Every other agent's run in houses",
+        "required": true
+      },
+      {
+        "name": "WAKE_REPO",
+        "label": "That agent's repo",
+        "hint": "an absolute path: its lane files, and where its sessions start (default: the home directory)"
+      },
+      {
+        "name": "WAKE_LANE_DIRS",
+        "label": "Lane directories in the repo",
+        "hint": "comma-separated; a house's -f may name only a .md file under one of these, and the page lists the first",
+        "default": "routines,briefs"
+      },
+      {
+        "name": "WAKE_DATA",
+        "label": "Where the clocks are kept",
+        "hint": "a directory: one per agent (spool, schedules, log), and the household's lanes and relay log",
+        "default": "${LOOM_PIECE_HOME}/data"
+      },
+      {
+        "name": "WAKE_AGENTS",
+        "label": "Agents that may set their own wakes over loom's API",
+        "hint": "comma-separated agent ids (default: the local agent)"
+      },
+      {
+        "name": "WAKE_FIRE",
+        "label": "Where the local agent's wakes run",
+        "kind": "choice",
+        "options": [
+          { "value": "local", "label": "Here, as a session" },
+          { "value": "house", "label": "In a house (loom-box)" },
+          { "value": "mixed", "label": "In a house when its prompt says it's ready, else here" }
+        ]
+      },
+      {
+        "name": "WAKE_MODEL",
+        "label": "The model a wake runs on, unless it names one",
+        "default": "claude-sonnet-5"
+      },
+      {
+        "name": "WAKE_SESSION_COMMAND",
+        "label": "The session a local wake starts",
+        "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\", \"--dangerously-skip-permissions\"]"
+      },
+      {
+        "name": "WAKE_ALERT_COMMAND",
+        "label": "How the clock reaches you when a wake keeps failing",
+        "hint": "a JSON list; the message is added as its last argument (a chat webhook script, a push). Without it, only the log"
+      },
+      {
+        "name": "WAKE_FIRE_GATE",
+        "label": "A check before any wake runs",
+        "hint": "a JSON list; a non-zero exit defers every wake an hour (a standby that must not run its primary's lanes)"
+      },
+      {
+        "name": "WAKE_PREAMBLE_FILE",
+        "label": "The words every wake starts with",
+        "hint": "a file with {name} {where} {id} {kind} {created} {note} {lanes} {body}; default: the piece's own"
+      },
+      {
+        "name": "WAKE_RELAY_HEADS_UP",
+        "label": "A relay thread this long is a heads-up",
+        "hint": "messages in one thread within a day (default 8)"
+      }
+    ],
+    "services": [
+      {
+        "name": "run",
+        "argv": ["loom-clock", "run"]
+      }
+    ]
+  }
+}
