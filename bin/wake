@@ -1798,6 +1798,11 @@ def until_text(dt, now):
     return f"in {round(hours / 24)} days"
 
 
+# How much of the next wake's words the tile carries: loom's app wraps a tile's line to three lines (it cut it at one
+# before, and this was 40 so the cut came here, mid-word: "Art: Checking a pull request is moving, roun…").
+TILE_BRIEF = 120
+
+
 def short(text, n=80):
     text = " ".join(str(text).split())
     return text if len(text) <= n else text[: n - 1] + "…"
@@ -1928,7 +1933,8 @@ def ui_manifest(view, now=None):
     elif nxt:
         at = datetime.strptime(nxt[1]["at"], TIME_FMT)
         value = day_time(at, now)
-        detail, tone = f"{name_of(nxt[0]['agent'])}: {short(brief_of(nxt[1]), 40)}", None
+        # Up to three lines on a phone's tile (loom wraps a tile's line there); the agent's clock, a tap away, has the rest.
+        detail, tone = f"{name_of(nxt[0]['agent'])}: {short(brief_of(nxt[1]), TILE_BRIEF)}", None
     else:
         value, detail, tone = "Nothing", "nothing pending", "warn"
     # The tile opens the clock it's about: that agent's own (the household's Clock is only loom's lanes).
