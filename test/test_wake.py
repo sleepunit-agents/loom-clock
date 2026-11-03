@@ -1585,6 +1585,16 @@ class PlainWords(unittest.TestCase):
         self.assertEqual(tile["detail"], "Ada: Plan prepare")
         self.assertEqual(tile["value"], "8:50 AM")
 
+    def test_the_tile_carries_a_wakes_words_to_three_lines_not_forty_characters(self):
+        words = "Checking a pull request is moving, round 6 of the nudge-watch on the bench repro"
+        view = [{"agent": "ada", "schedules": {}, "entries": [self.entry(note=words)], "recent": [], "paused": None}]
+        detail = wake_cli.ui_manifest(view, now=self.now)["tile"]["detail"]
+        # before: "Ada: Checking a pull request is moving, roun…" (cut at 40)
+        self.assertEqual(detail, f"Ada: {wake_cli.brief_of(view[0]['entries'][0])}")
+        self.assertNotIn("…", detail)
+        long = view[0]["entries"][0] | {"note": "x " * 200}
+        self.assertLessEqual(len(wake_cli.ui_manifest([view[0] | {"entries": [long]}], now=self.now)["tile"]["detail"]), len("Ada: ") + wake_cli.TILE_BRIEF)
+
     def test_the_tile_and_card_skip_house_checks_and_name_a_schedule_alone(self):
         sched = wake_cli.schedule_entry("plan-retro", {"at": "23:17", "prompt": "x", "note": "task 7 from Pat"},
                                         wake_cli.datetime(2026, 10, 30, 23, 17))
