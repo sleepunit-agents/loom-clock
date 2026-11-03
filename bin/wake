@@ -1669,6 +1669,110 @@ def when_text(sc):
     return f"{', '.join(d.capitalize() for d in days.split(','))} {at}"
 
 
+def and_list(words):
+    words = list(words)
+    return words[0] if len(words) == 1 else ", ".join(words[:-1]) + " and " + words[-1]
+
+
+def days_spec(value, chips=False):
+    """What the page posts for a schedule's days -> how the clock keeps them: '' (every day), 'mon-fri', 'sat,sun',
+    or a list ('mon,wed,fri'). It takes the day chips (ticked days, comma-joined) and the old forms alike
+    ('mon-fri', 'sat,sun', '' for daily). With `chips`, no day ticked is a mistake, not 'every day'.
+    Raises ValueError for anything else."""
+    value = "".join(str(value or "").lower().split())
+    if not value:
+        if chips:
+            raise ValueError("Pick at least one day.")
+        return ""
+    days = days_of(value)   # ValueError on a day it doesn't know
+    if days == set(range(7)):
+        return ""
+    if days == set(range(5)):
+        return "mon-fri"
+    if days == {5, 6}:
+        return "sat,sun"
+    return ",".join(DAYS[d] for d in sorted(days))
+
+
+def days_chips(spec):
+    """A schedule's days as the chips field's value: every ticked day, comma-joined ('' is every day: all seven)."""
+    try:
+        return ",".join(DAYS[d] for d in sorted(days_of((spec or "").lower())))
+    except ValueError:
+        return ""
+
+
+def days_field(spec, name="days", label="Days"):
+    """The days a schedule runs, as a row of chips (Mon…Sun). Its sheet posts a hidden days_chips=1 with it, so
+    no day ticked is refused rather than read as every day."""
+    return {"name": name, "label": label, "kind": "checks", "value": days_chips(spec),
+            "options": [{"value": d, "label": d.capitalize()} for d in DAYS]}
+
+
+def when_words(sc):
+    """A schedule's times as the row says them: '5:17 AM, every day', '9:30 AM, weekdays', '6:00 PM, Sundays',
+    '7:17 AM and 7:17 PM, Mon, Wed and Fri'."""
+    times = [sc.get("at")] if isinstance(sc.get("at"), str) else (sc.get("at") or [])
+    times = [t.strip() for x in times for t in str(x).split(",") if t.strip()]
+    try:
+        at = and_list([clock_time(datetime.strptime(t, "%H:%M")) for t in times]) if times else "No time"
+    except ValueError:
+        at = ", ".join(times)
+    try:
+        days = days_of((sc.get("days") or "").lower())
+    except ValueError:
+        return f"{at}, {sc.get('days')}"
+    full = ["Mondays", "Tuesdays", "Wednesdays", "Thursdays", "Fridays", "Saturdays", "Sundays"]
+    if days == set(range(7)):
+        on = "every day"
+    elif days == set(range(5)):
+        on = "weekdays"
+    elif days == {5, 6}:
+        on = "weekends"
+    elif len(days) == 1:
+        on = full[next(iter(days))]
+    else:
+        on = and_list([DAYS[d].capitalize() for d in sorted(days)])
+    return f"{at}, {on}"
+
+
+WAKE_KINDS = (
+    (re.compile(r"\bnudge-watch\b", re.I), "Checking a pull request is moving"),
+    (re.compile(r"\breview-watch\b", re.I), "Watching for a review"),
+    (re.compile(r"\bci-watch\b", re.I), "Watching a pull request's checks"),
+    (re.compile(r"\bdead-?man\b", re.I), "Safety wake, in case nothing else wakes it"),
+)
+
+
+def wake_words(text):
+    """What a wake is for, in words, and the ids its note carried: (words, refs).
+    't-1652 PR38 nudge-watch round 22' -> ('Checking a pull request is moving, round 22', ['t-1652', 'PR 38']).
+    The ids go to the wake's detail (and quietly into a row's meta); a note with no pattern it knows reads as
+    written, less the task ids it leads with and any wake id."""
+    text = " ".join(str(text or "").split())
+    refs = []
+    m = re.match(r"((?:t-\d+)(?:\s*/\s*t-\d+)*)\s*[:\-–—]?\s+", text)
+    if m:
+        refs += re.findall(r"t-\d+", m.group(1))
+        text = text[m.end():]
+    prs = re.findall(r"\bPR\s?#?(\d+)\b", text)
+    refs += [f"PR {n}" for n in prs]
+    rnd = re.search(r"\bround (\d+)\b", text)
+    for pat, words in WAKE_KINDS:
+        if pat.search(text):
+            for t in re.findall(r"\bt-\d+\b", text):
+                if t not in refs:
+                    refs.append(t)
+            refs += [w for w in re.findall(r"\bw-[0-9a-f]{6}\b", text) if w not in refs]
+            return words + (f", round {rnd.group(1)}" if rnd else ""), refs
+    text = re.sub(r"\bPR\s?#?\d+\b\s*", "", text)
+    wids = re.findall(r"\bw-[0-9a-f]{6}\b", text)
+    refs += wids
+    text = re.sub(r"(?:,?\s+(?:after|from|of|for))?\s*\bw-[0-9a-f]{6}\b", "", text).strip(" ,:;")
+    text = " ".join(text.split())
+    return (text[:1].upper() + text[1:]) if text else "", refs
+
+
 def day_time(dt, now):
     """'9:30 AM', 'Tomorrow 3:13 AM', 'Yesterday 9:00 PM', 'Sun 6:00 PM', 'Oct 3, 9:30 AM'."""
     days = (dt.date() - now.date()).days
@@ -1805,8 +1909,8 @@ def name_of(agent):
 
 def brief_of(e):
     """What a wake is, in a few words, for the tile and an agent's card: a schedule occurrence by its schedule's name
-    alone ("Planning retro"); the Clock's own page keeps the rest of its note."""
-    return pretty(e["schedule"]) if e.get("schedule") else what_of(e)
+    alone ("Planning retro"), any other in words without its ids; the Clock's own page keeps the rest of its note."""
+    return pretty(e["schedule"]) if e.get("schedule") else (wake_words(what_of(e))[0] or what_of(e))
 
 
 def upcoming(entries):
@@ -1862,69 +1966,97 @@ def lanes():
     return sorted(p.relative_to(REPO).as_posix() for p in (REPO / lane_dir()).glob("*.md"))
 
 
+def until_words(dt, now):
+    """'at 10:05 AM', 'tomorrow at 3:13 AM', 'on Sun 6:00 PM': the tail of 'Art wakes …'."""
+    s = next_at(dt, now).removeprefix("Next ")
+    return s if s.startswith(("at ", "tomorrow", "yesterday")) else "on " + s
+
+
 def hero(c, now):
-    """The clock's top: when the agent wakes next, with Wake now and Pause."""
+    """The clock's top: a headline that says when the agent wakes next, and the clock's switch, with Wake now."""
     agent, name = c["agent"], name_of(c["agent"])
     nxt = next((e for e in upcoming(c["entries"]) if not e.get("held")), None)
     held = sum(1 for e in c["entries"] if e.get("held"))
+    switch = {"label": "Clock", "toggle": {"action": "clock", "on": not c["paused"], "fields": {"agent": agent}}}
     if c["paused"]:
         since = datetime.strptime(c["paused"]["since"], TIME_FMT)
-        stat = {"label": f"{name}'s clock", "value": "Paused", "tone": "warn",
-                "detail": f"since {day_time(since, now)}" + (f" · {held} held" if held else "")}
-        pause = {"action": "resume", "label": "Resume", "fields": {"agent": agent}}
+        head = {"type": "health", "tone": "warn", "text": f"{name}'s clock is paused",
+                "detail": f"Since {day_time(since, now)}. " + (f"{held} wake{'s' if held != 1 else ''} held: each fires once when it runs again."
+                                                               if held else "Wakes that come due are held, not lost.")}
+        switch.update(value="Paused", tone="warn", detail="Turn it on and each held wake fires once.")
     elif nxt:
         at = datetime.strptime(nxt["at"], TIME_FMT)
-        stat = {"label": f"{name} wakes next", "value": day_time(at, now),
-                "detail": f"{until_text(at, now)} · {short(what_of(nxt), 60)}"}
-        pause = {"action": "pause", "label": "Pause", "fields": {"agent": agent},
-                 "confirm": f"Wakes that come due are held, not lost: each fires once when you resume."}
+        words = wake_words(what_of(nxt))[0] or "A wake"
+        head = {"type": "health", "tone": "ok", "text": f"{name} wakes {until_words(at, now)}",
+                "detail": f"{until_text(at, now)[:1].upper()}{until_text(at, now)[1:]}: {words}."}
+        switch.update(value="Running", detail="Turned off, wakes that come due are held, not lost.")
     else:
-        stat = {"label": f"{name} wakes next", "value": "Nothing", "tone": "warn", "detail": "nothing pending"}
-        pause = {"action": "pause", "label": "Pause", "fields": {"agent": agent}}
-    return [{"type": "stats", "items": [stat]},
-            {"type": "buttons", "items": [{"action": "now", "label": "Wake now", "tone": "primary", "fields": {"agent": agent}}, pause]}]
+        head = {"type": "health", "tone": "warn", "text": "Nothing pending", "detail": f"{name} has no wake coming."}
+        switch.update(value="Running", detail="Turned off, wakes that come due are held, not lost.")
+    return [head, {"type": "panel", "rows": [switch],
+                   "action": {"action": "now", "label": "Wake now", "tone": "primary", "fields": {"agent": agent}}}]
+
+
+def lane_note(note):
+    """A schedule's note without the piece's own 'loom lane: ' at its head."""
+    note = note or ""
+    return note.removeprefix("loom lane").removeprefix(":").strip()
 
 
 def schedule_blocks(c, now):
+    """An agent's schedules as rows: name, when in words, next and what it's for; Add a schedule last."""
     agent = c["agent"]
     nxt = {e["schedule"]: e["at"] for e in c["entries"] if e.get("schedule")}
-    items = []
+    rows = []
     for name, sc in sorted(c["schedules"].items(), key=lambda kv: nxt.get(kv[0], "9")):
         at = nxt.get(name)
-        items.append({"text": pretty(name), "badge": when_text(sc), "page": f"schedule/{agent}/{name}",
-                      "meta": (next_at(datetime.strptime(at, TIME_FMT), now) if at else "None armed")
-                      + (f" · {short(sc['note'], 50)}" if sc.get("note") else "")})
-    blocks = [{"type": "list", "items": items} if items else {"type": "text", "text": "No schedules.", "tone": "muted"}]
+        note = lane_note(sc.get("note")) if sc.get("loom_lane") else (sc.get("note") or "")
+        detail = (next_at(datetime.strptime(at, TIME_FMT), now) if at else "None armed") \
+            + (" · a loom lane" if sc.get("loom_lane") else "") + (f" · {note}" if note else "")
+        rows.append({"label": pretty(name), "value": when_words(sc), "detail": detail, "page": f"schedule/{agent}/{name}"})
     lane_opts = [{"value": l, "label": pretty(Path(l).stem)} for l in lanes()][:50]
-    blocks.append({"type": "details", "summary": "Add a wake", "blocks": [{
-        "type": "form", "action": "schedule-set", "submit": "Add", "hidden": {"agent": agent},
-        "note": "A recurring wake keeps one occurrence pending and arms the next when it fires.",
+    rows.append({"label": "Add a schedule", "value": "A wake that comes back on the days and times you pick", "edit": {
+        "action": "schedule-set", "title": "New schedule", "submit": "Add", "hidden": {"agent": agent, "days_chips": "1"},
+        "note": "A recurring wake keeps one run pending and arms the next when it fires.",
         "fields": [
             {"name": "name", "label": "Name", "kind": "text", "required": True, "hint": "lowercase and dashes, like nightly"},
             time_field("at", "Time", ""),
-            {"name": "days", "label": "Days", "kind": "choice", "value": "",
-             "options": [{"value": "", "label": "Every day"}, {"value": "mon-fri", "label": "Weekdays"},
-                         {"value": "sat,sun", "label": "Weekends"}, {"value": "sun", "label": "Sundays"}]},
+            days_field(""),
             {"name": "lane", "label": "Lane", "kind": "choice", "required": True, "options": lane_opts}
             if agent == LOCAL_AGENT else
             {"name": "lane", "label": "Lane", "kind": "text", "required": True, "hint": "a file in its repo, like routines/x.md"},
-            {"name": "note", "label": "Note", "kind": "text"},
-        ]}]})
-    return blocks
+            {"name": "note", "label": "What it's for", "kind": "text"},
+        ]}})
+    blocks = [] if c["schedules"] else [{"type": "text", "text": "No schedules yet.", "tone": "muted"}]
+    return blocks + [{"type": "panel", "rows": rows}]
+
+
+def wake_row(e, agent, now):
+    """A pending wake as a list row: what it's for in words; its time, and quietly the task it's for. Its ids are on its page."""
+    words, refs = wake_words(what_of(e))
+    meta = [day_time(datetime.strptime(e["at"], TIME_FMT), now)]
+    if e.get("held"):
+        meta.append("held")
+    if e.get("fails"):
+        meta.append(f"retry {e['fails']}")
+    tasks = [r for r in refs if r.startswith("t-")]
+    if tasks:
+        meta.append(", ".join(tasks[:3]))
+    row = {"text": words or "A wake", "meta": " · ".join(meta), "page": f"wake/{agent}/{e['id']}"}
+    if e.get("held"):
+        row["tone"] = "warn"
+    elif e.get("fails"):
+        row["tone"] = "bad"
+    return row
 
 
 def oneoff_blocks(c, now):
     agent = c["agent"]
     rows = [e for e in c["entries"] if e["kind"] != "schedule"]
     wakes = sum(1 for e in rows if e["kind"] == "wake")
-    items = [{"text": short(what_of(e), 90) or "A wake", "tone": "warn" if e.get("held") else ("bad" if e.get("fails") else None),
-              "meta": day_time(datetime.strptime(e["at"], TIME_FMT), now) + (" · held" if e.get("held") else "")
-              + (" · dead-man" if e["kind"] == "deadman" else "") + (f" · retry {e['fails']}" if e.get("fails") else ""),
-              "page": f"wake/{agent}/{e['id']}"} for e in rows[:100]]
-    for i in items:
-        if i["tone"] is None:
-            del i["tone"]
-    return [{"type": "text", "text": f"{wakes} of {MAX_PENDING} at most, and the dead-man when nothing else is pending.", "tone": "muted"},
+    items = [wake_row(e, agent, now) for e in rows[:100]]
+    return [{"type": "text", "text": f"{wakes} one-off wake{'s' if wakes != 1 else ''} pending, of {MAX_PENDING} at most. "
+                                     "The safety wake comes when nothing else is.", "tone": "muted"},
             {"type": "list", "items": items} if items else {"type": "text", "text": "None pending.", "tone": "muted"}]
 
 
@@ -1935,9 +2067,11 @@ def recent_blocks(c, now):
         why = {"fire-fail": "failed, retrying", "fire-giveup": "failed, gave up", "fire-refused": "refused",
                "fire-held": "held (paused)"}.get(event)
         house = re.search(r"\b(h-\d+)\b", detail)
-        meta = day_time(when, now) + (f" · {why}" if why else "") + (" · in a house" if house and not bad else "")
-        item = {"text": short(what, 80) or "A wake", "meta": meta, "tone": "bad" if bad else ("warn" if event == "fire-held" else "ok")}
-        items.append(item)
+        words, refs = wake_words(what)
+        tasks = [r for r in refs if r.startswith("t-")]
+        meta = day_time(when, now) + (f" · {why}" if why else "") + (" · in a house" if house and not bad else "") \
+            + (f" · {', '.join(tasks[:3])}" if tasks else "")
+        items.append({"text": words or "A wake", "meta": meta, "tone": "bad" if bad else ("warn" if event == "fire-held" else "ok")})
     return [{"type": "list", "items": items}] if items else [{"type": "text", "text": "No wakes yet.", "tone": "muted"}]
 
 
@@ -1950,10 +2084,10 @@ def ui_page(view, path, now=None, lanes=True, scope=None):
     path = path or ""
     m = re.fullmatch(r"schedule/([a-z][a-z0-9-]{0,39})/([a-z][a-z0-9-]{0,39})", path)
     if m:
-        return schedule_page(view, m.group(1), m.group(2), now)
+        return schedule_page(view, m.group(1), m.group(2), now, lanes=lanes)
     m = re.fullmatch(r"lane/([a-z][a-z0-9-]{0,39})", path)
     if m:
-        return lane_page(m.group(1))
+        return lane_page(m.group(1), view, now)
     m = re.fullmatch(r"wake/([a-z][a-z0-9-]{0,39})/(w-[0-9a-f]{6})", path)
     if m:
         return wake_page(view, m.group(1), m.group(2), now)
@@ -1967,18 +2101,18 @@ def ui_page(view, path, now=None, lanes=True, scope=None):
     for c in view[:3]:
         who = f"{name_of(c['agent'])} · " if many else ""
         sections.append({"id": f"next-{c['agent']}", "title": f"{name_of(c['agent'])}" if many else "", "blocks": hero(c, now)})
-        sections.append({"id": f"schedule-{c['agent']}", "title": f"{who}Schedule", "blocks": schedule_blocks(c, now)})
+        sections.append({"id": f"schedule-{c['agent']}", "title": f"{who}Schedules", "blocks": schedule_blocks(c, now)})
+        sections.append({"id": f"oneoff-{c['agent']}", "title": f"{who}Coming up", "side": True, "blocks": oneoff_blocks(c, now)})
         sections.append({"id": f"recent-{c['agent']}", "title": f"{who}Recent", "side": True, "blocks": recent_blocks(c, now)})
-        sections.append({"id": f"oneoff-{c['agent']}", "title": f"{who}One-off wakes", "side": True, "blocks": oneoff_blocks(c, now)})
     if not sections:
         sections.append({"id": "none", "title": "", "blocks": [{"type": "text", "text": "No clock here.", "tone": "muted"}]})
-    runs = [{"text": pretty(nm), "meta": lane_when(ln), "page": f"household:lane/{nm}"}
+    runs = [{"text": pretty(nm), "meta": when_words(ln) + (" · on loom's machine" if ln.get("local") else ""), "page": f"household:lane/{nm}"}
             for nm, ln in sorted(load_lanes().items()) if ln.get("agent") == scope]
     if lanes and runs:   # the household's lanes are its owners' to see (an agent owner's view has none)
         sections.append({"id": "its-lanes", "title": "Loom lanes it runs", "side": True, "blocks": [
             {"type": "text", "tone": "muted", "text": "The household's work on a schedule, assigned to it. They're set on loom's Clock, under Setup."},
             {"type": "list", "items": runs}]})
-    return {"title": "Clock", "sections": sections[:10]}
+    return {"title": "Clock", "intro": "When this agent wakes: its schedules, and the one-off wakes it set itself.", "sections": sections[:10]}
 
 
 def household_clock_page(view, now, lanes=True):
@@ -1986,134 +2120,237 @@ def household_clock_page(view, now, lanes=True):
     sections = []
     if lanes:
         sections.append({"id": "loom-lanes", "title": "Loom lanes", "blocks": lane_blocks() + new_lane_blocks()})
-    items = []
+    rows = []
     for c in view:
         e = next((e for e in upcoming(c["entries"]) if not e.get("held")), None)
-        nxt = f"{next_at(datetime.strptime(e['at'], TIME_FMT), now)}: {short(what_of(e), 40)}" if e else "nothing pending"
-        items.append({"text": f"{name_of(c['agent'])}'s clock", "agent": c["agent"], "page": f"agent:{c['agent']}",
-                      "meta": "paused" if c.get("paused") else nxt})
-    if items:
+        row = {"label": f"{name_of(c['agent'])}'s clock", "agent": c["agent"], "page": f"agent:{c['agent']}"}
+        if c.get("paused"):
+            row.update(value="Paused", tone="warn", detail="Its wakes are held until it runs again.")
+        elif e:
+            row.update(value=next_at(datetime.strptime(e["at"], TIME_FMT), now), detail=brief_of(e) or "A wake")
+        else:
+            row.update(value="Nothing pending")
+        rows.append(row)
+    if rows:
         sections.append({"id": "agents", "title": "Each agent's clock", "side": True, "blocks": [
-            {"type": "text", "tone": "muted", "text": "Each agent's schedule and wakes are on its own pages."},
-            {"type": "list", "items": items}]})
+            {"type": "text", "tone": "muted", "text": "Each agent's schedules and wakes are on its own pages."},
+            {"type": "panel", "rows": rows}]})
     if not sections:
         sections.append({"id": "none", "title": "", "blocks": [{"type": "text", "text": "No clock here.", "tone": "muted"}]})
-    return {"title": "Clock", "sections": sections}
+    return {"title": "Clock", "intro": "The household's work on a schedule, each lane run by one of its agents.", "sections": sections}
+
+
+def where_words(ln):
+    return "on loom's machine" if ln.get("local") else "in a house"
 
 
 def lane_blocks():
-    """The household's lanes: what, when, whose; the owner reassigns one here."""
+    """The household's lanes as rows: whose, when and where in a sentence ('Art · 5:17 AM, every day · on loom's machine')."""
     lanes = load_lanes()
-    if not lanes:
-        return []
-    agents = [a for a in household_agents() or clock_agents()]
-    rows = [{"text": pretty(nm), "meta": f"{name_of(ln['agent'])} · {lane_when(ln)}" + (" · on loom's machine" if ln.get("local") else ""),
-             "agent": ln["agent"], "page": f"lane/{nm}"} for nm, ln in sorted(lanes.items())]
-    return [{"type": "text", "tone": "muted", "text": "The household's work on a schedule, each assigned to an agent: its run happens in that agent's houses."},
-            {"type": "list", "items": rows}] if rows else []
+    rows = [{"label": pretty(nm), "value": f"{name_of(ln['agent'])} · {when_words(ln)}" + (" · on loom's machine" if ln.get("local") else ""),
+             "agent": ln["agent"], "page": f"lane/{nm}", **({"detail": ln["note"]} if ln.get("note") else {})}
+            for nm, ln in sorted(lanes.items())]
+    if not rows:
+        return [{"type": "text", "tone": "muted", "text": "No loom lanes yet."}]
+    return [{"type": "panel", "rows": rows}]
 
 
 def lane_when(ln):
     return when_text(ln)
 
 
+def agent_field(name, label, value, agents):
+    """Whose: side by side when there are a few agents, else a picker."""
+    opts = [{"value": a, "label": name_of(a)} for a in agents]
+    kind = "segmented" if 2 <= len(opts) <= 5 else "choice"
+    return {"name": name, "label": label, "kind": kind, "value": value, "options": opts}
+
+
+WHERE_OPTIONS = [{"value": "house", "label": "In a house"}, {"value": "local", "label": "On loom's machine"}]
+
+
 def lane_fields(ln, agents):
-    """The settings a lane's form edits (a new lane's too)."""
+    """The settings a new lane's sheet asks for (the lane's own page sets each on its own row)."""
     return [
-        {"name": "to", "label": "Whose", "kind": "choice", "value": ln.get("agent") or (agents[0] if agents else LOCAL_AGENT),
-         "options": [{"value": a, "label": name_of(a)} for a in agents]},
+        agent_field("to", "Whose", ln.get("agent") or (agents[0] if agents else LOCAL_AGENT), agents),
         time_field("at", "When", ln["at"] if isinstance(ln.get("at"), str) else ",".join(ln.get("at") or [])),
-        {"name": "days", "label": "Days", "kind": "text", "value": ln.get("days") or "", "hint": "Empty for daily; mon-fri, or sat,sun"},
-        {"name": "where", "label": "Where it runs", "kind": "choice", "value": "local" if ln.get("local") else "house",
-         "options": [{"value": "house", "label": "In a house", "detail": "The agent's house, on any box"},
-                     {"value": "local", "label": "On loom's machine", "detail": "For work that needs it: systemd, files outside the repo"}]},
+        days_field(ln.get("days") or ""),
+        {"name": "where", "label": "Where it runs", "kind": "segmented", "value": "local" if ln.get("local") else "house",
+         "options": WHERE_OPTIONS, "hint": "On loom's machine is for work that needs it: systemd, files outside the repo."},
         {"name": "note", "label": "What it's for", "kind": "text", "value": ln.get("note") or ""},
     ]
 
 
-def lane_page(nm):
+def lane_page(nm, view=(), now=None):
+    """A loom lane as a panel: When, Where, Whose, What it's for and its text, each a row that says its value and
+    opens one control; Run now at its foot; the text to read; Remove, which asks first."""
+    now = now or datetime.now()
     ln = load_lanes().get(nm)
     if not ln:
         return {"title": "Not found", "sections": []}
     agents = household_agents() or clock_agents()
+    if ln["agent"] not in agents:
+        agents = [ln["agent"], *agents]
+    agent, whose = ln["agent"], name_of(ln["agent"])
+    key = {"name": nm, "agent": agent}
     text = ln["text"]
+    c = find_clock(list(view), agent)
+    nxt = next((e["at"] for e in (c["entries"] if c else []) if e.get("schedule") == nm), None)
+    at_value = ln["at"] if isinstance(ln.get("at"), str) else ",".join(ln.get("at") or [])
+    when = {"label": "When", "value": when_words(ln),
+            "edit": {"action": "lane-edit", "title": "When it runs", "submit": "Save", "hidden": {**key, "days_chips": "1"},
+                     "fields": [time_field("at", "Time", at_value), days_field(ln.get("days") or "")]}}
+    if nxt:
+        when["detail"] = next_at(datetime.strptime(nxt, TIME_FMT), now)
+    where = {"label": "Where", "value": "On loom's machine" if ln.get("local") else "In a house",
+             "detail": "For work that needs it: systemd, files outside the repo." if ln.get("local") else f"{whose}'s house, on any box.",
+             "choice": {"action": "lane-edit", "name": "where", "value": "local" if ln.get("local") else "house",
+                        "options": WHERE_OPTIONS, "fields": key}}
+    who = {"label": "Whose", "value": whose, "agent": agent, "detail": f"Its runs are {whose}'s work, as {whose}."}
+    if 2 <= len(agents) <= 5:
+        who["choice"] = {"action": "lane-edit", "name": "to", "value": agent,
+                         "options": [{"value": a, "label": name_of(a)} for a in agents], "fields": key}
+    elif len(agents) > 5:
+        who["edit"] = {"action": "lane-edit", "title": "Whose it is", "submit": "Save", "hidden": key,
+                       "fields": [agent_field("to", "Whose", agent, agents)]}
+    note = {"label": "What it's for", "value": ln.get("note") or "Not said yet",
+            "edit": {"action": "lane-edit", "title": "What it's for", "submit": "Save", "hidden": key,
+                     "fields": [{"name": "note", "label": "What it's for", "kind": "text", "value": ln.get("note") or "", "required": True}]}}
+    if not ln.get("note"):
+        note["tone"] = "muted"
+    src = repo_relative(ln.get("source") or "")
+    words = len(text.split())
     shown = text if len(text) <= 19000 else text[:19000] + "\n\n… (the rest is longer than the page shows; `wake lane text " + nm + "`)"
-    return {"title": pretty(nm), "intro": f"A loom lane: the household's, run by {name_of(ln['agent'])}, {lane_when(ln)}.",
+    readrow = {"label": "What it does", "value": f"{words:,} word{'s' if words != 1 else ''} of instructions",
+               "sheet": {"title": "What it does", "blocks": [{"type": "prose", "text": shown}]}}
+    if src:
+        readrow["detail"] = f"Set from {src}"
+    replacerow = {"label": "Replace the text", "value": "Paste a whole new text",
+                  "detail": "Or edit its file, then set it again with wake lane set." if src else None,
+                  "edit": {"action": "lane-text", "title": "Replace the text", "submit": "Replace", "hidden": key,
+                           "note": f"Paste the whole new text: it replaces all {len(text):,} characters.",
+                           "fields": [{"name": "text", "label": "The lane's text", "kind": "textarea", "required": True}]}}
+    if not src:
+        del replacerow["detail"]
+    return {"title": pretty(nm), "intro": f"A loom lane: the household's work, run by {whose}.",
             "sections": [
-                {"id": "settings", "title": "Settings", "blocks": [
-                    {"type": "form", "action": "lane-edit", "submit": "Save", "hidden": {"name": nm, "agent": ln["agent"]}, "fields": lane_fields(ln, agents)}]},
-                {"id": "text", "title": "What it does", "blocks": [{"type": "prose", "text": shown}]},
-                {"id": "replace", "title": "Replace the text", "side": True, "blocks": [
-                    {"type": "text", "tone": "muted", "text": f"Paste the whole new text: it replaces all {len(text):,} characters. "
-                                                             f"(Editing {lane_dir()}/{nm}.md and running `wake lane set {nm} -f {lane_dir()}/{nm}.md` does the same.)"},
-                    {"type": "form", "action": "lane-text", "submit": "Replace", "hidden": {"name": nm, "agent": ln["agent"]},
-                     "fields": [{"name": "text", "label": "The lane's text", "kind": "textarea", "required": True}]}]},
+                {"id": "settings", "title": "", "blocks": [
+                    {"type": "panel", "rows": [when, where, who, note],
+                     "action": {"action": "lane-run", "label": "Run now", "tone": "primary", "fields": key}}]},
+                {"id": "text", "title": "Its text", "blocks": [{"type": "panel", "rows": [readrow, replacerow]}]},
                 {"id": "remove", "title": "", "side": True, "blocks": [
                     {"type": "buttons", "items": [{"action": "lane-rm", "label": "Remove this lane", "tone": "danger",
-                                                   "confirm": f"{name_of(ln['agent'])}'s schedule for it goes; the text is gone from loom ({lane_dir()}/{nm}.md, if it's there, stays).",
-                                                   "fields": {"name": nm, "agent": ln["agent"]}}]}]},
+                                                   "confirm": f"{whose}'s schedule for it goes, and its text is gone from loom"
+                                                              + (f" ({src} stays)." if src else "."),
+                                                   "fields": key}]}]},
             ]}
 
 
 def new_lane_blocks():
     agents = household_agents() or clock_agents()
-    return [{"type": "details", "summary": "New loom lane", "blocks": [
-        {"type": "form", "action": "lane-new", "submit": "Add", "fields": [
+    return [{"type": "panel", "rows": [{"label": "New loom lane", "value": "Work on a schedule, run by one of the household's agents", "edit": {
+        "action": "lane-new", "title": "New loom lane", "submit": "Add", "hidden": {"days_chips": "1"}, "fields": [
             {"name": "name", "label": "Name", "kind": "text", "required": True, "hint": "lowercase and dashes, like directory-upkeep"},
             *lane_fields({}, agents),
-            {"name": "text", "label": "What it does", "kind": "textarea", "required": True, "hint": "The lane's prompt, as its house gets it"}]}]}]
+            {"name": "text", "label": "What it does", "kind": "textarea", "required": True, "hint": "The lane's prompt, as its house gets it"}]}}]}]
 
 
 def find_clock(view, agent):
     return next((c for c in view if c["agent"] == agent), None)
 
 
-def schedule_page(view, agent, name, now):
+def schedule_page(view, agent, name, now, lanes=True):
+    """A schedule as a panel: When (its sheet sets the time and days), what it's for, what it runs, whose; Run now."""
     c = find_clock(view, agent)
     sc = c and c["schedules"].get(name)
     if not sc:
         return {"title": "Not found", "sections": []}
     at = next((e["at"] for e in c["entries"] if e.get("schedule") == name), None)
     runs = repo_relative(sc.get("prompt_file") or sc.get("lane") or "")
-    kv = [{"label": "When", "value": when_text(sc)},
-          {"label": "Next", "value": day_time(datetime.strptime(at, TIME_FMT), now) if at else "none armed"},
-          {"label": "Runs", "value": runs or short(sc.get("prompt", ""), 120)},
-          {"label": "Model", "value": sc.get("model", DEFAULT_MODEL)},
-          {"label": "Clock", "value": name_of(agent)}]
-    if sc.get("note"):
-        kv.insert(2, {"label": "Note", "value": sc["note"]})
-    restore = {"agent": agent, "name": name, "at": sc["at"] if isinstance(sc["at"], str) else ",".join(sc["at"]),
-               "days": sc.get("days", ""), "note": sc.get("note", "")}
+    at_value = sc["at"] if isinstance(sc["at"], str) else ",".join(sc["at"])
+    keep = {"agent": agent, "name": name, "lane": runs, "model": sc.get("model") or DEFAULT_MODEL}
+    if sc.get("slot"):
+        keep["slot"] = sc["slot"]
+    lane = sc.get("loom_lane") and name in load_lanes()
+    when = {"label": "When", "value": when_words(sc),
+            "detail": next_at(datetime.strptime(at, TIME_FMT), now) if at else "None armed"}
+    note_text = lane_note(sc.get("note")) if sc.get("loom_lane") else (sc.get("note") or "")
+    note = {"label": "What it's for", "value": note_text or "Not said"}
+    if not note_text:
+        note["tone"] = "muted"
+    if runs:   # a lane file's schedule is set again from here; an inline prompt can't come back through a form
+        when["edit"] = {"action": "schedule-set", "title": "When it runs", "submit": "Save",
+                        "hidden": {**keep, "note": sc.get("note") or "", "days_chips": "1"},
+                        "fields": [time_field("at", "Time", at_value), days_field(sc.get("days") or "")]}
+        note["edit"] = {"action": "schedule-set", "title": "What it's for", "submit": "Save",
+                        "hidden": {**keep, "at": at_value, "days": sc.get("days") or ""},
+                        "fields": [{"name": "note", "label": "What it's for", "kind": "text", "value": sc.get("note") or ""}]}
+    elif lane and lanes:
+        when.update(page=f"household:lane/{name}", detail=when["detail"] + " · a loom lane: set on loom's Clock")
+    body = runs or sc.get("prompt", "")
+    what = {"label": "What it runs", "value": pretty(Path(runs).stem) if runs else ("A loom lane's text" if sc.get("loom_lane") else "A prompt of its own"),
+            "sheet": {"title": "What it runs", "blocks": [{"type": "code", "label": "Lane file" if runs else "Prompt",
+                                                            "text": body if len(body) <= 1900 else body[:1900] + "…"}]}}
+    rows = [when, note, what,
+            {"label": "Model", "value": sc.get("model", DEFAULT_MODEL)},
+            {"label": "Whose", "value": name_of(agent), "agent": agent}]
+    sections = [{"id": "schedule", "title": "", "blocks": [
+        {"type": "panel", "rows": rows,
+         "action": {"action": "run", "label": "Run now", "tone": "primary", "fields": {"agent": agent, "name": name}}}]}]
     if runs:
-        restore["lane"] = runs
-    buttons = [{"action": "run", "label": "Run now", "tone": "primary", "fields": {"agent": agent, "name": name}}]
-    if runs:  # an inline prompt can't come back through the form, so it isn't removed from here
-        buttons.append({"action": "schedule-rm", "label": "Remove", "tone": "danger", "fields": {"agent": agent, "name": name},
-                        "confirm": f"{pretty(name)} stops recurring and its pending occurrence is cancelled."})
-    return {"title": pretty(name), "sections": [{"id": "schedule", "title": "", "blocks": [
-        {"type": "kv", "items": kv}, {"type": "buttons", "items": buttons}]}]}
+        sections.append({"id": "remove", "title": "", "side": True, "blocks": [{"type": "buttons", "items": [
+            {"action": "schedule-rm", "label": "Remove", "tone": "danger", "fields": {"agent": agent, "name": name},
+             "confirm": f"{pretty(name)} stops recurring and its pending run is cancelled."}]}]})
+    return {"title": pretty(name), "sections": sections}
+
+
+WAKE_KIND_WORDS = {"wake": "A one-off wake", "deadman": "The safety wake: it comes when nothing else is pending",
+                   "schedule": "One run of a schedule", "watch": "Checking that its house started"}
 
 
 def wake_page(view, agent, wid, now):
+    """A pending wake: what it's for in words, when, what kind; its id, note as written and what it runs behind Details."""
     c = find_clock(view, agent)
     e = c and next((e for e in c["entries"] if e["id"] == wid), None)
     if not e:
         return {"title": "Not found", "sections": [{"id": "gone", "title": "", "blocks": [
             {"type": "text", "text": "That wake isn't pending any more: it fired or was cancelled.", "tone": "muted"}]}]}
-    kv = [{"label": "At", "value": day_time(datetime.strptime(e["at"], TIME_FMT), now)},
-          {"label": "Kind", "value": {"wake": "one-off", "deadman": "dead-man", "schedule": "schedule occurrence", "watch": "house check"}.get(e["kind"], e["kind"])},
-          {"label": "Set", "value": day_time(datetime.strptime(e["created"], TIME_FMT), now)},
-          {"label": "Id", "value": wid}]
+    words, refs = wake_words(what_of(e))
+    at = datetime.strptime(e["at"], TIME_FMT)
+    when = {"label": "When", "value": f"{day_time(at, now)}, {until_text(at, now)}" if at > now else day_time(at, now)}
     if e.get("held"):
-        kv.insert(1, {"label": "State", "value": "held until resume"})
-    blocks = [{"type": "kv", "items": kv}]
+        when.update(tone="warn", detail="Held: it fires once the clock runs again.")
+    elif e.get("fails"):
+        when.update(tone="bad", detail=f"Retry {e['fails']}: its last try failed.")
+    kind = WAKE_KIND_WORDS.get(e["kind"], e["kind"])
+    if e.get("schedule"):
+        kind = f"One run of {pretty(e['schedule'])}"
+    rows = [{"label": "What it's for", "value": words or "Not said"}, when, {"label": "What it is", "value": kind},
+            {"label": "Set", "value": day_time(datetime.strptime(e["created"], TIME_FMT), now)}]
+    tasks = [r for r in refs if r.startswith("t-")]
+    prs = [r for r in refs if r.startswith("PR ")]
+    if tasks:
+        rows.append({"label": "For", "value": ", ".join(f"task {t}" for t in tasks)
+                     + (f", {', '.join(prs)}" if prs else "")})
+    record = [{"label": "Id", "value": wid}, {"label": "Note, as written", "value": e.get("note") or "(none)"}]
+    if e.get("slot"):
+        record.append({"label": "House slot", "value": e["slot"]})
+    sheet = [{"type": "kv", "items": record}]
     body = e.get("prompt") or repo_relative(e.get("prompt_file") or e.get("lane", ""))
     if body:
-        blocks.append({"type": "details", "summary": "What it runs", "blocks": [{"type": "code", "text": body[:4000]}]})
+        sheet.append({"type": "code", "label": "What it runs", "text": body if len(body) <= 1900 else body[:1900] + "…"})
+    rows.append({"label": "Details", "value": "Its id, its note as written, and what it runs", "sheet": {"title": "The wake's record", "blocks": sheet}})
+    sections = [{"id": "wake", "title": "", "blocks": [{"type": "panel", "rows": rows}]}]
     if e["kind"] != "deadman":
-        blocks.append({"type": "buttons", "items": [{"action": "cancel", "label": "Cancel", "tone": "danger", "fields": {"agent": agent, "id": wid},
-                                                     "confirm": "This wake won't fire." if e["kind"] == "wake" else "Skips just this occurrence; the next is armed."}]})
-    return {"title": short(what_of(e), 60) or "A wake", "sections": [{"id": "wake", "title": "", "blocks": blocks}]}
+        sections.append({"id": "cancel", "title": "", "side": True, "blocks": [{"type": "buttons", "items": [
+            {"action": "cancel", "label": "Cancel this wake" if e["kind"] == "wake" else "Skip this run", "tone": "danger",
+             "fields": {"agent": agent, "id": wid},
+             "confirm": "This wake won't fire." if e["kind"] == "wake" else "Skips just this run; the next is armed."}]}]})
+    # The header holds a short title; what it's for, which runs long, is the first row and wraps.
+    title = {"wake": "One-off wake", "deadman": "Safety wake", "watch": "House check"}.get(e["kind"], "Wake")
+    if e.get("schedule"):
+        title = pretty(e["schedule"])
+    return {"title": title, "sections": sections}
 
 
 def owned_by(caller):
@@ -2127,7 +2364,7 @@ def owned_by(caller):
 
 
 def ui_act(req, run):
-    """The page's buttons and form -> {ok, message, page?, undo?}. `run(agent, argv)` is the CLI."""
+    """The page's buttons, switches and sheets -> {ok, message, page?, undo?}. `run(agent, argv)` is the CLI."""
     if not isinstance(req, dict):
         return {"ok": False, "message": "Not an action."}
     action, f = req.get("action"), req.get("fields") if isinstance(req.get("fields"), dict) else {}
@@ -2140,6 +2377,7 @@ def ui_act(req, run):
         return {"ok": False, "message": "That's not one of your agents' clocks; ask a household owner."}
     name = name_of(agent)
     pick = lambda k: str(f.get(k) or "").strip()
+    chips = pick("days_chips") == "1"
 
     def go(argv, message, **extra):
         code, out, err = run(agent, argv)
@@ -2147,23 +2385,64 @@ def ui_act(req, run):
             return {"ok": False, "message": (err.strip().removeprefix("wake: ") or out.strip() or "That didn't work.")[:300]}
         return {"ok": True, "message": message, **extra}
 
+    def days():
+        """The posted days as the clock keeps them; ValueError says what's wrong."""
+        try:
+            return days_spec(f.get("days"), chips=chips)
+        except ValueError as e:
+            if chips and not pick("days"):
+                raise ValueError("Pick at least one day.") from e
+            raise ValueError("Days are mon..sun: a list (mon,wed,fri), a range (mon-fri), or none for every day.") from e
+
     if action in ("lane-new", "lane-edit"):
         nm = pick("name")
-        argv = ["lane", "set", nm, "--agent", pick("to"), "--at", pick("at").replace(" ", ""), "--days", pick("days"),
-                "--local" if pick("where") == "local" else "--no-local", "--note", pick("note")]
+        cur = dict(load_lanes().get(nm) or {}) if action == "lane-edit" else {}
+        if action == "lane-edit" and not cur:
+            return {"ok": False, "message": f"There's no loom lane {nm}."}
+        # A sheet or a switch posts only what it sets; the rest of the lane stays as it is.
+        argv = ["lane", "set", nm]
+        if action == "lane-new" or "to" in f:
+            argv += ["--agent", pick("to")]
+            cur["agent"] = pick("to")
+        if action == "lane-new" or "at" in f:
+            argv += ["--at", pick("at").replace(" ", "")]
+            cur["at"] = pick("at").replace(" ", "")
+        if action == "lane-new" or "days" in f:
+            try:
+                cur["days"] = days()
+            except ValueError as e:
+                return {"ok": False, "message": str(e)}
+            argv += ["--days", cur["days"]]
+        if action == "lane-new" or "where" in f:
+            argv.append("--local" if pick("where") == "local" else "--no-local")
+            cur["local"] = pick("where") == "local"
+        if action == "lane-new" or "note" in f:
+            argv += ["--note", pick("note")]
         if action == "lane-new":
             if not pick("text"):
                 return {"ok": False, "message": "A lane needs its text: what its house is to do."}
             if nm in load_lanes():
                 return {"ok": False, "message": f"There's a loom lane {nm} already."}
             argv += ["-p", str(f.get("text") or "")]
-        return go(argv, f"{pretty(nm)} is {name_of(pick('to'))}'s, {when_text({'at': pick('at'), 'days': pick('days')})}.", page=f"lane/{nm}")
+        if len(argv) == 3:
+            return {"ok": False, "message": "Nothing to change."}
+        said = f"{pretty(nm)} is {name_of(cur.get('agent') or agent)}'s, {when_words(cur)}, {where_words(cur)}."
+        if action == "lane-edit" and "note" in f and len(argv) == 5:
+            said = f"{pretty(nm)}: what it's for is saved."
+        return go(argv, said, page=f"lane/{nm}")
     if action == "lane-text":
         if not pick("text"):
             return {"ok": False, "message": "Paste the whole new text."}
         return go(["lane", "set", pick("name"), "-p", str(f.get("text") or "")], f"{pretty(pick('name'))}'s text is replaced.", page=f"lane/{pick('name')}")
     if action == "lane-rm":
         return go(["lane", "rm", pick("name")], f"Removed the loom lane {pretty(pick('name'))}.", page="")
+    if action == "lane-run":
+        ln = load_lanes().get(pick("name"))
+        if not ln:
+            return {"ok": False, "message": f"There's no loom lane {pick('name')}."}
+        agent = ln["agent"]
+        return go(["schedule", "run", pick("name"), "--note", "from loom"],
+                  f"{pretty(pick('name'))} runs within a minute, {where_words(ln)}, as {name_of(agent)}.")
     if action == "lane-assign":
         to = pick("to")
         if not AGENT_NAME.match(to):
@@ -2171,6 +2450,8 @@ def ui_act(req, run):
         return go(["lane", "assign", pick("name"), "--agent", to], f"{pretty(pick('name'))} is {name_of(to)}'s now.", page="")
     if action == "now":
         return go(["now"], f"{name} wakes within a minute.")
+    if action == "clock":   # the clock's switch: on runs it, off pauses it
+        action = "resume" if pick("on") == "on" else "pause"
     if action == "pause":
         return go(["pause"], f"{name}'s clock is paused. Wakes that come due are held.", undo={"action": "resume", "label": "Resume", "fields": {"agent": agent}})
     if action == "resume":
@@ -2193,12 +2474,20 @@ def ui_act(req, run):
     if action == "schedule-set":
         if agent == LOCAL_AGENT and lane_file(pick("lane")) is None:
             return {"ok": False, "message": f"Pick a lane: a file in {lane_dirs_text()}."}
-        argv = ["schedule", "set", pick("name"), "--at", pick("at"), "-f", pick("lane")]
-        if pick("days"):
-            argv += ["--days", pick("days")]
+        try:
+            d = days()
+        except ValueError as e:
+            return {"ok": False, "message": str(e)}
+        argv = ["schedule", "set", pick("name"), "--at", pick("at").replace(" ", ""), "-f", pick("lane")]
+        if d:
+            argv += ["--days", d]
         if pick("note"):
             argv += ["--note", pick("note")]
-        return go(argv, f"{pretty(pick('name'))} is scheduled: {when_text({'at': pick('at'), 'days': pick('days')})}.", page=f"schedule/{agent}/{pick('name')}")
+        if pick("model"):
+            argv += ["--model", pick("model")]
+        if pick("slot"):
+            argv += ["--slot", pick("slot")]
+        return go(argv, f"{pretty(pick('name'))} is scheduled: {when_text({'at': pick('at'), 'days': d})}.", page=f"schedule/{agent}/{pick('name')}")
     return {"ok": False, "message": "The clock doesn't know that action."}
 
 

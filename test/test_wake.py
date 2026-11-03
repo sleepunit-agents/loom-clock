@@ -998,16 +998,19 @@ class PauseAndNow(Clocks):
             view = wake_cli.ui_view()
         page = wake_cli.ui_page(view, "", scope="ada")
         hero = page["sections"][0]["blocks"]
-        self.assertEqual(hero[0]["items"][0]["value"], "Paused")
-        self.assertEqual([b["label"] for b in hero[1]["items"]], ["Wake now", "Resume"])
-        sched = page["sections"][1]["blocks"][0]["items"][0]
-        self.assertEqual((sched["text"], sched["badge"], sched["page"]), ("Nightly", "10:44 PM daily", "schedule/ada/nightly"))
+        self.assertEqual((hero[0]["type"], hero[0]["tone"], hero[0]["text"]), ("health", "warn", "Ada's clock is paused"))
+        # The clock's switch says it's off, and Wake now is the panel's one action.
+        [switch] = hero[1]["rows"]
+        self.assertEqual((switch["value"], switch["toggle"]), ("Paused", {"action": "clock", "on": False, "fields": {"agent": "ada"}}))
+        self.assertEqual(hero[1]["action"]["label"], "Wake now")
+        sched = page["sections"][1]["blocks"][0]["rows"][0]
+        self.assertEqual((sched["label"], sched["value"], sched["page"]), ("Nightly", "10:44 PM, every day", "schedule/ada/nightly"))
         self.assertEqual(wake_cli.ui_page(view, "schedule/ada/nightly")["title"], "Nightly")
         # The household's Clock is loom's own: its lanes, and a link to each agent's clock, no agent's schedule.
         home = wake_cli.ui_page(view, "")
         self.assertEqual([x["id"] for x in home["sections"]], ["loom-lanes", "agents"])
-        [link] = home["sections"][1]["blocks"][1]["items"]
-        self.assertEqual((link["page"], link["meta"]), ("agent:ada", "paused"))
+        [link] = home["sections"][1]["blocks"][1]["rows"]
+        self.assertEqual((link["page"], link["value"]), ("agent:ada", "Paused"))
         m = wake_cli.ui_manifest(view)
         self.assertEqual((m["tab"], m["agentTab"]), ({"label": "Clock", "kind": "setting"}, {"label": "Clock"}))
         self.assertEqual(m["tile"]["page"], "agent:ada")
@@ -1386,11 +1389,160 @@ class LoomLanesOnThePage(LoomLanes):
         self.assertTrue(self.scheds("ada")["directory-upkeep"]["prompt"].endswith("Keep it tidier."))
         with mock.patch.object(wake_cli, "LANES", self.root / "clocks" / "lanes.json"), mock.patch.object(wake_cli, "HOUSEHOLD", self.root / "household.json"):
             page = wake_cli.ui_page([], "lane/directory-upkeep")
-        self.assertEqual([x["id"] for x in page["sections"]], ["settings", "text", "replace", "remove"])
-        self.assertEqual(page["sections"][1]["blocks"][0]["text"], "Keep it tidier.")
+        self.assertEqual([x["id"] for x in page["sections"]], ["settings", "text", "remove"])
+        rows = {r["label"]: r for r in page["sections"][0]["blocks"][0]["rows"]}
+        self.assertEqual(list(rows), ["When", "Where", "Whose", "What it's for"])
+        self.assertEqual(page["sections"][1]["blocks"][0]["rows"][1]["edit"]["action"], "lane-text")
+        self.assertEqual(page["sections"][1]["blocks"][0]["rows"][0]["sheet"]["blocks"][0]["text"], "Keep it tidier.")
         r, _ = self.run_act("lane-rm", {"name": "directory-upkeep", "agent": "ada"})
         self.assertTrue(r["ok"], r)
         self.assertNotIn("directory-upkeep", self.scheds("ada"))
+
+
+class LanePanel(LoomLanesOnThePage):
+    """A lane's page is a panel (Jonathan, 2026-11-03: "settings become rows that state the current value in a
+    sentence; tapping a row opens a sheet with one control"): each row's sheet or switch posts only what it sets."""
+
+    def setUp(self):
+        super().setUp()
+        r, _ = self.run_act("lane-new", {"name": "upkeep", "to": "bo", "at": "06:05", "days": "mon,tue,wed,thu,fri",
+                                         "days_chips": "1", "where": "house", "note": "people cards", "text": "Keep it tidy."})
+        self.assertTrue(r["ok"], r)
+
+    def test_days_come_as_chips_and_the_old_form_still_works(self):
+        # The day chips post the ticked days; the clock keeps the short form.
+        self.assertEqual(self.scheds("bo")["upkeep"]["days"], "mon-fri")
+        r, calls = self.run_act("lane-edit", {"name": "upkeep", "agent": "bo", "at": "07:15", "days": "mon,wed,fri", "days_chips": "1"})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["message"], "Upkeep is Bo's, 7:15 AM, Mon, Wed and Fri, in a house.")
+        self.assertNotIn("--agent", calls[0], "a When sheet sets the time and days, nothing else")
+        self.assertNotIn("--no-local", calls[0])
+        sc = self.scheds("bo")["upkeep"]
+        self.assertEqual((sc["at"], sc["days"]), ("07:15", "mon,wed,fri"))
+        self.assertTrue(sc["prompt"].endswith("Keep it tidy."), "the text stays")
+        # Every day ticked is every day; none ticked is refused, not read as every day.
+        r, _ = self.run_act("lane-edit", {"name": "upkeep", "agent": "bo", "at": "07:15", "days": ",".join(wake_cli.DAYS), "days_chips": "1"})
+        self.assertNotIn("days", self.scheds("bo")["upkeep"])
+        r, calls = self.run_act("lane-edit", {"name": "upkeep", "agent": "bo", "at": "07:15", "days": "", "days_chips": "1"})
+        self.assertEqual((r["ok"], r["message"], calls), (False, "Pick at least one day.", []))
+        # The old free-text form: mon-fri, sat,sun, empty for daily.
+        r, _ = self.run_act("lane-edit", {"name": "upkeep", "agent": "bo", "at": "07:15", "days": "sat,sun"})
+        self.assertEqual(self.scheds("bo")["upkeep"]["days"], "sat,sun")
+        r, calls = self.run_act("lane-edit", {"name": "upkeep", "agent": "bo", "days": "someday"})
+        self.assertFalse(r["ok"])
+        self.assertEqual(calls, [])
+
+    def test_where_and_whose_switch_at_once(self):
+        r, calls = self.run_act("lane-edit", {"name": "upkeep", "agent": "bo", "where": "local"})
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(calls[0], ["lane", "set", "upkeep", "--local"])
+        self.assertTrue(self.scheds("bo")["upkeep"]["prompt"].startswith("<!-- house: local -->"))
+        self.assertEqual(self.scheds("bo")["upkeep"]["at"], "06:05", "the time stays")
+        r, calls = self.run_act("lane-edit", {"name": "upkeep", "agent": "bo", "to": "ada"})
+        self.assertTrue(r["ok"], r)
+        self.assertNotIn("upkeep", self.scheds("bo"))
+        self.assertEqual(self.scheds("ada")["upkeep"]["days"], "mon-fri")
+        r, calls = self.run_act("lane-edit", {"name": "upkeep", "agent": "ada", "note": "the directory"})
+        self.assertEqual((r["ok"], r["message"]), (True, "Upkeep: what it's for is saved."))
+        r, _ = self.run_act("lane-edit", {"name": "nope", "agent": "ada", "where": "local"})
+        self.assertFalse(r["ok"])
+
+    def test_run_now_runs_it_on_its_agents_clock(self):
+        calls = []
+        run = lambda agent, argv: (calls.append((agent, argv)), (0, "", ""))[1]
+        with mock.patch.object(wake_cli, "LANES", self.root / "clocks" / "lanes.json"):
+            r = wake_cli.ui_act({"action": "lane-run", "fields": {"name": "upkeep", "agent": "ada"}}, run)
+        self.assertEqual(calls, [("bo", ["schedule", "run", "upkeep", "--note", "from loom"])])
+        self.assertEqual(r["message"], "Upkeep runs within a minute, in a house, as Bo.")
+
+    def test_the_page_reads_as_rows(self):
+        with mock.patch.object(wake_cli, "LANES", self.root / "clocks" / "lanes.json"), \
+             mock.patch.object(wake_cli, "HOUSEHOLD", self.root / "household.json"):
+            page = wake_cli.ui_page([], "lane/upkeep")
+            home = wake_cli.ui_page([], "")
+        panel = page["sections"][0]["blocks"][0]
+        rows = {r["label"]: r for r in panel["rows"]}
+        self.assertEqual(rows["When"]["value"], "6:05 AM, weekdays")
+        days = rows["When"]["edit"]["fields"][1]
+        self.assertEqual((days["kind"], days["value"], len(days["options"])), ("checks", "mon,tue,wed,thu,fri", 7))
+        self.assertEqual(rows["Where"]["choice"]["value"], "house")
+        self.assertEqual([o["label"] for o in rows["Where"]["choice"]["options"]], ["In a house", "On loom's machine"])
+        self.assertEqual((rows["Whose"]["value"], rows["Whose"]["choice"]["name"]), ("Bo", "to"))
+        self.assertEqual(rows["What it's for"]["value"], "people cards")
+        self.assertEqual(panel["action"]["action"], "lane-run")
+        for r in panel["rows"]:
+            self.assertLessEqual(len({"toggle", "choice", "edit", "sheet", "act", "page"} & set(r)), 1, r)
+        [lane, new] = home["sections"][0]["blocks"]
+        self.assertEqual(lane["rows"][0]["value"], "Bo · 6:05 AM, weekdays")
+        self.assertEqual(new["rows"][0]["edit"]["action"], "lane-new")
+
+
+class AppWords(unittest.TestCase):
+    """What a clock says, in words: days, times, and what a wake is for without its raw ids."""
+
+    def test_days_both_ways(self):
+        for given, kept in (("", ""), ("mon-fri", "mon-fri"), ("mon,tue,wed,thu,fri", "mon-fri"), ("sun,sat", "sat,sun"),
+                            ("mon,tue,wed,thu,fri,sat,sun", ""), ("fri,mon,wed", "mon,wed,fri"), ("Sat-Sun", "sat,sun")):
+            self.assertEqual(wake_cli.days_spec(given), kept, given)
+        with self.assertRaises(ValueError):
+            wake_cli.days_spec("", chips=True)
+        with self.assertRaises(ValueError):
+            wake_cli.days_spec("weekdays")
+        self.assertEqual(wake_cli.days_chips(""), "mon,tue,wed,thu,fri,sat,sun")
+        self.assertEqual(wake_cli.days_chips("mon-fri"), "mon,tue,wed,thu,fri")
+
+    def test_when_in_a_sentence(self):
+        w = wake_cli.when_words
+        self.assertEqual(w({"at": "05:17"}), "5:17 AM, every day")
+        self.assertEqual(w({"at": "05:17", "days": "mon-fri"}), "5:17 AM, weekdays")
+        self.assertEqual(w({"at": "18:00", "days": "sun"}), "6:00 PM, Sundays")
+        self.assertEqual(w({"at": ["07:17", "19:17"], "days": "mon,wed,fri"}), "7:17 AM and 7:17 PM, Mon, Wed and Fri")
+
+    def test_a_wake_says_what_its_for_and_keeps_its_ids_aside(self):
+        w = wake_cli.wake_words
+        # before: "t-1652 PR38 nudge-watch round 22"
+        self.assertEqual(w("t-1652 PR38 nudge-watch round 22"), ("Checking a pull request is moving, round 22", ["t-1652", "PR 38"]))
+        self.assertEqual(w("t-1340/t-1673 PR57 nudge-watch round 5")[1], ["t-1340", "t-1673", "PR 57"])
+        self.assertEqual(w("t-1674 PR385 review-watch round 21")[0], "Watching for a review, round 21")
+        self.assertEqual(w("t-1765: wunder swap 86% recurrence investigation"), ("Wunder swap 86% recurrence investigation", ["t-1765"]))
+        self.assertEqual(w("t-40 routine 24h dead-man after t-40 reply, round 7")[0], "Safety wake, in case nothing else wakes it, round 7")
+        self.assertEqual(w("making: discontinuity-mud session 27"), ("Making: discontinuity-mud session 27", []))
+        self.assertEqual(w("Plan (schedule)"), ("Plan (schedule)", []))
+        self.assertEqual(w(""), ("", []))
+
+    def test_a_wakes_page_keeps_its_ids_in_its_details(self):
+        now = wake_cli.datetime(2026, 10, 30, 8, 0)
+        e = {"id": "w-abcdef", "kind": "wake", "at": "2026-10-30 08:39:00", "created": "2026-10-30 07:00:00",
+             "note": "t-1652 PR38 nudge-watch round 22", "prompt": "Check PR 38."}
+        view = [{"agent": "ada", "schedules": {}, "entries": [e], "recent": [], "paused": None}]
+        page = wake_cli.ui_page(view, "wake/ada/w-abcdef", now=now)
+        self.assertEqual(page["title"], "One-off wake")
+        rows = {r["label"]: r for r in page["sections"][0]["blocks"][0]["rows"]}
+        self.assertEqual(rows["What it's for"]["value"], "Checking a pull request is moving, round 22")
+        self.assertEqual(rows["When"]["value"], "8:39 AM, in 39 minutes")
+        self.assertNotIn("w-abcdef", wake_cli.json.dumps({k: v for k, v in rows.items() if k != "Details"}))
+        self.assertIn("w-abcdef", wake_cli.json.dumps(rows["Details"]["sheet"]))
+        row = wake_cli.oneoff_blocks(view[0], now)[1]["items"][0]
+        self.assertEqual((row["text"], row["meta"]), ("Checking a pull request is moving, round 22", "8:39 AM · t-1652"))
+
+    def test_the_clock_switch_pauses_and_resumes(self):
+        calls = []
+        run = lambda agent, argv: (calls.append(argv), (0, "", ""))[1]
+        off = wake_cli.ui_act({"action": "clock", "fields": {"agent": "ada", "on": ""}}, run)
+        on = wake_cli.ui_act({"action": "clock", "fields": {"agent": "ada", "on": "on"}}, run)
+        self.assertEqual(calls, [["pause"], ["resume"]])
+        self.assertTrue(off["ok"] and on["ok"])
+
+    def test_a_schedules_when_sheet_keeps_its_lane_note_and_model(self):
+        calls = []
+        run = lambda agent, argv: (calls.append(argv), (0, "", ""))[1]
+        with mock.patch.object(wake_cli, "lane_file", return_value=Path("/x")):
+            r = wake_cli.ui_act({"action": "schedule-set", "fields": {
+                "agent": "ada", "name": "groom", "at": "17:47", "days": "sun", "days_chips": "1", "lane": "routines/groom.md",
+                "note": "weekly", "model": "claude-opus-5"}}, run)
+        self.assertEqual(calls, [["schedule", "set", "groom", "--at", "17:47", "-f", "routines/groom.md", "--days", "sun",
+                                  "--note", "weekly", "--model", "claude-opus-5"]])
+        self.assertEqual(r["message"], "Groom is scheduled: Sun 5:47 PM.")
 
 
 class PlainWords(unittest.TestCase):
@@ -1425,9 +1577,9 @@ class PlainWords(unittest.TestCase):
         view = [{"agent": "ada", "schedules": {}, "entries": [e], "recent": [], "paused": None}]
         with mock.patch.object(wake_cli, "load_lanes", return_value={}):
             home = wake_cli.ui_page(view, "", now=self.now)
-        [link] = home["sections"][-1]["blocks"][1]["items"]
+        [link] = home["sections"][-1]["blocks"][1]["rows"]
         # before: "next: 8:50 AM, schedule plan-prepare"
-        self.assertEqual(link["meta"], "Next at 8:50 AM: Plan prepare (schedule)")
+        self.assertEqual((link["value"], link["detail"]), ("Next at 8:50 AM", "Plan prepare"))
         # before: tile "Ada next: schedule plan-prepare"
         tile = wake_cli.ui_manifest(view, now=self.now)["tile"]
         self.assertEqual(tile["detail"], "Ada: Plan prepare")
@@ -1456,9 +1608,9 @@ class PlainWords(unittest.TestCase):
         self.assertEqual(m["agents"]["ada"]["readings"][0]["value"], "nothing pending")
         # The Clock page's top and the household's link to it, too.
         with mock.patch.object(wake_cli, "load_lanes", return_value={}):
-            [link] = wake_cli.ui_page(view, "", now=self.now)["sections"][-1]["blocks"][1]["items"]
-        self.assertEqual(link["meta"], "nothing pending")
-        self.assertEqual(wake_cli.hero(view[0], self.now)[0]["items"][0]["value"], "Nothing")
+            [link] = wake_cli.ui_page(view, "", now=self.now)["sections"][-1]["blocks"][1]["rows"]
+        self.assertEqual(link["value"], "Nothing pending")
+        self.assertEqual(wake_cli.hero(view[0], self.now)[0]["text"], "Nothing pending")
 
     def test_times_are_12_hour_everywhere(self):
         # before: "03:13 daily", "04:17 daily" (lane_when built from the raw 24-hour text)
@@ -1469,17 +1621,16 @@ class PlainWords(unittest.TestCase):
         with mock.patch.object(wake_cli, "load_lanes", return_value={"expand-pages": {"agent": "ada", "at": "05:17", "text": "x"}}), \
              mock.patch.object(wake_cli, "household_agents", return_value=["ada"]):
             page = wake_cli.ui_page([], "lane/expand-pages")
-            rows = wake_cli.lane_blocks()[1]["items"]
-        # before: "A loom lane: the household's, run by Ada, 05:17 daily."
-        self.assertEqual(page["intro"], "A loom lane: the household's, run by Ada, 5:17 AM daily.")
+            rows = wake_cli.lane_blocks()[0]["rows"]
+        self.assertEqual(page["intro"], "A loom lane: the household's work, run by Ada.")
         self.assertEqual(page["title"], "Expand pages")
-        # before: "Ada · 05:17 daily"
-        self.assertEqual((rows[0]["text"], rows[0]["meta"]), ("Expand pages", "Ada · 5:17 AM daily"))
+        # before: "Ada · 05:17 daily"; then "Ada · 5:17 AM daily" in a list's meta
+        self.assertEqual((rows[0]["label"], rows[0]["value"]), ("Expand pages", "Ada · 5:17 AM, every day"))
 
     def test_the_schedule_form_hint_and_lane_picker(self):
         c = {"agent": "ada", "schedules": {}, "entries": [], "recent": [], "paused": None}
         with mock.patch.object(wake_cli, "lanes", return_value=["routines/expand-pages.md"]):
-            form = wake_cli.schedule_blocks(c, self.now)[1]["blocks"][0]
+            form = wake_cli.schedule_blocks(c, self.now)[-1]["rows"][-1]["edit"]
         fields = {f["name"]: f for f in form["fields"]}
         # A time picker now, not a text box with a format hint (TimePicker below).
         self.assertEqual((fields["at"]["kind"], fields["at"]["multiple"]), ("time", True))
@@ -1495,7 +1646,8 @@ class PlainWords(unittest.TestCase):
         a, b = wake_cli.recent_blocks(c, self.now)[0]["items"][::-1]
         # before: text "w-2bd487", meta "8:01 AM · house h-400"
         self.assertEqual((a["text"], a["meta"]), ("A wake", "8:01 AM · in a house"))
-        self.assertEqual(b["text"], "routine dead-man rearm, round after w-ea33ba", "a note keeps its ids")
+        # a note reads in words; its ids go to its detail (Jonathan, 2026-11-03: "raw ids never show unless asked")
+        self.assertEqual(b["text"], "Safety wake, in case nothing else wakes it")
         oneoff = wake_cli.oneoff_blocks({"agent": "ada", "entries": [self.entry(prompt="")]}, self.now)[1]["items"][0]
         self.assertEqual(oneoff["text"], "A wake")
 
