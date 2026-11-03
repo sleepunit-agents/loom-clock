@@ -2,7 +2,7 @@
   "name": "loom-clock",
   "version": "0.1.0",
   "private": true,
-  "description": "loom's clock piece: an agent's self-set wakes, recurring schedules, the household's lanes and agent-to-agent relays, on systemd user timers",
+  "description": "loom's clock piece: an agent's self-set wakes, recurring schedules and the household's lanes, on systemd user timers",
   "bin": {
     "loom-clock": "bin/wake",
     "wake": "bin/wake"
@@ -20,7 +20,7 @@
     "name": "clock",
     "role": "clock",
     "label": "Clock",
-    "description": "Wakes an agent: self-set alarms, recurring schedules, the household's lanes assigned to an agent, and relays between agents, each run in a house or as a session here.",
+    "description": "Wakes an agent: self-set alarms, recurring schedules and the household's lanes assigned to an agent, each delivered through loom (or run in a house or as a session here). Relays between agents are the runtime's.",
     "settings": [
       {
         "name": "WAKE_LOCAL_AGENT",
@@ -104,11 +104,6 @@
         "name": "WAKE_LOOM_URL",
         "label": "loom's address, as this machine reaches it",
         "default": "http://127.0.0.1:8787"
-      },
-      {
-        "name": "WAKE_RELAY_HEADS_UP",
-        "label": "A relay thread this long is a heads-up",
-        "hint": "messages in one thread within a day (default 8)"
       }
     ],
     "venues": { "wake": {} },
