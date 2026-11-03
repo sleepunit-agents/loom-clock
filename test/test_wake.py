@@ -553,6 +553,172 @@ class MixedMode(unittest.TestCase):
         self.assertEqual(self.fire({**self.base, "prompt": "p"}, mode="house"), "house")
 
 
+class Delivery(unittest.TestCase):
+    """A wake for the agent's house is delivered through loom's `POST /api/loom/deliver` (agent-runtime.md,
+    "Delivery"), with the clock's own token; WAKE_DELIVERY=spawn keeps the old path."""
+
+    base = {"id": "w-cccccc", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "t-9 round 2", "model": "m", "created": "x"}
+
+    def fire(self, entry, answers, env=None, body=None, entries=None):
+        """Fire `entry` with post_delivery answering `answers` in turn: (posts, dispatch mock, spool, log, alerts)."""
+        posts, alerts = [], []
+        answers = list(answers)
+        with tempfile.TemporaryDirectory() as td:
+            tok = Path(td) / "token"
+            tok.write_text("clock-token\n")
+            e = {"WAKE_FIRE": "mixed", "WAKE_DELIVER_TOKEN_FILE": str(tok), "WAKE_DELIVERY": "", **(env or {})}
+            with mock.patch.dict(wake_cli.os.environ, e), \
+                 mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
+                 mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+                 mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+                 mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+                 mock.patch.object(wake_cli, "SCHEDULES", Path(td) / "schedules.json"), \
+                 mock.patch.object(wake_cli, "ensure_deadman"), \
+                 mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+                 mock.patch.object(wake_cli, "alert", lambda m: alerts.append(m)), \
+                 mock.patch.object(wake_cli, "post_delivery", lambda b: posts.append(json.loads(json.dumps(b))) or answers.pop(0)), \
+                 mock.patch.object(wake_cli, "dispatch") as dispatch, \
+                 mock.patch.object(wake_cli.subprocess, "run") as prime:
+                prime.return_value.returncode = 0
+                dispatch.return_value.returncode = 0
+                dispatch.return_value.stdout = ""
+                if body is not None:
+                    lane = Path(td) / "nightly.md"
+                    lane.write_text(body)
+                    entry = {**entry, "prompt_file": str(lane)}
+                (Path(td) / "spool.jsonl").write_text("".join(json.dumps(x) + "\n" for x in [entry, *(entries or [])]))
+                try:
+                    wake_cli.cmd_fire(mock.Mock(id=entry["id"]))
+                except SystemExit:
+                    pass
+                spool = [json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
+                logged = (Path(td) / "wake.log").read_text() if (Path(td) / "wake.log").exists() else ""
+        return posts, dispatch, spool, logged, alerts
+
+    ok = (200, {"conversation": "cv-0123456789ab", "seq": 1, "body": "queued", "reason": "its body is still starting"})
+
+    def test_a_house_wake_is_delivered_not_started(self):
+        posts, dispatch, spool, logged, _ = self.fire({**self.base, "prompt": "check PR 12"}, [self.ok])
+        dispatch.assert_not_called()
+        (b,) = posts
+        self.assertEqual({k: b[k] for k in ("id", "agent", "venue", "place", "label", "from", "kind")},
+                         {"id": "w-cccccc", "agent": "ada", "venue": "wake", "place": "wake:w-cccccc", "label": "t-9 round 2",
+                          "from": {"kind": "schedule"}, "kind": "wake"})
+        self.assertRegex(b["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.000Z$")
+        # The preamble (the agent's own words, with this wake's id) leads the text; the prompt follows it.
+        self.assertIn("(wake id w-cccccc, kind wake", b["text"])
+        self.assertIn("in your house (loom's runtime delivered it)", b["text"])
+        self.assertTrue(b["text"].endswith("check PR 12"))
+        self.assertNotIn("model", b, "the runtime chooses the model")
+        self.assertIn("fire | w-cccccc delivered: queued (its body is still starting), cv-0123456789ab seq 1", logged)
+        self.assertEqual(spool, [], "delivered: nothing left to retry or watch")
+
+    def test_a_lanes_wakes_share_one_conversation(self):
+        posts, *_ = self.fire(self.base, [self.ok], body="# Lane\n<!-- house: ready -->\nwork")
+        self.assertEqual(posts[0]["place"], "lane:nightly")
+        self.assertIn("nightly.md", posts[0]["text"], "a lane file goes as a pointer, as to a house")
+        posts, *_ = self.fire({**self.base, "kind": "schedule", "schedule": "knowledge-triage", "prompt": "the lane"}, [self.ok])
+        self.assertEqual(posts[0]["place"], "lane:knowledge-triage")
+
+    def test_failed_is_retried_later_as_a_new_delivery_in_the_same_conversation(self):
+        failed = (200, {"conversation": "cv-0123456789ab", "seq": 1, "body": "failed", "reason": "no box may host ada"})
+        posts, _, spool, logged, _ = self.fire({**self.base, "kind": "schedule", "schedule": "nightly", "prompt": "p"}, [failed])
+        (r,) = spool
+        self.assertNotEqual(r["id"], "w-cccccc")
+        self.assertEqual((r["fails"], r["kind"], r["deliver_place"]), (1, "wake", "lane:nightly"))
+        self.assertNotIn("delivery", r, "loom keeps a failed answer for the id: the retry is a new delivery")
+        self.assertIn("no body took it: no box may host ada", logged)
+        posts2, *_ = self.fire(r, [self.ok])
+        self.assertEqual((posts2[0]["id"], posts2[0]["place"]), (r["id"], "lane:nightly"))
+
+    def test_no_answer_or_a_5xx_is_retried_with_the_same_id_and_body(self):
+        for answer in [(503, {"error": "unavailable: clock has too many deliveries in flight"}), (0, {"error": "loom didn't answer: refused"}), (429, {"error": "too-many"})]:
+            posts, _, spool, logged, alerts = self.fire({**self.base, "prompt": "p"}, [answer])
+            (r,) = spool
+            self.assertEqual(r["delivery"], posts[0], answer)
+            posts2, _, spool2, logged2, _ = self.fire(r, [self.ok])
+            self.assertEqual(posts2[0], posts[0], "the same (source, id), with the same body: loom answers it once")
+            self.assertIn(f"fire | {r['id']} delivered as w-cccccc: queued", logged2)
+            self.assertEqual(spool2, [])
+
+    def test_a_refusal_is_said_loudly_and_never_retried(self):
+        for status in (400, 403, 409, 413):
+            posts, _, spool, logged, alerts = self.fire({**self.base, "prompt": "p"}, [(status, {"error": "forbidden: clock doesn't declare that it delivers on core's wake"})])
+            self.assertEqual(spool, [], status)
+            self.assertIn(f"fire-refused | w-cccccc deliver REFUSED {status}", logged)
+            self.assertEqual(len(alerts), 1)
+            self.assertIn("not retried", alerts[0].lower())
+
+    def test_spawn_is_one_setting_away(self):
+        posts, dispatch, *_ = self.fire({**self.base, "prompt": "p"}, [], env={"WAKE_DELIVERY": "spawn"})
+        self.assertEqual(posts, [])
+        self.assertEqual(dispatch.call_args.args[3], "house")
+        # Unset, with no token to deliver with: the old way.
+        posts, dispatch, *_ = self.fire({**self.base, "prompt": "p"}, [], env={"WAKE_DELIVER_TOKEN_FILE": ""})
+        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "house"))
+        # Unset, and loom has no piece offering delivery: this wake goes the old way.
+        posts, dispatch, _, logged, _ = self.fire({**self.base, "prompt": "p"}, [(503, {"error": "unavailable: no installed piece offers delivery (the runtime), so nothing can reach a body"})])
+        self.assertEqual((len(posts), dispatch.call_args.args[3]), (1, "house"))
+        self.assertIn("in a fresh house (loom-box)", dispatch.call_args.args[0], "its words say where it really runs")
+        self.assertIn("fire-spawn", logged)
+        # Set to deliver, it never falls back.
+        posts, dispatch, spool, *_ = self.fire({**self.base, "prompt": "p"}, [(503, {"error": "unavailable: no installed piece offers delivery"})], env={"WAKE_DELIVERY": "deliver"})
+        dispatch.assert_not_called()
+        self.assertEqual(len(spool), 1, "retried")
+
+    def test_what_delivery_cant_carry_goes_the_old_way(self):
+        # A wake that needs loom's machine, and a lane that keeps a house slot.
+        posts, dispatch, *_ = self.fire({**self.base, "prompt": "ssh buildbox <!-- house: local -->"}, [])
+        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "local"))
+        posts, dispatch, *_ = self.fire(self.base, [], body="# L\n<!-- house: ready -->\n<!-- house-slot: nightly -->\n")
+        self.assertEqual((posts, dispatch.call_args.args[3], dispatch.call_args.args[5]), ([], "house", "nightly"))
+
+    def test_the_post_itself(self):
+        import http.server
+        import threading
+        seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                seen.append((self.path, self.headers.get("authorization"), json.loads(self.rfile.read(int(self.headers["content-length"])))))
+                code, out = (403, {"error": "forbidden: no"}) if seen[-1][2].get("id") == "deny" else (200, {"conversation": "cv-0123456789ab", "seq": 3, "body": "started"})
+                data = json.dumps(out).encode()
+                self.send_response(code)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            with tempfile.TemporaryDirectory() as td:
+                (Path(td) / "t").write_text("tok-1\n")
+                env = {"WAKE_DELIVER_TOKEN_FILE": str(Path(td) / "t"), "WAKE_LOOM_URL": f"http://127.0.0.1:{srv.server_port}/mcp"}
+                with mock.patch.dict(wake_cli.os.environ, env):
+                    self.assertEqual(wake_cli.post_delivery({"id": "w-1"}), (200, {"conversation": "cv-0123456789ab", "seq": 3, "body": "started"}))
+                    self.assertEqual(wake_cli.post_delivery({"id": "deny"}), (403, {"error": "forbidden: no"}))
+                self.assertEqual(seen[0], ("/api/loom/deliver", "Bearer tok-1", {"id": "w-1"}))
+                with mock.patch.dict(wake_cli.os.environ, {**env, "WAKE_LOOM_URL": "http://127.0.0.1:1"}):
+                    self.assertEqual(wake_cli.post_delivery({"id": "w-1"})[0], 0)
+                with mock.patch.dict(wake_cli.os.environ, {**env, "WAKE_DELIVER_TOKEN_FILE": str(Path(td) / "none")}):
+                    status, ans = wake_cli.post_delivery({"id": "w-1"})
+                    self.assertEqual(status, 0)
+                    self.assertNotIn("tok-1", ans["error"])
+        finally:
+            srv.shutdown()
+
+    def test_the_piece_says_it_delivers_on_cores_wake(self):
+        loom = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom"]
+        self.assertEqual(loom["venues"], {"wake": {}})
+        names = {x["name"] for x in loom["settings"]}
+        self.assertTrue({"WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL"} <= names)
+        self.assertTrue({"WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL"} <= set(wake_cli.TIMER_ENV))
+
+
 class Clocks(unittest.TestCase):
     """Schedules, the cap and per-agent clocks. Everything in a temp dir:
     arm_timer/disarm_timer are stubs, and no path here is loom's machine's."""

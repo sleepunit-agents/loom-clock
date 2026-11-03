@@ -40,13 +40,25 @@ inline prompt) and runs the rest here. Every other agent's wake, and an agent's
 own wake (set through the piece API), always goes to a house. Set by $WAKE_FIRE,
 else $WAKE_DATA/fire (one word).
 
+Delivery (WAKE_DELIVERY): a wake bound for the agent's house is delivered
+through loom's `POST /api/loom/deliver` (loom docs/specs/agent-runtime.md,
+"Delivery") with the clock's own piece token (WAKE_DELIVER_TOKEN_FILE): the
+runtime records the wake in the agent's conversation and reaches its body.
+One lane is one conversation (place `lane:<name>`); any other wake is its own
+(`wake:<id>`). "spawn" keeps the old path (`loom box up` with the wake as the
+house's task); unset, it's "deliver" when the clock has a token for it and
+loom has a piece offering delivery, else "spawn". A wake that needs loom's
+machine (fire mode "local") or a house slot still goes the old way: delivery
+has neither.
+
 Timers: transient `systemd-run --user` units named wake-<id> (KillMode=process
 so a background session the wake started survives the service's cgroup cleanup).
 
 Settings (environment; a managed piece gets them from loom, see README.md):
   WAKE_DATA, WAKE_LOCAL_AGENT, WAKE_REPO, WAKE_LANE_DIRS, WAKE_AGENTS, WAKE_FIRE,
   WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
-  WAKE_PREAMBLE_FILE, WAKE_RELAY_HEADS_UP, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS
+  WAKE_PREAMBLE_FILE, WAKE_RELAY_HEADS_UP, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS,
+  WAKE_DELIVERY, WAKE_DELIVER_TOKEN_FILE, WAKE_LOOM_URL
 """
 
 import argparse
@@ -187,7 +199,8 @@ TIME_FMT = "%Y-%m-%d %H:%M:%S"
 TIMER_ENV = ("PATH", "HOME", "LOOM_HOME", "LOOM_PIECE_NAME", "LOOM_PIECE_HOME", "LOOM_URL", "LOOM_TOKEN_FILE",
              "WAKE_DATA", "WAKE_LOCAL_AGENT", "WAKE_REPO", "WAKE_LANE_DIRS", "WAKE_AGENTS", "WAKE_FIRE", "WAKE_MODEL",
              "WAKE_SESSION_COMMAND", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
-             "WAKE_RELAY_HEADS_UP", "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS")
+             "WAKE_RELAY_HEADS_UP", "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS",
+             "WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL")
 
 
 def lane_dir():
@@ -1384,6 +1397,123 @@ def fire_gate_open():
         return False
 
 
+# ─── Delivery (loom docs/specs/agent-runtime.md, "5. Delivery") ─────────────
+# A wake is delivered, not started: the clock hands it to loom's `deliver` with its own piece token, and the runtime
+# writes the wake's turn and reaches the agent's body. The clock names no harness and no house here.
+DELIVER_TIMEOUT_S = 130   # core forwards for up to 120 s
+DELIVER_TEXT_MAX = 40000
+DELIVER_ID_MAX = 200
+DELIVER_LABEL_MAX = 80
+BODY_STATES = ("fed", "resumed", "started", "queued")
+NO_DELIVERY = "no installed piece offers delivery"
+
+
+def delivery_mode():
+    """"deliver" or "spawn" (WAKE_DELIVERY). Unset: "deliver" when the clock has a token to deliver with (core then
+    says whether a piece offers delivery; with none, that wake falls back to "spawn"), else "spawn"."""
+    m = setting("WAKE_DELIVERY").strip().lower()
+    if m in ("spawn", "deliver"):
+        return m
+    return "auto" if setting("WAKE_DELIVER_TOKEN_FILE") else "spawn"
+
+
+def loom_api():
+    """loom's address for its HTTP API (WAKE_LOOM_URL; an MCP URL's /mcp is dropped)."""
+    u = (setting("WAKE_LOOM_URL") or os.environ.get("LOOM_URL") or "http://127.0.0.1:8787").rstrip("/")
+    return u[:-4] if u.endswith("/mcp") else u
+
+
+def wake_place(entry):
+    """Where a wake lands in the agent's conversations (conversations.md: one per agent, venue and place). A lane's
+    wakes share one, so a lane's runs read as one conversation and its body can resume: `lane:<name>`, by the
+    schedule, else the lane file. Anything else is its own: `wake:<id>`, by the id it was first fired under."""
+    if entry.get("deliver_place"):
+        return entry["deliver_place"]
+    name = entry.get("schedule")
+    if not name and (entry.get("lane") or entry.get("prompt_file")):
+        name = Path(entry.get("lane") or entry["prompt_file"]).stem
+    if name:
+        return f"lane:{name}"[:200]
+    return f"wake:{entry['id']}"
+
+
+def wake_label(entry):
+    what = entry.get("note") or (pretty(entry["schedule"]) if entry.get("schedule") else "") or entry["id"]
+    return plain(what, DELIVER_LABEL_MAX) or entry["id"]
+
+
+def post_delivery(body):
+    """POST /api/loom/deliver: (status, answer). 0 is no answer (loom down, a timeout, no token)."""
+    tf = setting("WAKE_DELIVER_TOKEN_FILE")
+    try:
+        token = Path(tf).expanduser().read_text().strip() if tf else ""
+    except OSError as e:
+        return 0, {"error": f"can't read WAKE_DELIVER_TOKEN_FILE: {e.strerror}"}
+    if not token:
+        return 0, {"error": "no token to deliver with (WAKE_DELIVER_TOKEN_FILE: a piece token of this clock's)"}
+    req = urllib.request.Request(f"{loom_api()}/api/loom/deliver", data=json.dumps(body).encode(), method="POST",
+                                 headers={"content-type": "application/json", "authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=DELIVER_TIMEOUT_S) as r:
+            raw, status = r.read(), r.status
+    except urllib.error.HTTPError as e:
+        raw, status = e.read(), e.code
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        return 0, {"error": f"loom didn't answer: {getattr(e, 'reason', e)}"}
+    try:
+        ans = json.loads(raw or b"{}")
+    except ValueError:
+        ans = {}
+    return status, ans if isinstance(ans, dict) else {}
+
+
+def as_retry(entry):
+    """A schedule's run that didn't go is retried as a one-off: its next occurrence is already armed."""
+    if entry.get("kind") == "schedule":
+        entry["kind"] = "wake"
+        entry["note"] = f"retry of {entry.pop('schedule')}: {entry.get('note', '')}"
+
+
+def deliver_wake(entry, prompt, agent, auto):
+    """Deliver one wake. Answers "spawn" when it should go the old way after all (auto, and loom has no piece
+    offering delivery), else None, having logged what came of it:
+      - an answer (fed, resumed, started, queued): logged, done; the runtime has it from here;
+      - failed: the turn stands and no body took it: retried later as a new delivery (a new id, the same place);
+      - no answer, a 5xx or a 429: retried later with the same id and body, which loom answers once;
+      - any other refusal (400, 403, 409, 413): said loudly, never retried: a retry would be refused the same way."""
+    body = entry.get("delivery")
+    if not body:
+        body = {"id": entry["id"][:DELIVER_ID_MAX], "agent": agent, "venue": "wake", "place": wake_place(entry),
+                "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": prompt[:DELIVER_TEXT_MAX]}
+    status, ans = post_delivery(body)
+    err = str(ans.get("error") or ans.get("reason") or "")[:200]
+    if auto and status == 503 and NO_DELIVERY in err:
+        log("fire-spawn", f"{entry['id']} {err}: sent the old way")
+        return "spawn"
+    # What every retry keeps: the conversation it belongs to.
+    entry["deliver_place"], entry["deliver_label"] = body["place"], body["label"]
+    via = "" if body["id"] == entry["id"] else f" as {body['id']}"
+    if status == 200 and ans.get("body") in BODY_STATES:
+        why = f" ({str(ans['reason'])[:120]})" if ans.get("reason") else ""
+        log("fire", f"{entry['id']} delivered{via}: {ans['body']}{why}, {ans.get('conversation')} seq {ans.get('seq')}")
+        return None
+    entry.pop("delivery", None)
+    as_retry(entry)
+    if status == 200 and ans.get("body") == "failed":
+        # loom keeps that answer a day: the same id would only be told `failed` again. A new delivery, same place.
+        retry(entry, f"delivered{via} but no body took it: {err or 'failed'}", "fire-fail")
+        return None
+    if status in (0, 429) or status >= 500:
+        entry["delivery"] = body
+        retry(entry, f"deliver{via}: {status or 'no answer'} {err}", "fire-fail")
+        return None
+    log("fire-refused", f"{entry['id']} deliver{via} REFUSED {status}: {err}; not retried")
+    alert(f"wake: loom refused to deliver \"{entry.get('note') or entry['id']}\" ({status}): {err}. Not retried: fix the "
+          f"clock's settings or the wake, or set WAKE_DELIVERY=spawn")
+    return None
+
+
 def cmd_fire(args):
     # The fire gate (one writer): a standby never dispatches a lane.
     # Keep the entry, push it out an hour, re-check then.
@@ -1463,14 +1593,26 @@ def cmd_fire(args):
         rel = pf.relative_to(REPO) if pf.is_absolute() and pf.is_relative_to(REPO) else pf
         body = (f"Your lane for this wake is the file `{rel}` in your own repo (your house's "
                 f"checkout). Read it and follow it.")
+    # Delivered: a wake for the agent's house that needs no house slot (delivery keeps a conversation, not a slot).
+    dmode = delivery_mode() if mode == "house" and not slot else "spawn"
+
+    def prompt_for(where):
+        # The preamble is the agent's (WAKE_PREAMBLE_FILE): it goes in the wake's text, since it carries this
+        # wake's own id, note and time, and the runtime hands a wake's text to the body as it came.
+        try:
+            return preamble_template().format(name=name_of(AGENT), where=where, id=entry["id"], kind=entry["kind"],
+                                              created=entry["created"], note=note, body=body, lanes=lane_dir())
+        except (KeyError, IndexError, ValueError) as e:
+            log("preamble", f"WAKE_PREAMBLE_FILE doesn't format ({e}); the piece's own is used")
+            return PREAMBLE.format(name=name_of(AGENT), where=where, id=entry["id"], kind=entry["kind"],
+                                   created=entry["created"], note=note, body=body, lanes=lane_dir())
+
+    agent = origin.split(":", 1)[1] if origin else AGENT
+    if dmode != "spawn":
+        if deliver_wake(entry, prompt_for("in your house (loom's runtime delivered it)"), agent, dmode == "auto") != "spawn":
+            return
     where = "in a fresh house (loom-box)" if mode == "house" else "on loom's machine"
-    try:
-        prompt = preamble_template().format(name=name_of(AGENT), where=where, id=entry["id"], kind=entry["kind"],
-                                            created=entry["created"], note=note, body=body, lanes=lane_dir())
-    except (KeyError, IndexError, ValueError) as e:
-        log("preamble", f"WAKE_PREAMBLE_FILE doesn't format ({e}); the piece's own is used")
-        prompt = PREAMBLE.format(name=name_of(AGENT), where=where, id=entry["id"], kind=entry["kind"],
-                                 created=entry["created"], note=note, body=body, lanes=lane_dir())
+    prompt = prompt_for(where)
     env = os.environ.copy()
     prepend = ":".join(
         p for p in [str(HOME / ".local" / "bin"), str(REPO / "bin")]
@@ -1478,7 +1620,6 @@ def cmd_fire(args):
     )
     if prepend:
         env["PATH"] = prepend + (":" + env["PATH"] if env.get("PATH") else "")
-    agent = origin.split(":", 1)[1] if origin else AGENT
     r = dispatch(prompt, entry.get("model", DEFAULT_MODEL), env, mode, agent, slot)
     if r.returncode != 0:
         # Dispatch failed: put the wake back under a fresh id — our own unit
@@ -1492,10 +1633,8 @@ def cmd_fire(args):
             # every 15 minutes would otherwise start a retry chain, and alerts, per try.)
             log("fire-busy", f"{entry['id']} {r.stderr.strip()[:200]} — skipped; next occurrence is armed")
             return
-        if entry.get("kind") == "schedule":
-            # Its next occurrence is already armed: the retry is a one-off.
-            entry["kind"] = "wake"
-            entry["note"] = f"retry of {entry.pop('schedule')}: {entry.get('note', '')}"
+        # Its next occurrence is already armed: the retry is a one-off.
+        as_retry(entry)
         # A wake that keeps failing backs off, says so once, and gives up,
         # rather than failing every 15 minutes with nobody hearing of it.
         retry(entry, f"rc={r.returncode} {r.stderr.strip()[:200]}", "fire-fail")

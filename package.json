@@ -86,11 +86,32 @@
         "hint": "a file with {name} {where} {id} {kind} {created} {note} {lanes} {body}; default: the piece's own"
       },
       {
+        "name": "WAKE_DELIVERY",
+        "label": "How a wake reaches the agent",
+        "kind": "choice",
+        "options": [
+          { "value": "deliver", "label": "Delivered through loom (the runtime reaches its body)" },
+          { "value": "spawn", "label": "The old way: the clock asks for a house itself" }
+        ],
+        "hint": "unset: delivered when the clock has a token for it and a piece offers delivery, else the old way"
+      },
+      {
+        "name": "WAKE_DELIVER_TOKEN_FILE",
+        "label": "The clock's own token, to deliver with",
+        "hint": "a file holding a piece token of this clock's (loom token create --piece clock/<name>)"
+      },
+      {
+        "name": "WAKE_LOOM_URL",
+        "label": "loom's address, as this machine reaches it",
+        "default": "http://127.0.0.1:8787"
+      },
+      {
         "name": "WAKE_RELAY_HEADS_UP",
         "label": "A relay thread this long is a heads-up",
         "hint": "messages in one thread within a day (default 8)"
       }
     ],
+    "venues": { "wake": {} },
     "services": [
       {
         "name": "run",
