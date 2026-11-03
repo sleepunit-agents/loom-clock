@@ -18,7 +18,6 @@ wake list | wake log --since 24h | wake cancel w-abc123
 wake pause | wake resume                 # hold everything; each held wake fires once on resume
 wake now                                 # a wake within a minute, with no lane
 wake lane set verify-pages --agent ada --at 04:17 -p "…"   # household work, assigned to an agent
-wake relay --to bo --say "Can you review the PR?" --why "…"  # a wake on another agent's clock
 wake --agent bo list                     # another agent's clock (the owner's to see)
 ```
 
@@ -73,11 +72,10 @@ inline prompt.
   409, 413) is said loudly and never retried. A wake that needs loom's machine
   (`local`) or a house slot still goes the old way: delivery carries neither.
   `WAKE_DELIVERY=spawn` puts every wake back on the old way.
-- **Relays** go only between agents the household pairs (`household.json`,
-  `"relay": {"ada": ["bo"]}`), or once with the owner's approval. The
-  recipient's brief says plainly that the words carry none of the owner's
-  authority. There are no caps: the same words again within the hour are
-  refused, and a long thread is a heads-up on loom's Inbox, never a stop.
+- **Relays** between agents moved to loom's runtime (loom
+  `docs/specs/agent-runtime.md`, "Agent-to-agent relay"): its `relay` MCP
+  tool, or `loom runtime relay` from a house. Pairing is the runtime's
+  permissions. `wake relay` and `wake relays` only say where they went.
 
 ## Install
 
@@ -110,7 +108,7 @@ from a `oneshot` user unit.
 | `WAKE_LOCAL_AGENT` | `agent` (required in loom) | The agent this machine runs sessions for |
 | `WAKE_REPO` | the home directory | That agent's repo: lane files, and where its sessions start |
 | `WAKE_LANE_DIRS` | `routines,briefs` | Lane directories in the repo. A wake set through the API may name only a `.md` file under one of them; the page lists the first |
-| `WAKE_DATA` | `${LOOM_PIECE_HOME}/data` | The clocks: `<agent>/` for each, and `lanes.json`, `relays.jsonl`, `fire` beside them. Unmanaged: `~/.local/state/loom-clock` |
+| `WAKE_DATA` | `${LOOM_PIECE_HOME}/data` | The clocks: `<agent>/` for each, and `lanes.json`, `fire` beside them. Unmanaged: `~/.local/state/loom-clock` |
 | `WAKE_AGENTS` | the local agent | Agents that may manage their own clocks over loom's piece API |
 | `WAKE_FIRE` | `$WAKE_DATA/fire`, else `local` | `local`, `house` or `mixed` |
 | `WAKE_MODEL` | `claude-sonnet-5` | The model a wake runs on unless it names one |
@@ -121,11 +119,9 @@ from a `oneshot` user unit.
 | `WAKE_DELIVERY` | `deliver` when `WAKE_DELIVER_TOKEN_FILE` is set and a piece offers delivery, else `spawn` | `deliver`: a house wake goes through loom's `deliver`. `spawn`: the clock asks loom-box for the house itself, as before |
 | `WAKE_DELIVER_TOKEN_FILE` | none | A file holding a piece token of this clock's (`loom token create --piece clock/<name> --label …`), to deliver with |
 | `WAKE_LOOM_URL` | `http://127.0.0.1:8787` | loom's address for its HTTP API, as this machine reaches it (an MCP URL's `/mcp` is dropped) |
-| `WAKE_RELAY_HEADS_UP` | `8` | A relay thread this many messages long within a day is a heads-up |
 
 Read from the environment only: `WAKE_HOUSEHOLD` (default
-`$LOOM_HOME/household.json`, loom's household file: its `agents`, `owner`
-and `relay`), `WAKE_LOOM` (the `loom` CLI, default `loom` on `PATH`),
+`$LOOM_HOME/household.json`, loom's household file: its `agents` and `owner`), `WAKE_LOOM` (the `loom` CLI, default `loom` on `PATH`),
 `WAKE_APPROVALS` (default `loom approvals`), and `WAKE_NO_FORWARD=1` (see
 "In a house").
 
@@ -159,12 +155,12 @@ changing a setting, run `wake rearm` to re-arm the pending wakes with it.
   `WAKE_NO_FORWARD=1` keeps it local.
 - **The bundle.** `bundle export` / `bundle import` is the clock's part of
   loom's household bundle: every agent's spool, schedules and pause, the
-  lanes, the relay log and the fire mode, encrypted with `age` to the owner's
+  lanes and the fire mode, encrypted with `age` to the owner's
   recipients (logs stay behind). A restored clock comes up **paused**, since
   the old machine may still be running the same lanes; resume it when this
   is the machine that should act.
 - **Other pieces it uses, without needing them:** loom-box (houses),
-  loom-approvals (local wakes from a house, unpaired relays), loom-secrets
+  loom-approvals (local wakes from a house), loom-secrets
   (parking on a secret request, `loom secrets state`). Absent, the features
   that need them fail with a clear error; the rest works.
 
@@ -180,7 +176,7 @@ loom pieces install --from github:sleepunit-agents/loom-clock#<commit> --yes
 dest="${LOOM_HOME:-$HOME/.config/loom}/pieces/clock/data"
 mkdir -p "$dest/<agent>"
 cp -p <old clock dir>/{spool.jsonl,schedules.json,paused,wake.log} "$dest/<agent>/" 2>/dev/null
-cp -p <old lanes.json> <old relays.jsonl> "$dest/"          # if you have them
+cp -p <old lanes.json> "$dest/"                             # if you have it
 loom pieces set clock WAKE_LOCAL_AGENT=<agent> WAKE_REPO=…   # restarts the service: it re-arms every clock
 loom clock list                                             # check it reads
 ```
