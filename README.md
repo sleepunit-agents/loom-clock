@@ -57,6 +57,22 @@ inline prompt.
   third (`WAKE_ALERT_COMMAND`), and give up at the sixth. A house handed to
   loom-box is checked on later: one that never started is retried like a
   failed dispatch.
+- **Delivery.** A wake bound for the agent's house is delivered, not
+  started: the clock calls loom's `POST /api/loom/deliver` with its own piece
+  token (`WAKE_DELIVER_TOKEN_FILE`), on core's venue `wake` (the piece
+  declares `"venues": {"wake": {}}`), and loom's runtime records the wake in
+  the agent's conversation and reaches its body. A lane's wakes share one
+  conversation (place `lane:<schedule or lane file>`), so its body can
+  resume; any other wake is its own (`wake:<id>`). The agent's preamble
+  (`WAKE_PREAMBLE_FILE`) goes in the wake's text, as it carries the wake's own
+  id, note and time; the model is the runtime's choice. The answer (`fed`,
+  `resumed`, `started`, `queued`, or `failed`) is in the wake log. `failed`
+  is retried later as a new delivery to the same conversation (loom keeps a
+  failed answer for its id a day); no answer, a 5xx or a 429 is retried with
+  the same id and body, which loom answers once; any other refusal (400, 403,
+  409, 413) is said loudly and never retried. A wake that needs loom's machine
+  (`local`) or a house slot still goes the old way: delivery carries neither.
+  `WAKE_DELIVERY=spawn` puts every wake back on the old way.
 - **Relays** go only between agents the household pairs (`household.json`,
   `"relay": {"ada": ["bo"]}`), or once with the owner's approval. The
   recipient's brief says plainly that the words carry none of the owner's
@@ -102,6 +118,9 @@ from a `oneshot` user unit.
 | `WAKE_ALERT_COMMAND` | none (the log only) | How the clock reaches the owner when a wake keeps failing; the message is its last argument |
 | `WAKE_FIRE_GATE` | none | A command run before any wake: non-zero defers every wake an hour. For a standby that mirrors a primary and must never run the same lanes |
 | `WAKE_PREAMBLE_FILE` | the piece's own | The words every wake starts with: `{name} {where} {id} {kind} {created} {note} {lanes} {body}` |
+| `WAKE_DELIVERY` | `deliver` when `WAKE_DELIVER_TOKEN_FILE` is set and a piece offers delivery, else `spawn` | `deliver`: a house wake goes through loom's `deliver`. `spawn`: the clock asks loom-box for the house itself, as before |
+| `WAKE_DELIVER_TOKEN_FILE` | none | A file holding a piece token of this clock's (`loom token create --piece clock/<name> --label …`), to deliver with |
+| `WAKE_LOOM_URL` | `http://127.0.0.1:8787` | loom's address for its HTTP API, as this machine reaches it (an MCP URL's `/mcp` is dropped) |
 | `WAKE_RELAY_HEADS_UP` | `8` | A relay thread this many messages long within a day is a heads-up |
 
 Read from the environment only: `WAKE_HOUSEHOLD` (default
