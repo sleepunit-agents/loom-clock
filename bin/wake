@@ -47,9 +47,14 @@ runtime records the wake in the agent's conversation and reaches its body.
 One lane is one conversation (place `lane:<name>`); any other wake is its own
 (`wake:<id>`). "spawn" keeps the old path (`loom box up` with the wake as the
 house's task); unset, it's "deliver" when the clock has a token for it and
-loom has a piece offering delivery, else "spawn". A wake that needs loom's
-machine (fire mode "local") or a house slot still goes the old way: delivery
-has neither.
+loom has a piece offering delivery, else "spawn". A wake with a house slot
+still goes the old way: delivery keeps no slot. So does a wake that needs
+loom's machine (fire mode "local"), unless it names its conversation
+(`--place alert:host-watch`, set on loom's machine only): then it's delivered
+there with the contract's `local: true` (its `<!-- house: local -->` line
+taken out: the field says it, never the words), and the runtime runs its body
+on loom's machine, if it runs local bodies for this agent; if it refuses (400
+or 403), it's a session here as before.
 
 Timers: transient `systemd-run --user` units named wake-<id> (KillMode=process
 so a background session the wake started survives the service's cgroup cleanup).
@@ -532,6 +537,17 @@ def cmd_set(args, when):
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     if origin:
         entry["origin"] = origin
+    place = (getattr(args, "place", "") or "").strip()
+    if place:
+        # A place is a conversation: what's delivered there feeds the body that has it. Set here, on loom's machine,
+        # only: a house naming a place could feed its words to a body that runs on loom's machine.
+        if origin:
+            sys.exit("wake: --place is for wakes set on loom's machine; a house's wake is its own conversation")
+        if not PLACE.fullmatch(place) or place.startswith(("lane:", "wake:")):
+            sys.exit(f"wake: --place is <kind>:<name> (like alert:host-watch), not lane:/wake: (the clock's own), not {place!r}")
+        if args.slot:
+            sys.exit("wake: --place and --slot don't go together: a delivered wake keeps a conversation, not a slot")
+        entry["place"] = place
     if args.slot:
         if not SLOT_NAME.match(args.slot):
             sys.exit(f"wake: --slot is lowercase letters, digits and dashes, not {args.slot!r}")
@@ -1289,12 +1305,17 @@ def loom_api():
     return u[:-4] if u.endswith("/mcp") else u
 
 
+PLACE = re.compile(r"[a-z][a-z0-9-]{0,31}:[A-Za-z0-9][A-Za-z0-9._@:/-]{0,159}")
+
+
 def wake_place(entry):
     """Where a wake lands in the agent's conversations (conversations.md: one per agent, venue and place). A lane's
     wakes share one, so a lane's runs read as one conversation and its body can resume: `lane:<name>`, by the
     schedule, else the lane file. Anything else is its own: `wake:<id>`, by the id it was first fired under."""
     if entry.get("deliver_place"):
         return entry["deliver_place"]
+    if entry.get("place"):
+        return entry["place"]
     name = entry.get("schedule")
     if not name and (entry.get("lane") or entry.get("prompt_file")):
         name = Path(entry.get("lane") or entry["prompt_file"]).stem
@@ -1340,7 +1361,7 @@ def as_retry(entry):
         entry["note"] = f"retry of {entry.pop('schedule')}: {entry.get('note', '')}"
 
 
-def deliver_wake(entry, prompt, agent, auto):
+def deliver_wake(entry, prompt, agent, auto, local=False):
     """Deliver one wake. Answers "spawn" when it should go the old way after all (auto, and loom has no piece
     offering delivery), else None, having logged what came of it:
       - an answer (fed, resumed, started, queued): logged, done; the runtime has it from here;
@@ -1349,13 +1370,22 @@ def deliver_wake(entry, prompt, agent, auto):
       - any other refusal (400, 403, 409, 413): said loudly, never retried: a retry would be refused the same way."""
     body = entry.get("delivery")
     if not body:
+        # A local wake says so in the contract's own field (`local: true`), never by the words: its marker is this
+        # clock's input syntax only, and goes. The runtime trusts the field from this piece alone.
+        text = prompt.replace(HOUSE_LOCAL, "").strip() if local else prompt
         body = {"id": entry["id"][:DELIVER_ID_MAX], "agent": agent, "venue": "wake", "place": wake_place(entry),
                 "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
-                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": prompt[:DELIVER_TEXT_MAX]}
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text[:DELIVER_TEXT_MAX],
+                **({"local": True} if local else {})}
     status, ans = post_delivery(body)
     err = str(ans.get("error") or ans.get("reason") or "")[:200]
     if auto and status == 503 and NO_DELIVERY in err:
         log("fire-spawn", f"{entry['id']} {err}: sent the old way")
+        return "spawn"
+    if local and (status in (400, 403) or (status == 503 and NO_DELIVERY in err)):
+        # A wake for loom's machine that the runtime won't run here (no local bodies for this agent): a session here,
+        # as before, so it still runs where it needs to; only its conversation is lost.
+        log("fire-spawn", f"{entry['id']} deliver to {body['place']} refused ({status}: {err}): a session here instead")
         return "spawn"
     # What every retry keeps: the conversation it belongs to.
     entry["deliver_place"], entry["deliver_label"] = body["place"], body["label"]
@@ -1459,8 +1489,13 @@ def cmd_fire(args):
         rel = pf.relative_to(REPO) if pf.is_absolute() and pf.is_relative_to(REPO) else pf
         body = (f"Your lane for this wake is the file `{rel}` in your own repo (your house's "
                 f"checkout). Read it and follow it.")
-    # Delivered: a wake for the agent's house that needs no house slot (delivery keeps a conversation, not a slot).
-    dmode = delivery_mode() if mode == "house" and not slot else "spawn"
+    # Delivered: a wake for the agent's house that needs no house slot (delivery keeps a conversation, not a slot). A
+    # wake for loom's machine that names its place (--place) is delivered too: the runtime runs its body here, in that
+    # conversation, when it runs local bodies for this agent; else it's a session here, as before.
+    # Only a wake set here (no origin: never a house's, approved or not) is delivered to run on loom's machine.
+    local_place = (mode == "local" and bool(entry.get("place")) and AGENT == LOCAL_AGENT
+                   and not origin and not entry.get("local_approval"))
+    dmode = delivery_mode() if (mode == "house" or local_place) and not slot else "spawn"
 
     def prompt_for(where):
         # The preamble is the agent's (WAKE_PREAMBLE_FILE): it goes in the wake's text, since it carries this
@@ -1475,7 +1510,8 @@ def cmd_fire(args):
 
     agent = origin.split(":", 1)[1] if origin else AGENT
     if dmode != "spawn":
-        if deliver_wake(entry, prompt_for("in your house (loom's runtime delivered it)"), agent, dmode == "auto") != "spawn":
+        where = "on loom's machine (loom's runtime delivered it)" if local_place else "in your house (loom's runtime delivered it)"
+        if deliver_wake(entry, prompt_for(where), agent, dmode == "auto", local=local_place) != "spawn":
             return
     where = "in a fresh house (loom-box)" if mode == "house" else "on loom's machine"
     prompt = prompt_for(where)
@@ -2624,6 +2660,8 @@ def main():
         p.add_argument("--model", default=DEFAULT_MODEL)
         p.add_argument("--slot", default="", help="a house slot: its bookkeeping, restored and saved (one house at a time)")
         p.add_argument("--approval", default="", help="the owner's approval id, for a house's wake that must run on loom's machine")
+        p.add_argument("--place", default="", help="the conversation it joins (delivery's place, like alert:host-watch): "
+                       "every wake with the same place feeds one conversation; loom's machine only")
         p.set_defaults(fn=lambda a: cmd_set(a, parser_fn(a.time)))
 
     add_set("at", "wake at a clock time", parse_at)
