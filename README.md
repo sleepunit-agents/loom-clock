@@ -69,8 +69,14 @@ inline prompt.
   is retried later as a new delivery to the same conversation (loom keeps a
   failed answer for its id a day); no answer, a 5xx or a 429 is retried with
   the same id and body, which loom answers once; any other refusal (400, 403,
-  409, 413) is said loudly and never retried. A wake that needs loom's machine
-  (`local`) or a house slot still goes the old way: delivery carries neither.
+  409, 413) is said loudly and never retried. A wake with a house slot still
+  goes the old way: delivery keeps no slot. A wake can name its conversation,
+  `--place <kind>:<name>` (like `alert:host-watch`; not `lane:` or `wake:`,
+  and only when set on loom's machine, never from a house): every wake with
+  that place feeds one conversation. A wake that needs loom's machine
+  (`<!-- house: local -->`) is delivered only when it names its place; the
+  runtime runs its body on loom's machine if it runs local bodies for that
+  agent, and if it refuses (403), the wake is a session here as before.
   `WAKE_DELIVERY=spawn` puts every wake back on the old way.
 - **Relays** between agents moved to loom's runtime (loom
   `docs/specs/agent-runtime.md`, "Agent-to-agent relay"): its `relay` MCP

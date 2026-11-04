@@ -673,6 +673,53 @@ class Delivery(unittest.TestCase):
         posts, dispatch, *_ = self.fire(self.base, [], body="# L\n<!-- house: ready -->\n<!-- house-slot: nightly -->\n")
         self.assertEqual((posts, dispatch.call_args.args[3], dispatch.call_args.args[5]), ([], "house", "nightly"))
 
+    def test_a_local_wake_that_names_its_place_is_delivered_there(self):
+        # t-1830: an alert's triage needs loom's machine, and its repeats one conversation (alert:<source>).
+        e = {**self.base, "prompt": "<!-- house: local -->\ntriage the alert", "place": "alert:host-watch"}
+        posts, dispatch, spool, logged, _ = self.fire(e, [self.ok])
+        dispatch.assert_not_called()
+        (b,) = posts
+        self.assertEqual((b["place"], b["venue"], b["kind"]), ("alert:host-watch", "wake", "wake"))
+        self.assertIn("<!-- house: local -->", b["text"], "the runtime reads the marker: this body runs on loom's machine")
+        self.assertIn("on loom's machine (loom's runtime delivered it)", b["text"])
+        self.assertEqual(spool, [])
+        # A house wake with a place joins that conversation too.
+        posts, *_ = self.fire({**self.base, "prompt": "p", "place": "alert:dns"}, [self.ok])
+        self.assertEqual(posts[0]["place"], "alert:dns")
+
+    def test_a_runtime_that_wont_run_it_here_leaves_a_session_here(self):
+        e = {**self.base, "prompt": "<!-- house: local -->\ntriage", "place": "alert:host-watch"}
+        posts, dispatch, spool, logged, alerts = self.fire(e, [(403, {"error": "forbidden: the runtime runs no local bodies for ada"})])
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(dispatch.call_args.args[3], "local")
+        self.assertIn("on loom's machine", dispatch.call_args.args[0])
+        self.assertIn("fire-spawn", logged)
+        self.assertEqual(alerts, [], "not a refusal to shout about: it ran, the old way")
+        # Without a place, a local wake is never delivered.
+        posts, dispatch, *_ = self.fire({**self.base, "prompt": "<!-- house: local -->\nx"}, [])
+        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "local"))
+
+    def test_place_is_set_on_loom_machine_only_and_checked(self):
+        def setp(place, env=None, slot=""):
+            args = mock.Mock(prompt="p", prompt_file=None, note="n", model="m", slot=slot, approval="", place=place, park_on="")
+            with tempfile.TemporaryDirectory() as td, \
+                 mock.patch.dict(wake_cli.os.environ, env or {}), \
+                 mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+                 mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+                 mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+                 mock.patch.object(wake_cli, "arm_timer", return_value="armed"):
+                wake_cli.cmd_set(args, wake_cli.datetime.now())
+                return [json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
+        (e,) = setp("alert:host-watch")
+        self.assertEqual(e["place"], "alert:host-watch")
+        for bad in ("lane:nightly", "wake:w-1", "Alert:x", "alert:", "alert x", "alert:" + "x" * 200):
+            with self.assertRaises(SystemExit, msg=bad):
+                setp(bad)
+        with self.assertRaises(SystemExit):
+            setp("alert:x", env={"WAKE_ORIGIN": "house:art"})
+        with self.assertRaises(SystemExit):
+            setp("alert:x", slot="nightly")
+
     def test_the_post_itself(self):
         import http.server
         import threading
