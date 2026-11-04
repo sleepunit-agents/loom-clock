@@ -680,12 +680,17 @@ class Delivery(unittest.TestCase):
         dispatch.assert_not_called()
         (b,) = posts
         self.assertEqual((b["place"], b["venue"], b["kind"]), ("alert:host-watch", "wake", "wake"))
-        self.assertIn("<!-- house: local -->", b["text"], "the runtime reads the marker: this body runs on loom's machine")
+        self.assertIs(b["local"], True, "the contract's field says where its body runs")
+        self.assertNotIn("<!-- house: local -->", b["text"], "never the words: the marker is the clock's input only")
         self.assertIn("on loom's machine (loom's runtime delivered it)", b["text"])
         self.assertEqual(spool, [])
         # A house wake with a place joins that conversation too.
         posts, *_ = self.fire({**self.base, "prompt": "p", "place": "alert:dns"}, [self.ok])
         self.assertEqual(posts[0]["place"], "alert:dns")
+        self.assertNotIn("local", posts[0])
+        # A house's wake approved for loom's machine is never delivered local: a session here, as before.
+        posts, dispatch, *_ = self.fire({**self.base, "prompt": "<!-- house: local -->\nx", "place": "alert:x", "origin": "house:art", "local_approval": "a-12345678"}, [])
+        self.assertEqual(posts, [])
 
     def test_a_runtime_that_wont_run_it_here_leaves_a_session_here(self):
         e = {**self.base, "prompt": "<!-- house: local -->\ntriage", "place": "alert:host-watch"}
