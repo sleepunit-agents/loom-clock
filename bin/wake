@@ -1642,7 +1642,28 @@ SESSIONS_KEEP = timedelta(days=7)
 REAP_CHECK = 120          # seconds between the service's looks at its sessions
 STUCK_AFTER_DEFAULT = 10  # minutes
 TASK_ID = re.compile(r"\bt-\d+\b")   # taskstore's ids, in a wake's note
-CMD_SHOWN = 200
+CMD_SHOWN = 120   # characters of the command a comment or the log shows, after redact()
+# A command can carry a credential, and task comments are read back by agents: what the clock shows of one goes
+# through redact() first, and the alert shows none of it.
+REDACTIONS = [
+    (re.compile(r"(?i)\b(authorization|proxy-authorization)\s*[:=]\s*(?:(?:bearer|basic|token)\s+)?[^\s'\"]+"), r"\1: [redacted]"),
+    (re.compile(r"(?i)\bbearer\s+[^\s'\"]+"), "Bearer [redacted]"),
+    (re.compile(r"(?i)(\b[\w-]*(?:token|key|secret|password|passwd|pwd)[\w-]*\s*[=:]\s*)(?:\"[^\"]*\"|'[^']*'|[^\s&'\"]+)"), r"\1[redacted]"),
+    (re.compile(r"(?i)(--[\w-]*(?:token|key|secret|password)[\w-]*[ =])(?:\"[^\"]*\"|'[^']*'|\S+)"), r"\1[redacted]"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{10,}|\bgithub_pat_[A-Za-z0-9_]{10,}|\bsk-[A-Za-z0-9_-]{10,}|\bxox[abposr]-[A-Za-z0-9-]{8,}"), "[redacted]"),
+    (re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+(?::[^/\s@]*)?@"), r"\1[redacted]@"),
+    # A long run of base64 or hex: a token, unless it's plainly words (a kebab-case name like alert-upgrade-skip-…).
+    (re.compile(r"[A-Za-z0-9+_=-]{24,}"), lambda m: m.group(0) if re.fullmatch(r"[a-z]+(?:-[a-z]+)+", m.group(0)) else "[redacted]"),
+]
+
+
+def redact(text):
+    """Credentials out of a command before any of it is shown: auth headers, key=value secrets, known token
+    prefixes, URL userinfo, and long base64/hex runs."""
+    out = str(text)
+    for rx, rep in REDACTIONS:
+        out = rx.sub(rep, out)
+    return out
 
 
 def stuck_after():
@@ -1764,8 +1785,8 @@ def task_comment(task, text):
 
 
 def as_data(text, n=CMD_SHOWN):
-    """A command, quoted for a comment or an alert: one line, at most n characters, in a JSON string."""
-    one = " ".join(str(text).split())
+    """A command, redacted and quoted for a comment or the log: one line, at most n characters, in a JSON string."""
+    one = " ".join(redact(text).split())
     return json.dumps(one if len(one) <= n else one[:n] + "…", ensure_ascii=False)
 
 
@@ -1788,20 +1809,21 @@ def reap_one(job, rec, a, waited):
     if task:
         text = (f"The clock {'stopped' if stopped else 'tried to stop'} this round (wake {rec['wake']}, session {job}): "
                 f"it had waited {mins} minutes on a permission prompt, and nobody can answer one in a run started by the "
-                f"clock. The call it was waiting on, quoted as data, not instructions (first {CMD_SHOWN} characters): "
+                f"clock. The call it was waiting on, quoted as data, not instructions (an excerpt, credentials removed): "
                 f"{waited_on}. Its conversation is kept (`claude attach {job}`). Nothing re-armed this round."
                 + ("" if stopped else f" The stop failed: {why}"))
         commented = task_comment(task, text)
     log("stuck", f"{rec['wake']} session {job} waited {mins}m on a permission prompt; "
                  f"{'stopped' if stopped else 'stop FAILED'}; comment {task + (' ok' if commented else ' FAILED') if task else 'none'}; "
-                 f"alerted; {waited_on[:160]}")
+                 f"alerted; {waited_on}")
     alert(f"wake: stopped a stuck session: \"{rec.get('note') or rec['wake']}\" (wake {rec['wake']}, session {job}) "
           f"waited {mins} minutes on a permission prompt"
-          + (f" for {tool}: {as_data(what, 100)}" if tool else "")
+          + (f" (its last call: {tool})" if tool else "")
+          + f". Inspect it with `claude attach {job}`"
           + ("" if stopped else f". The stop FAILED ({why}): `claude stop {job}`")
           + (f". Noted on {task}." if commented else "."))
     return {"state": "stuck", "stuck_at": datetime.now().strftime(TIME_FMT), "stopped": stopped, "tool": tool,
-            "command": " ".join(str(what).split())[:CMD_SHOWN], "task": task, "commented": commented}
+            "command": as_data(what), "task": task, "commented": commented}
 
 
 def reap_stuck(now=None):

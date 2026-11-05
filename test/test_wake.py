@@ -2145,6 +2145,41 @@ class StuckSessions(unittest.TestCase):
         self.assertTrue(fire[0].endswith("| fire | w-aaa111 backgrounded · abc12345"))
         self.assertFalse(any(ln.startswith("  claude") for ln in self.read("clock/wake.log")))
 
+    def test_a_credential_in_the_command_is_never_shown_and_the_alert_has_no_command(self):
+        bearer, ghp = "abcDEF1234567890xyzSECRETbearer", "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        secret_cmd = (f"GH_TOKEN={ghp} curl -H 'Authorization: Bearer {bearer}' "
+                      f"https://bob:hunter2pass@example.com/x?api_key=zzzSECRETzzz")
+        lines = [json.loads(x) for x in self.transcript.read_text().splitlines()]
+        lines[3]["message"]["content"][1]["input"]["command"] = secret_cmd
+        self.transcript.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+        self.record()
+        self.list_()
+        self.at(0)
+        self.at(10)
+        rec = self.records()["abc12345"]
+        shown = {"comment": "\n".join(self.read("comments")), "alert": "\n".join(self.read("alerts")),
+                 "log": "\n".join(self.read("clock/wake.log")), "record": json.dumps(rec)}
+        for where, text in shown.items():
+            for secret in (bearer, ghp, "hunter2pass", "zzzSECRETzzz"):
+                self.assertNotIn(secret, text, f"{secret} in the {where}")
+        self.assertIn("[redacted]", shown["comment"])
+        self.assertIn("[redacted]", rec["command"])
+        # The alert: the tool and the session, never the command.
+        self.assertIn("Bash", shown["alert"])
+        self.assertIn("claude attach abc12345", shown["alert"])
+        for part in ("GH_TOKEN", "curl", "Authorization", "example.com", "taskstore comment"):
+            self.assertNotIn(part, shown["alert"])
+
+    def test_redact(self):
+        r = wake_cli.redact
+        self.assertEqual(r("ls -la /home/art/Art"), "ls -la /home/art/Art")
+        self.assertNotIn("s3cr3t", r("PASSWORD=s3cr3t ./run"))
+        self.assertNotIn("s3cr3t", r("mysql --password s3cr3t"))
+        self.assertNotIn("xoxb-12345-abcdefgh", r("SLACK=xoxb-12345-abcdefgh"))
+        self.assertNotIn("sk-ant-abcdefghijklmnop", r("call sk-ant-abcdefghijklmnop"))
+        self.assertNotIn("deadbeef" * 4, r("sha " + "deadbeef" * 4))
+        self.assertNotIn("pw", r("git clone https://me:pw@github.com/x/y"))
+
     def test_the_last_tool_call_is_read_from_the_transcript(self):
         self.assertEqual(wake_cli.transcript_of("11111111-2222-3333-4444-555555555555"), self.transcript)
         self.assertIsNone(wake_cli.transcript_of("../../etc/passwd"))
