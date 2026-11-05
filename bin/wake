@@ -1636,6 +1636,8 @@ def watch_house(entry):
 # permission prompt for WAKE_STUCK_AFTER minutes, counted from when the clock first saw it waiting, is stopped
 # (`claude stop`, which keeps its conversation), commented on its task, logged `stuck`, and said once. Only the
 # sessions in that record are ever looked at: never an interactive session, never one anyone else started.
+# The `stuck` line in wake.log: `<wake> session=<id> alerted=yes|no stopped=yes|no task=<t-N|none>
+# comment=ok|failed|none waited=<N>m on a permission prompt | <tool>: "<redacted excerpt>"`.
 
 SESSION_JOB = re.compile(r"^backgrounded · (\S+)", re.M)
 SESSIONS_KEEP = timedelta(days=7)
@@ -1848,9 +1850,11 @@ def reap_one(job, rec, a, waited):
                 f"{waited_on}. Its conversation is kept (`claude attach {job}`). Nothing re-armed this round."
                 + ("" if stopped else f" The stop failed: {why}"))
         commented = task_comment(task, text)
-    log("stuck", f"{wid} session {job} waited {mins}m on a permission prompt; "
-                 f"{'stopped' if stopped else 'stop FAILED'}; comment {task + (' ok' if commented else ' FAILED') if task else 'none'}; "
-                 f"{'alerted' if alerting else 'not alerted (no WAKE_ALERT_COMMAND)'}; {waited_on}")
+    # Fixed fields first, in a fixed order, then the excerpt last: a checker reads the fields by position
+    # (`stuck | <wake> session=<id> alerted=yes|no …`) and never the excerpt, which is the command's own text.
+    log("stuck", f"{wid} session={job} alerted={'yes' if alerting else 'no'} stopped={'yes' if stopped else 'no'} "
+                 f"task={task or 'none'} comment={('ok' if commented else 'failed') if task else 'none'} "
+                 f"waited={mins}m on a permission prompt | {waited_on}")
     alert(f"wake: stopped a stuck session: \"{rec.get('note') or wid}\" (wake {wid}, session {job}) "
           f"waited {mins} minutes on a permission prompt"
           + (f" (its last call: {tool})" if tool else "")
