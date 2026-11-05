@@ -1986,7 +1986,8 @@ class StuckSessions(unittest.TestCase):
         ]
         for p in self.patches:
             p.start()
-        self.now = wake_cli.datetime(2026, 11, 4, 18, 45, 0)
+        # Records are stamped with the real time, so the looks are counted from it too.
+        self.now = wake_cli.datetime.now().replace(microsecond=0)
 
     def tearDown(self):
         for p in reversed(self.patches):
@@ -2097,7 +2098,9 @@ class StuckSessions(unittest.TestCase):
     def test_a_session_that_ended_is_let_go_and_old_records_are_dropped(self):
         self.record()
         self.agents.write_text("[]")
-        self.at(0)
+        self.at(1)   # just started: not listed yet isn't gone
+        self.assertEqual(self.records()["abc12345"]["state"], "running")
+        self.at(6)
         self.assertEqual(self.records()["abc12345"]["state"], "gone")
         wake_cli.reap_stuck(wake_cli.datetime.now() + wake_cli.timedelta(days=8))
         self.assertEqual(self.records(), {})
@@ -2179,6 +2182,65 @@ class StuckSessions(unittest.TestCase):
         self.assertNotIn("sk-ant-abcdefghijklmnop", r("call sk-ant-abcdefghijklmnop"))
         self.assertNotIn("deadbeef" * 4, r("sha " + "deadbeef" * 4))
         self.assertNotIn("pw", r("git clone https://me:pw@github.com/x/y"))
+
+    def test_a_look_that_fails_never_raises_and_is_said_once(self):
+        self.record()
+        for broken in ("not json", '{"a": 1}'):
+            self.agents.write_text(broken)
+            self.at(0)
+            self.at(30)
+        claude = self.t / "bin" / "claude"
+        claude.unlink()   # claude isn't there at all
+        self.at(40)
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_SESSION_COMMAND": "[not json", "WAKE_TASK_COMMENT": "[nope"}):
+            self.at(50)   # malformed settings: still no exception, no SystemExit
+        self.assertEqual(self.records()["abc12345"]["state"], "running")
+        blind = [ln for ln in self.read("clock/wake.log") if "| reap-blind |" in ln]
+        self.assertGreaterEqual(len(blind), 1)
+        self.assertEqual(len(blind), 4)   # four looks that failed four ways: each said once, not once per look (8 looks)
+
+    def test_a_transcript_line_that_isnt_an_object_is_skipped(self):
+        with self.transcript.open("a") as f:
+            f.write('[1, 2]\n"text"\n{"type": "assistant", "message": "x"}\n')
+        self.assertEqual(wake_cli.last_tool_use(self.transcript), ("Bash", self.COMMAND))
+
+    def test_a_busy_session_with_a_stale_waiting_for_isnt_counted(self):
+        self.assertFalse(wake_cli.waiting_on_permission({"status": "busy", "waitingFor": "permission prompt"}))
+        self.assertTrue(wake_cli.waiting_on_permission({"status": "waiting", "waitingFor": "permission prompt"}))
+
+    def test_off_doesnt_even_look(self):
+        self.record()
+        self.agents.write_text("not json")
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_STUCK_AFTER": "off"}):
+            self.at(0)
+        self.assertFalse(any("reap-blind" in ln for ln in self.read("clock/wake.log")))
+
+    def test_the_service_reaps_every_two_minutes_and_rearms_every_ten(self):
+        clock = [0.0]
+        sleeps = []
+
+        def sleep(n):
+            sleeps.append(n)
+            clock[0] += n
+            if len(sleeps) > 10:
+                raise KeyboardInterrupt
+
+        def boom():
+            raise SystemExit("wake: WAKE_SESSION_COMMAND is a JSON list …")
+
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_LOCAL_AGENT": "ada"}), \
+             mock.patch.object(wake_cli, "cmd_rearm"), \
+             mock.patch.object(wake_cli, "configure"), \
+             mock.patch.object(wake_cli.time, "sleep", side_effect=sleep), \
+             mock.patch.object(wake_cli.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(wake_cli, "keep_armed") as keep, \
+             mock.patch.object(wake_cli, "reap_stuck", side_effect=boom) as reap, \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                wake_cli.cmd_run(wake_cli.argparse.Namespace())
+        self.assertEqual(set(sleeps), {wake_cli.REAP_CHECK})
+        self.assertEqual(reap.call_count, 10)            # a SystemExit from a look never ends the service
+        self.assertEqual(keep.call_count, 10 * wake_cli.REAP_CHECK // wake_cli.RUN_CHECK)
 
     def test_the_last_tool_call_is_read_from_the_transcript(self):
         self.assertEqual(wake_cli.transcript_of("11111111-2222-3333-4444-555555555555"), self.transcript)

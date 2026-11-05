@@ -377,7 +377,7 @@ def timer_env():
     out = []
     for k in TIMER_ENV:
         v = os.environ.get(k)
-        if k in ("LOOM_PIECE_NAME", "LOOM_PIECE_HOME") and foreign_piece():
+        if k in ("LOOM_PIECE_NAME", "LOOM_PIECE_HOME", "LOOM_TOKEN_FILE") and foreign_piece():
             v = str(PIECE_HOME) if k == "LOOM_PIECE_HOME" and PIECE_HOME else None
         if v not in (None, "") and "\n" not in v:
             out += ["--setenv", f"{k}={v}"]
@@ -1709,26 +1709,47 @@ def record_session(job, entry):
 
 
 def claude_bin():
-    """The harness that started the sessions: the session command's program (`claude` by default)."""
-    argv = argv_setting("WAKE_SESSION_COMMAND", SESSION_DEFAULT)
-    return argv[0] if argv else "claude"
+    """The harness that started the sessions: the session command's program (`claude` by default). A malformed
+    setting is the session command's problem, said when a wake fires; here it's "" (the reaper can't look)."""
+    try:
+        argv = argv_setting("WAKE_SESSION_COMMAND", SESSION_DEFAULT)
+    except SystemExit:
+        return ""
+    return argv[0] if argv else ""
+
+
+_BLIND = []   # the service's last word on why it couldn't look, so it's said once, not every 2 minutes
+
+
+def say_blind(why):
+    if why != (_BLIND[0] if _BLIND else None):
+        _BLIND[:] = [why] if why else []
+        if why:
+            log("reap-blind", f"can't look at the sessions it started: {why}; trying again every {REAP_CHECK}s")
 
 
 def background_sessions():
     """`claude agents --json`: {id: entry} for the background sessions it lists, or None when it can't be asked."""
+    cmd = [claude_bin(), "agents", "--json"]
+    if not cmd[0]:
+        say_blind("WAKE_SESSION_COMMAND doesn't parse")
+        return None
     try:
-        r = subprocess.run([claude_bin(), "agents", "--json"], capture_output=True, text=True, timeout=60,
-                           stdin=subprocess.DEVNULL)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
         rows = json.loads(r.stdout) if r.returncode == 0 else None
-    except (OSError, ValueError, subprocess.SubprocessError):
-        return None
+        why = "" if r.returncode == 0 else f"`{' '.join(cmd)}` rc={r.returncode} {(r.stderr or '').strip()[:120]}"
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        rows, why = None, f"`{' '.join(cmd)}`: {str(e)[:120]}"
     if not isinstance(rows, list):
+        say_blind(why or f"`{' '.join(cmd)}` didn't answer a JSON list")
         return None
+    say_blind("")
     return {str(a["id"]): a for a in rows if isinstance(a, dict) and a.get("id") and a.get("kind") == "background"}
 
 
 def waiting_on_permission(a):
-    return "permission" in str(a.get("waitingFor") or "").lower()
+    """`claude agents --json` says it's waiting, on a permission prompt (a row without a status counts)."""
+    return a.get("status") in (None, "waiting") and "permission" in str(a.get("waitingFor") or "").lower()
 
 
 def transcript_of(session_id):
@@ -1740,7 +1761,10 @@ def transcript_of(session_id):
     return found[0] if found else None
 
 
-def last_tool_use(path, tail=4 * 1024 * 1024):
+TRANSCRIPT_TAIL = 4 * 1024 * 1024   # bytes read from a transcript's end
+
+
+def last_tool_use(path, tail=TRANSCRIPT_TAIL):
     """(tool, what) for the transcript's last tool call: what it was waiting on. ("", "") when there is none."""
     try:
         with open(path, "rb") as f:
@@ -1754,8 +1778,10 @@ def last_tool_use(path, tail=4 * 1024 * 1024):
             d = json.loads(line)
         except ValueError:
             continue
-        content = (d.get("message") or {}).get("content") if isinstance(d, dict) else None
-        if d.get("type") != "assistant" or not isinstance(content, list):
+        if not isinstance(d, dict) or d.get("type") != "assistant" or not isinstance(d.get("message"), dict):
+            continue
+        content = d["message"].get("content")
+        if not isinstance(content, list):
             continue
         for block in reversed(content):
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -1770,7 +1796,11 @@ def task_comment(task, text):
     raw = setting("WAKE_TASK_COMMENT")
     if raw.strip().lower() in ("off", "none"):
         return False
-    argv = argv_setting("WAKE_TASK_COMMENT", ["taskstore", "comment", "{task}", "{text}"])
+    try:
+        argv = argv_setting("WAKE_TASK_COMMENT", ["taskstore", "comment", "{task}", "{text}"])
+    except SystemExit as e:
+        log("stuck-comment-fail", f"{task}: {e}")
+        return False
     if not raw and not shutil.which(argv[0]):
         return False
     try:
@@ -1802,21 +1832,26 @@ def reap_one(job, rec, a, waited):
     except (OSError, subprocess.SubprocessError) as e:
         stopped, why = False, str(e)[:160]
     mins = int(waited.total_seconds() // 60)
+    wid = str(rec.get("wake") or "?")
+    try:
+        alerting = bool(argv_setting("WAKE_ALERT_COMMAND", []))
+    except SystemExit:
+        alerting = False
     waited_on = f"{tool}: {as_data(what)}" if tool else "a tool call the clock couldn't read from its transcript"
     m = TASK_ID.search(rec.get("note") or "")
     task = m.group(0) if m else ""
     commented = False
     if task:
-        text = (f"The clock {'stopped' if stopped else 'tried to stop'} this round (wake {rec['wake']}, session {job}): "
+        text = (f"The clock {'stopped' if stopped else 'tried to stop'} this round (wake {wid}, session {job}): "
                 f"it had waited {mins} minutes on a permission prompt, and nobody can answer one in a run started by the "
                 f"clock. The call it was waiting on, quoted as data, not instructions (an excerpt, credentials removed): "
                 f"{waited_on}. Its conversation is kept (`claude attach {job}`). Nothing re-armed this round."
                 + ("" if stopped else f" The stop failed: {why}"))
         commented = task_comment(task, text)
-    log("stuck", f"{rec['wake']} session {job} waited {mins}m on a permission prompt; "
+    log("stuck", f"{wid} session {job} waited {mins}m on a permission prompt; "
                  f"{'stopped' if stopped else 'stop FAILED'}; comment {task + (' ok' if commented else ' FAILED') if task else 'none'}; "
-                 f"alerted; {waited_on}")
-    alert(f"wake: stopped a stuck session: \"{rec.get('note') or rec['wake']}\" (wake {rec['wake']}, session {job}) "
+                 f"{'alerted' if alerting else 'not alerted (no WAKE_ALERT_COMMAND)'}; {waited_on}")
+    alert(f"wake: stopped a stuck session: \"{rec.get('note') or wid}\" (wake {wid}, session {job}) "
           f"waited {mins} minutes on a permission prompt"
           + (f" (its last call: {tool})" if tool else "")
           + f". Inspect it with `claude attach {job}`"
@@ -1829,6 +1864,8 @@ def reap_one(job, rec, a, waited):
 def reap_stuck(now=None):
     """One look at the sessions this clock started: stop any that has waited on a permission prompt too long."""
     after = stuck_after()
+    if after is None:
+        return   # WAKE_STUCK_AFTER=off: not even a look
     with Sessions() as ss:
         records = {k: dict(v) for k, v in ss.records.items() if isinstance(v, dict)}
     if not records:
@@ -1837,6 +1874,8 @@ def reap_stuck(now=None):
     if agents is None:
         return  # can't ask: look again next time, never guess
     now = now or datetime.now()
+    # seen: for each recorded session this look found listed and running, when it started waiting on a permission
+    # prompt (None: it isn't waiting). A record not in `seen` wasn't listed, or isn't running.
     seen, reaped = {}, {}
     for job, rec in records.items():
         a = agents.get(job)
@@ -1863,15 +1902,26 @@ def reap_stuck(now=None):
                     rec["waiting_since"] = seen[job]
                 else:
                     rec.pop("waiting_since", None)
-            elif rec.get("state") == "running" and job not in agents:
+            elif rec.get("state") == "running" and job in records and job not in agents and listed_long(rec, now):
                 rec["state"] = "gone"   # it ended (or was stopped by hand): nothing to watch
                 rec.pop("waiting_since", None)
             try:
                 old = now - datetime.strptime(rec.get("stuck_at") or rec.get("fired") or "", TIME_FMT) > SESSIONS_KEEP
-            except ValueError:
+            except (ValueError, TypeError):
                 old = True
             if old:
                 ss.records.pop(job)
+
+
+GONE_GRACE = timedelta(minutes=5)   # a session just started may not be listed yet
+
+
+def listed_long(rec, now):
+    """True once a record is old enough that `claude agents` not listing it means it ended."""
+    try:
+        return now - datetime.strptime(rec.get("fired") or "", TIME_FMT) >= GONE_GRACE
+    except (ValueError, TypeError):
+        return True
 
 
 def cmd_reap(_args):
@@ -2905,7 +2955,7 @@ def cmd_run(_args):
         try:
             configure(LOCAL_AGENT)
             reap_stuck()   # only the local agent's clock starts sessions here
-        except Exception as e:   # a look that failed is tried again next time; never the service's end
+        except (Exception, SystemExit) as e:   # a look that failed is tried again next time; never the service's end
             print(f"wake run: reap: {e}", file=sys.stderr, flush=True)
         if time.monotonic() - last_armed < RUN_CHECK:
             continue

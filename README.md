@@ -173,7 +173,7 @@ changing a setting, run `wake rearm` to re-arm the pending wakes with it.
   `{"argv": [...]}` from the owner or an agent in `WAKE_AGENTS`. An agent
   reaches only its own clock; the owner may name any with `--agent`. Only the
   clock verbs pass (`at in park list cancel log schedule relay relays lane`);
-  `fire`, `rearm`, `run`, `ui` and `bundle` are loom's machine's.
+  `fire`, `rearm`, `run`, `reap`, `ui` and `bundle` are loom's machine's.
 - **In a house** (`HOUSE_ID` set), `wake` forwards itself to loom's piece API
   with `LOOM_URL` and `LOOM_TOKEN_FILE` (default `/run/secrets/loom-token`),
   so a wake set there lands in the one spool, never the house's own copy.
