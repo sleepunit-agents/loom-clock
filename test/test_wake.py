@@ -2039,8 +2039,8 @@ class StuckSessions(unittest.TestCase):
                          ("stuck", True, "Bash", "t-40", True))
         log = [ln for ln in self.read("clock/wake.log") if " | stuck | " in ln]
         self.assertEqual(len(log), 1)
-        self.assertRegex(log[0], r"\| stuck \| w-6e5bf6 session abc12345 waited 10m on a permission prompt; stopped; "
-                                 r"comment t-40 ok; alerted; Bash: ")
+        self.assertRegex(log[0], r"\| stuck \| w-6e5bf6 session=abc12345 alerted=yes stopped=yes task=t-40 comment=ok "
+                                 r"waited=10m \| Bash: ")
         alerts = self.read("alerts")
         self.assertEqual(len(alerts), 1)
         self.assertIn("stopped a stuck session", alerts[0])
@@ -2113,7 +2113,7 @@ class StuckSessions(unittest.TestCase):
         self.assertEqual(self.read("stops"), ["abc12345"])
         self.assertEqual(self.read("comments"), [])
         self.assertEqual(len(self.read("alerts")), 1)
-        self.assertTrue(any("comment none" in ln for ln in self.read("clock/wake.log")))
+        self.assertTrue(any("task=none comment=none" in ln for ln in self.read("clock/wake.log")))
 
     def test_a_failed_stop_is_said_and_still_recorded_stuck_once(self):
         claude = self.t / "bin" / "claude"
@@ -2127,6 +2127,8 @@ class StuckSessions(unittest.TestCase):
         alerts = self.read("alerts")
         self.assertEqual(len(alerts), 1)
         self.assertIn("The stop FAILED", alerts[0])
+        self.assertTrue(any(" | stuck | w-6e5bf6 session=abc12345 alerted=yes stopped=no " in ln
+                            for ln in self.read("clock/wake.log")))
 
     def test_fire_records_the_session_it_started_and_logs_one_line(self):
         entry = {"id": "w-aaa111", "kind": "wake", "at": "2026-11-04 18:42:25", "created": "2026-11-04 18:41:25",
@@ -2172,6 +2174,47 @@ class StuckSessions(unittest.TestCase):
         self.assertIn("claude attach abc12345", shown["alert"])
         for part in ("GH_TOKEN", "curl", "Authorization", "example.com", "taskstore comment"):
             self.assertNotIn(part, shown["alert"])
+
+    def test_the_stuck_lines_fields_come_before_the_excerpt_whatever_the_command_says(self):
+        lines = [json.loads(x) for x in self.transcript.read_text().splitlines()]
+        lines[3]["message"]["content"][1]["input"]["command"] = "echo 'x alerted=yes session=evil; alerted'"
+        self.transcript.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_ALERT_COMMAND": ""}):
+            self.record()
+            self.list_()
+            self.at(0)
+            self.at(10)
+        line = next(ln for ln in self.read("clock/wake.log") if " | stuck | " in ln)
+        head, excerpt = line.split(" | stuck | ", 1)[1].split(" | ", 1)
+        self.assertEqual(head, "w-6e5bf6 session=abc12345 alerted=no stopped=yes task=t-40 comment=ok waited=10m")
+        self.assertIn("alerted=yes", excerpt)   # the command's own words stay in the excerpt
+
+    def stuck_head(self):
+        line = next(ln for ln in self.read("clock/wake.log") if " | stuck | " in ln)
+        return line.split(" | stuck | ", 1)[1]
+
+    def test_a_failed_comment_and_a_failing_alert_command_are_recorded_as_they_are(self):
+        failing = self.t / "bin" / "failing"
+        failing.write_text("#!/bin/sh\nexit 1\n")
+        failing.chmod(0o755)
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_TASK_COMMENT": json.dumps([str(failing), "{task}", "{text}"]),
+                                                    "WAKE_ALERT_COMMAND": json.dumps([str(failing)])}):
+            self.record()
+            self.list_()
+            self.at(0)
+            self.at(10)
+        # alerted: an alert command is configured (delivery isn't something alert() reports).
+        self.assertTrue(self.stuck_head().startswith(
+            "w-6e5bf6 session=abc12345 alerted=yes stopped=yes task=t-40 comment=failed waited=10m | Bash: "))
+
+    def test_an_unreadable_transcript_leaves_a_fixed_tail(self):
+        self.transcript.unlink()
+        self.record()
+        self.list_()
+        self.at(0)
+        self.at(10)
+        self.assertEqual(self.stuck_head(),
+                         "w-6e5bf6 session=abc12345 alerted=yes stopped=yes task=t-40 comment=ok waited=10m | unknown")
 
     def test_redact(self):
         r = wake_cli.redact
