@@ -1904,5 +1904,353 @@ class Service(unittest.TestCase):
         self.assertIn("WAKE_LOCAL_AGENT isn't set", err.getvalue())
 
 
+class AnotherPiecesVariables(unittest.TestCase):
+    """The tasks piece and loom's runtime run `loom-clock in 1m …` with their own LOOM_PIECE_NAME and
+    LOOM_PIECE_HOME. Those aren't the clock's: read as its own, they made a second clock in that piece's
+    data, with an agent called "agent" and the default session command (t-1854)."""
+
+    def install(self, d):
+        pieces = Path(d) / "pieces"
+        home = pieces / "clock"
+        pkg = home / "versions" / ("a" * 40) / "node_modules" / "loom-clock" / "bin"
+        pkg.mkdir(parents=True)
+        (home / "piece.json").write_text("{}")
+        (home / "settings.json").write_text(json.dumps({"WAKE_LOCAL_AGENT": "zed", "WAKE_REPO": d}))
+        (pkg / "wake").write_text("")
+        (pieces / "tasks").mkdir()
+        (pieces / "tasks" / "settings.json").write_text(json.dumps({"TASKSTORE_DB": "/x"}))
+        return pieces, home, pkg / "wake"
+
+    def test_a_foreign_piece_home_is_ignored_and_the_clock_finds_its_own(self):
+        with tempfile.TemporaryDirectory() as d:
+            pieces, home, script = self.install(d)
+            m = Settings.load(self, {"HOME": d, "LOOM_PIECE_NAME": "tasks", "LOOM_PIECE_HOME": str(pieces / "tasks")},
+                              script=script)
+            self.assertEqual((m.PIECE_HOME, m.CLOCKS, m.LOCAL_AGENT), (home, home / "data", "zed"))
+            with mock.patch.dict(m.os.environ, {"LOOM_PIECE_NAME": "tasks", "LOOM_PIECE_HOME": str(pieces / "tasks")}):
+                env = m.timer_env()
+            self.assertNotIn("LOOM_PIECE_NAME=tasks", env)
+            self.assertNotIn(f"LOOM_PIECE_HOME={pieces / 'tasks'}", env)
+            self.assertIn(f"LOOM_PIECE_HOME={home}", env)
+
+    def test_the_clocks_own_and_an_unnamed_piece_home_are_still_taken(self):
+        for env in ({"LOOM_PIECE_NAME": "clock"}, {}):
+            m = Settings.load(self, {"HOME": "/h", "LOOM_PIECE_HOME": "/h/pieces/clock", **env})
+            self.assertEqual(m.PIECE_HOME, Path("/h/pieces/clock"))
+
+
+class StuckSessions(unittest.TestCase):
+    """The reaper (t-1854): a session the clock started that waits on a permission prompt past WAKE_STUCK_AFTER
+    is stopped, commented on its task, logged `stuck` and said once. Nothing else is ever touched. `claude` is a
+    stand-in: `agents --json` prints $FAKE_AGENTS, `stop` writes its id down."""
+
+    COMMAND = "cd ~/Art && taskstore comment t-40 \"Round 12: killed a stale \\`rclone authorize drive\\` from $(cat <<'EOF'\nx\nEOF\n)\""
+
+    def setUp(self):
+        self.td = tempfile.TemporaryDirectory()
+        t = Path(self.td.name)
+        self.t = t
+        (t / "bin").mkdir()
+        claude = t / "bin" / "claude"
+        claude.write_text("#!/bin/sh\n"
+                          "case \"$1\" in\n"
+                          "  agents) cat \"$FAKE_AGENTS\" ;;\n"
+                          "  stop) echo \"$2\" >> \"$FAKE_STOPS\" ;;\n"
+                          "  --bg) printf 'backgrounded \\302\\267 abc12345\\n  claude agents   list sessions\\n  claude attach abc12345\\n' ;;\n"
+                          "esac\n")
+        claude.chmod(0o755)
+        for name, out in (("comment", "comments"), ("alert", "alerts")):
+            f = t / "bin" / name
+            f.write_text(f"#!/bin/sh\nprintf '%s\\t%s\\n' \"$1\" \"$2\" >> \"{t / out}\"\n")
+            f.chmod(0o755)
+        (t / "projects" / "-home-art-Art").mkdir(parents=True)
+        self.transcript = t / "projects" / "-home-art-Art" / "11111111-2222-3333-4444-555555555555.jsonl"
+        self.transcript.write_text("\n".join(json.dumps(x) for x in [
+            {"type": "user", "message": {"role": "user", "content": "wake up"}},
+            {"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "ls"}}]}},
+            {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}},
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "commenting"},
+                                                          {"type": "tool_use", "name": "Bash", "input": {"command": self.COMMAND}}]}},
+            {"type": "cost-state"},
+        ]) + "\n")
+        self.agents = t / "agents.json"
+        self.patches = [
+            mock.patch.object(wake_cli, "WAKE_DIR", t / "clock"),
+            mock.patch.object(wake_cli, "LOG", t / "clock" / "wake.log"),
+            mock.patch.object(wake_cli, "REPO", t),
+            mock.patch.dict(wake_cli.os.environ, {
+                "FAKE_AGENTS": str(self.agents), "FAKE_STOPS": str(t / "stops"), "CLAUDE_CONFIG_DIR": str(t),
+                "WAKE_SESSION_COMMAND": json.dumps([str(claude), "--bg", "{prompt}"]),
+                "WAKE_TASK_COMMENT": json.dumps([str(t / "bin" / "comment"), "{task}", "{text}"]),
+                "WAKE_ALERT_COMMAND": json.dumps([str(t / "bin" / "alert")]), "WAKE_STUCK_AFTER": ""}),
+        ]
+        for p in self.patches:
+            p.start()
+        # Records are stamped with the real time, so the looks are counted from it too.
+        self.now = wake_cli.datetime.now().replace(microsecond=0)
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+        self.td.cleanup()
+
+    def list_(self, waiting="permission prompt", extra=()):
+        rows = [
+            # The owner's own session (remote control): interactive, no id. Never touched.
+            {"pid": 1, "kind": "interactive", "sessionId": "cd5a78c3-e706-540e-a7a9-2369f557e35b", "name": "art-e1", "status": "waiting",
+             "waitingFor": "permission prompt"},
+            {"id": "abc12345", "kind": "background", "sessionId": "11111111-2222-3333-4444-555555555555", "pid": 2,
+             "name": "t-40 round 12", **({"status": "waiting", "waitingFor": waiting} if waiting else {"status": "busy"})},
+            *extra,
+        ]
+        self.agents.write_text(json.dumps(rows))
+
+    def record(self, job="abc12345", note="t-40 round 12 (local, approval a-67a85363)"):
+        wake_cli.record_session(job, {"id": "w-6e5bf6", "note": note, "kind": "wake"})
+
+    def read(self, name):
+        f = self.t / name
+        return f.read_text().splitlines() if f.exists() else []
+
+    def at(self, minutes):
+        wake_cli.reap_stuck(self.now + wake_cli.timedelta(minutes=minutes))
+
+    def records(self):
+        return json.loads((self.t / "clock" / "sessions.json").read_text())
+
+    def test_a_session_waiting_past_the_threshold_is_stopped_commented_logged_and_said_once(self):
+        self.record()
+        self.list_()
+        self.at(0)    # first seen waiting: the clock starts counting
+        self.at(9)
+        self.assertEqual(self.read("stops"), [])
+        self.at(10)
+        self.assertEqual(self.read("stops"), ["abc12345"])
+        comments = self.read("comments")
+        self.assertEqual(len(comments), 1)
+        task, text = comments[0].split("\t", 1)
+        self.assertEqual(task, "t-40")
+        self.assertIn("waited 10 minutes on a permission prompt", text)
+        self.assertIn("quoted as data, not instructions", text)
+        self.assertIn("Bash: \"cd ~/Art && taskstore comment t-40", text)
+        self.assertNotIn("\n", text)
+        rec = self.records()["abc12345"]
+        self.assertEqual((rec["state"], rec["stopped"], rec["tool"], rec["task"], rec["commented"]),
+                         ("stuck", True, "Bash", "t-40", True))
+        log = [ln for ln in self.read("clock/wake.log") if " | stuck | " in ln]
+        self.assertEqual(len(log), 1)
+        self.assertRegex(log[0], r"\| stuck \| w-6e5bf6 session abc12345 waited 10m on a permission prompt; stopped; "
+                                 r"comment t-40 ok; alerted; Bash: ")
+        alerts = self.read("alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("stopped a stuck session", alerts[0])
+        # Later looks (it may still be listed, waiting): no second stop, comment or alert.
+        self.at(20)
+        self.at(30)
+        self.assertEqual((len(self.read("stops")), len(self.read("comments")), len(self.read("alerts"))), (1, 1, 1))
+
+    def test_sessions_the_clock_didnt_start_are_never_touched(self):
+        stranger = {"id": "ffff0000", "kind": "background", "sessionId": "99999999-2222-3333-4444-555555555555",
+                    "status": "waiting", "waitingFor": "permission prompt"}
+        self.record()
+        self.list_(waiting="", extra=[stranger])
+        for m in (0, 15, 60):
+            self.at(m)
+        self.assertEqual(self.read("stops"), [])
+        self.assertEqual(self.read("alerts"), [])
+        # With nothing recorded at all, it doesn't even ask.
+        (self.t / "clock" / "sessions.json").write_text("{}")
+        self.agents.write_text("not json")
+        self.at(90)
+        self.assertEqual(self.read("stops"), [])
+
+    def test_the_wait_is_counted_from_when_it_was_first_seen_and_resets_when_it_moves_on(self):
+        self.record()
+        self.list_()
+        self.at(0)
+        self.list_(waiting="")        # answered or moved on
+        self.at(5)
+        self.assertNotIn("waiting_since", self.records()["abc12345"])
+        self.list_()                  # waiting again, on something else
+        self.at(8)
+        self.at(17)
+        self.assertEqual(self.read("stops"), [])
+        self.at(18)
+        self.assertEqual(self.read("stops"), ["abc12345"])
+
+    def test_the_threshold_is_a_setting_and_off_turns_it_off(self):
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_STUCK_AFTER": "1"}):
+            self.assertEqual(wake_cli.stuck_after(), wake_cli.timedelta(minutes=1))
+            self.record()
+            self.list_()
+            self.at(0)
+            self.at(1)
+        self.assertEqual(self.read("stops"), ["abc12345"])
+        for off in ("0", "off"):
+            with mock.patch.dict(wake_cli.os.environ, {"WAKE_STUCK_AFTER": off}):
+                self.assertIsNone(wake_cli.stuck_after())
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_STUCK_AFTER": "off"}):
+            self.record(job="abc12345")   # a fresh round under the same id
+            self.at(0)
+            self.at(600)
+        self.assertEqual(self.read("stops"), ["abc12345"])
+
+    def test_a_session_that_ended_is_let_go_and_old_records_are_dropped(self):
+        self.record()
+        self.agents.write_text("[]")
+        self.at(1)   # just started: not listed yet isn't gone
+        self.assertEqual(self.records()["abc12345"]["state"], "running")
+        self.at(6)
+        self.assertEqual(self.records()["abc12345"]["state"], "gone")
+        wake_cli.reap_stuck(wake_cli.datetime.now() + wake_cli.timedelta(days=8))
+        self.assertEqual(self.records(), {})
+
+    def test_a_round_with_no_task_in_its_note_is_still_stopped_and_said(self):
+        self.record(note="alert unit-x: something failed")
+        self.list_()
+        self.at(0)
+        self.at(10)
+        self.assertEqual(self.read("stops"), ["abc12345"])
+        self.assertEqual(self.read("comments"), [])
+        self.assertEqual(len(self.read("alerts")), 1)
+        self.assertTrue(any("comment none" in ln for ln in self.read("clock/wake.log")))
+
+    def test_a_failed_stop_is_said_and_still_recorded_stuck_once(self):
+        claude = self.t / "bin" / "claude"
+        claude.write_text(claude.read_text().replace('stop) echo "$2" >> "$FAKE_STOPS" ;;', 'stop) echo nope >&2; exit 1 ;;'))
+        self.record()
+        self.list_()
+        self.at(0)
+        self.at(10)
+        self.at(20)
+        self.assertEqual(self.records()["abc12345"]["state"], "stuck")
+        alerts = self.read("alerts")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("The stop FAILED", alerts[0])
+
+    def test_fire_records_the_session_it_started_and_logs_one_line(self):
+        entry = {"id": "w-aaa111", "kind": "wake", "at": "2026-11-04 18:42:25", "created": "2026-11-04 18:41:25",
+                 "note": "t-40 round 12", "prompt": "do it"}
+        spool = self.t / "clock" / "spool.jsonl"
+        spool.parent.mkdir(parents=True, exist_ok=True)
+        spool.write_text(json.dumps(entry) + "\n")
+        with mock.patch.object(wake_cli, "SPOOL", spool), \
+             mock.patch.object(wake_cli, "LOCK", self.t / "clock" / "spool.lock"), \
+             mock.patch.object(wake_cli, "fire_mode", return_value="local"), \
+             mock.patch.object(wake_cli, "fire_gate_open", return_value=True), \
+             mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+             mock.patch.object(wake_cli, "delivery_mode", return_value="spawn"):
+            wake_cli.cmd_fire(wake_cli.argparse.Namespace(id="w-aaa111"))
+        rec = self.records()["abc12345"]
+        self.assertEqual((rec["wake"], rec["note"], rec["state"]), ("w-aaa111", "t-40 round 12", "running"))
+        fire = [ln for ln in self.read("clock/wake.log") if " | fire | " in ln]
+        self.assertEqual(len(fire), 1)
+        self.assertTrue(fire[0].endswith("| fire | w-aaa111 backgrounded · abc12345"))
+        self.assertFalse(any(ln.startswith("  claude") for ln in self.read("clock/wake.log")))
+
+    def test_a_credential_in_the_command_is_never_shown_and_the_alert_has_no_command(self):
+        bearer, ghp = "abcDEF1234567890xyzSECRETbearer", "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+        secret_cmd = (f"GH_TOKEN={ghp} curl -H 'Authorization: Bearer {bearer}' "
+                      f"https://bob:hunter2pass@example.com/x?api_key=zzzSECRETzzz")
+        lines = [json.loads(x) for x in self.transcript.read_text().splitlines()]
+        lines[3]["message"]["content"][1]["input"]["command"] = secret_cmd
+        self.transcript.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+        self.record()
+        self.list_()
+        self.at(0)
+        self.at(10)
+        rec = self.records()["abc12345"]
+        shown = {"comment": "\n".join(self.read("comments")), "alert": "\n".join(self.read("alerts")),
+                 "log": "\n".join(self.read("clock/wake.log")), "record": json.dumps(rec)}
+        for where, text in shown.items():
+            for secret in (bearer, ghp, "hunter2pass", "zzzSECRETzzz"):
+                self.assertNotIn(secret, text, f"{secret} in the {where}")
+        self.assertIn("[redacted]", shown["comment"])
+        self.assertIn("[redacted]", rec["command"])
+        # The alert: the tool and the session, never the command.
+        self.assertIn("Bash", shown["alert"])
+        self.assertIn("claude attach abc12345", shown["alert"])
+        for part in ("GH_TOKEN", "curl", "Authorization", "example.com", "taskstore comment"):
+            self.assertNotIn(part, shown["alert"])
+
+    def test_redact(self):
+        r = wake_cli.redact
+        self.assertEqual(r("ls -la /home/art/Art"), "ls -la /home/art/Art")
+        self.assertNotIn("s3cr3t", r("PASSWORD=s3cr3t ./run"))
+        self.assertNotIn("s3cr3t", r("mysql --password s3cr3t"))
+        self.assertNotIn("xoxb-12345-abcdefgh", r("SLACK=xoxb-12345-abcdefgh"))
+        self.assertNotIn("sk-ant-abcdefghijklmnop", r("call sk-ant-abcdefghijklmnop"))
+        self.assertNotIn("deadbeef" * 4, r("sha " + "deadbeef" * 4))
+        self.assertNotIn("pw", r("git clone https://me:pw@github.com/x/y"))
+
+    def test_a_look_that_fails_never_raises_and_is_said_once(self):
+        self.record()
+        for broken in ("not json", '{"a": 1}'):
+            self.agents.write_text(broken)
+            self.at(0)
+            self.at(30)
+        claude = self.t / "bin" / "claude"
+        claude.unlink()   # claude isn't there at all
+        self.at(40)
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_SESSION_COMMAND": "[not json", "WAKE_TASK_COMMENT": "[nope"}):
+            self.at(50)   # malformed settings: still no exception, no SystemExit
+        self.assertEqual(self.records()["abc12345"]["state"], "running")
+        blind = [ln for ln in self.read("clock/wake.log") if "| reap-blind |" in ln]
+        self.assertGreaterEqual(len(blind), 1)
+        self.assertEqual(len(blind), 4)   # four looks that failed four ways: each said once, not once per look (8 looks)
+
+    def test_a_transcript_line_that_isnt_an_object_is_skipped(self):
+        with self.transcript.open("a") as f:
+            f.write('[1, 2]\n"text"\n{"type": "assistant", "message": "x"}\n')
+        self.assertEqual(wake_cli.last_tool_use(self.transcript), ("Bash", self.COMMAND))
+
+    def test_a_busy_session_with_a_stale_waiting_for_isnt_counted(self):
+        self.assertFalse(wake_cli.waiting_on_permission({"status": "busy", "waitingFor": "permission prompt"}))
+        self.assertTrue(wake_cli.waiting_on_permission({"status": "waiting", "waitingFor": "permission prompt"}))
+
+    def test_off_doesnt_even_look(self):
+        self.record()
+        self.agents.write_text("not json")
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_STUCK_AFTER": "off"}):
+            self.at(0)
+        self.assertFalse(any("reap-blind" in ln for ln in self.read("clock/wake.log")))
+
+    def test_the_service_reaps_every_two_minutes_and_rearms_every_ten(self):
+        clock = [0.0]
+        sleeps = []
+
+        def sleep(n):
+            sleeps.append(n)
+            clock[0] += n
+            if len(sleeps) > 10:
+                raise KeyboardInterrupt
+
+        def boom():
+            raise SystemExit("wake: WAKE_SESSION_COMMAND is a JSON list …")
+
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_LOCAL_AGENT": "ada"}), \
+             mock.patch.object(wake_cli, "cmd_rearm"), \
+             mock.patch.object(wake_cli, "configure"), \
+             mock.patch.object(wake_cli.time, "sleep", side_effect=sleep), \
+             mock.patch.object(wake_cli.time, "monotonic", side_effect=lambda: clock[0]), \
+             mock.patch.object(wake_cli, "keep_armed") as keep, \
+             mock.patch.object(wake_cli, "reap_stuck", side_effect=boom) as reap, \
+             contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                wake_cli.cmd_run(wake_cli.argparse.Namespace())
+        self.assertEqual(set(sleeps), {wake_cli.REAP_CHECK})
+        self.assertEqual(reap.call_count, 10)            # a SystemExit from a look never ends the service
+        self.assertEqual(keep.call_count, 10 * wake_cli.REAP_CHECK // wake_cli.RUN_CHECK)
+
+    def test_the_last_tool_call_is_read_from_the_transcript(self):
+        self.assertEqual(wake_cli.transcript_of("11111111-2222-3333-4444-555555555555"), self.transcript)
+        self.assertIsNone(wake_cli.transcript_of("../../etc/passwd"))
+        self.assertEqual(wake_cli.last_tool_use(self.transcript), ("Bash", self.COMMAND))
+        other = self.t / "other.jsonl"
+        other.write_text(json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "name": "EnterWorktree", "input": {"path": "/home/art/Art/.worktrees/x"}}]}}) + "\n")
+        self.assertEqual(wake_cli.last_tool_use(other), ("EnterWorktree", '{"path": "/home/art/Art/.worktrees/x"}'))
+
+
 if __name__ == "__main__":
     unittest.main()

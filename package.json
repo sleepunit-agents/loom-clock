@@ -71,6 +71,17 @@
         "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\"]"
       },
       {
+        "name": "WAKE_STUCK_AFTER",
+        "label": "Minutes a session may wait on a permission prompt",
+        "hint": "a session the clock started that waits this long on a permission prompt is stopped, noted on its task and said once; default 10, 0 or off: never",
+        "default": "10"
+      },
+      {
+        "name": "WAKE_TASK_COMMENT",
+        "label": "How a stopped session is noted on its task",
+        "hint": "a JSON list, {task} and {text} filled in; default [\"taskstore\", \"comment\", \"{task}\", \"{text}\"] when taskstore is on PATH; off: never"
+      },
+      {
         "name": "WAKE_ALERT_COMMAND",
         "label": "How the clock reaches you when a wake keeps failing",
         "hint": "a JSON list; the message is added as its last argument (a chat webhook script, a push). Without it, only the log"
