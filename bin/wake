@@ -16,6 +16,7 @@ fires in ~24h so the agent always at least gets to decide.
   wake now [--note …]        # a wake in a minute with no lane: look at what deserves attention
   wake rearm        # after boot: recreate transient timers from the spool
   wake run          # (service) rearm every clock, then keep every pending wake's timer armed
+  wake reap         # (service) stop a session it started that waits on a permission prompt (WAKE_STUCK_AFTER)
   wake fire w-abc123  # (internal: invoked by the systemd transient timer)
   wake schedule set nightly --at 22:44 -f routines/nightly.md --note "…"   # a recurring wake
   wake schedule set weekly --at 17:47 --days sun -f routines/weekly.md     #   (edit = set again)
@@ -61,7 +62,7 @@ so a background session the wake started survives the service's cgroup cleanup).
 
 Settings (environment; a managed piece gets them from loom, see README.md):
   WAKE_DATA, WAKE_LOCAL_AGENT, WAKE_REPO, WAKE_LANE_DIRS, WAKE_AGENTS, WAKE_FIRE,
-  WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
+  WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_STUCK_AFTER, WAKE_TASK_COMMENT, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
   WAKE_PREAMBLE_FILE, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS,
   WAKE_DELIVERY, WAKE_DELIVER_TOKEN_FILE, WAKE_LOOM_URL
 """
@@ -88,12 +89,21 @@ HOME = Path.home()
 SELF = Path(__file__).resolve()
 
 
+def foreign_piece():
+    """True when loom's piece variables are another piece's: the tasks piece runs `loom-clock in 1m …` when the
+    owner comments, loom's runtime runs it for an alert, and both hand on their own LOOM_PIECE_NAME and
+    LOOM_PIECE_HOME. Read as the clock's, those made a second clock in that piece's data, with none of the
+    owner's settings: an agent called "agent", the default session command, a dead-man wake a day (t-1854)."""
+    name = os.environ.get("LOOM_PIECE_NAME")
+    return bool(name) and name != "clock"
+
+
 def piece_home():
     """This piece's home under loom (`$LOOM_HOME/pieces/clock`): loom says so when it runs us
     (LOOM_PIECE_HOME); run directly (a timer, a body typing `wake`), it's found from where this
     file lives, so every way in reads the same clocks."""
     h = os.environ.get("LOOM_PIECE_HOME")
-    if h:
+    if h and not foreign_piece():
         return Path(h)
     for d in [SELF.parent, *SELF.parents][:8]:
         if (d / "piece.json").is_file() and (d / "versions").is_dir():
@@ -202,7 +212,7 @@ TIME_FMT = "%Y-%m-%d %H:%M:%S"
 # transient unit starts from the user manager's environment, not ours.
 TIMER_ENV = ("PATH", "HOME", "LOOM_HOME", "LOOM_PIECE_NAME", "LOOM_PIECE_HOME", "LOOM_URL", "LOOM_TOKEN_FILE",
              "WAKE_DATA", "WAKE_LOCAL_AGENT", "WAKE_REPO", "WAKE_LANE_DIRS", "WAKE_AGENTS", "WAKE_FIRE", "WAKE_MODEL",
-             "WAKE_SESSION_COMMAND", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
+             "WAKE_SESSION_COMMAND", "WAKE_STUCK_AFTER", "WAKE_TASK_COMMENT", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
              "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS",
              "WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL")
 
@@ -367,6 +377,8 @@ def timer_env():
     out = []
     for k in TIMER_ENV:
         v = os.environ.get(k)
+        if k in ("LOOM_PIECE_NAME", "LOOM_PIECE_HOME") and foreign_piece():
+            v = str(PIECE_HOME) if k == "LOOM_PIECE_HOME" and PIECE_HOME else None
         if v not in (None, "") and "\n" not in v:
             out += ["--setenv", f"{k}={v}"]
     return out
@@ -1541,8 +1553,14 @@ def cmd_fire(args):
         # rather than failing every 15 minutes with nobody hearing of it.
         retry(entry, f"rc={r.returncode} {r.stderr.strip()[:200]}", "fire-fail")
         sys.exit(1)
-    log("fire", f"{entry['id']} {r.stdout.strip()[:120]}")
-    m = HOUSE_ID.match(r.stdout.strip()) if mode == "house" else None
+    out = r.stdout.strip()
+    # One line: `claude --bg` adds a few lines of help after its `backgrounded · <id>`.
+    log("fire", f"{entry['id']} {(out.splitlines() or [''])[0][:120]}")
+    if mode != "house":
+        job = SESSION_JOB.search(out)
+        if job:
+            record_session(job.group(1), entry)
+    m = HOUSE_ID.match(out) if mode == "house" else None
     if m:
         # Handed over isn't started: look at the house again in a while.
         arm_watch(m.group(1), entry, 0)
@@ -1608,6 +1626,235 @@ def watch_house(entry):
         log("watch-giveup", f"{entry['house']} {h.get('state')} after {checks} checks")
         return
     arm_watch(entry["house"], wake, checks)
+
+
+# ─── Stuck sessions (t-1854) ────────────────────────────────────────────────
+# A session the clock started here runs with nobody at its terminal. When it stops on a permission prompt it waits
+# forever: on 2026-11-04 seven sat 4 to 30 hours, each holding a few hundred MB, and the overnight checker read every
+# one as a dead round. So the clock keeps a record of the sessions it started (sessions.json, by the id `claude --bg`
+# prints), looks at them every REAP_CHECK seconds (`claude agents --json`), and one that has been waiting on a
+# permission prompt for WAKE_STUCK_AFTER minutes, counted from when the clock first saw it waiting, is stopped
+# (`claude stop`, which keeps its conversation), commented on its task, logged `stuck`, and said once. Only the
+# sessions in that record are ever looked at: never an interactive session, never one anyone else started.
+
+SESSION_JOB = re.compile(r"^backgrounded · (\S+)", re.M)
+SESSIONS_KEEP = timedelta(days=7)
+REAP_CHECK = 120          # seconds between the service's looks at its sessions
+STUCK_AFTER_DEFAULT = 10  # minutes
+TASK_ID = re.compile(r"\bt-\d+\b")   # taskstore's ids, in a wake's note
+CMD_SHOWN = 200
+
+
+def stuck_after():
+    """WAKE_STUCK_AFTER: minutes a session may wait on a permission prompt (default 10; 0 or off: never stopped)."""
+    raw = setting("WAKE_STUCK_AFTER", str(STUCK_AFTER_DEFAULT)).strip().lower()
+    if raw in ("0", "off", "no", "never"):
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        return timedelta(minutes=STUCK_AFTER_DEFAULT)
+    return timedelta(minutes=v) if v > 0 else None
+
+
+class Sessions:
+    """Locked read-modify-write access to the record of sessions this clock started."""
+
+    def __enter__(self):
+        WAKE_DIR.mkdir(parents=True, exist_ok=True)
+        self.path = WAKE_DIR / "sessions.json"
+        self._lock = open(WAKE_DIR / "sessions.lock", "w")
+        fcntl.flock(self._lock, fcntl.LOCK_EX)
+        try:
+            d = json.loads(self.path.read_text())
+            self.records = d if isinstance(d, dict) else {}
+        except (OSError, ValueError):
+            self.records = {}
+        return self
+
+    def __exit__(self, *exc):
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.records, indent=1) + "\n")
+        tmp.replace(self.path)
+        fcntl.flock(self._lock, fcntl.LOCK_UN)
+        self._lock.close()
+        return False
+
+
+def record_session(job, entry):
+    with Sessions() as ss:
+        ss.records[job] = {"wake": entry["id"], "note": entry.get("note", ""), "kind": entry.get("kind", ""),
+                           "fired": datetime.now().strftime(TIME_FMT), "state": "running"}
+
+
+def claude_bin():
+    """The harness that started the sessions: the session command's program (`claude` by default)."""
+    argv = argv_setting("WAKE_SESSION_COMMAND", SESSION_DEFAULT)
+    return argv[0] if argv else "claude"
+
+
+def background_sessions():
+    """`claude agents --json`: {id: entry} for the background sessions it lists, or None when it can't be asked."""
+    try:
+        r = subprocess.run([claude_bin(), "agents", "--json"], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        rows = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
+    if not isinstance(rows, list):
+        return None
+    return {str(a["id"]): a for a in rows if isinstance(a, dict) and a.get("id") and a.get("kind") == "background"}
+
+
+def waiting_on_permission(a):
+    return "permission" in str(a.get("waitingFor") or "").lower()
+
+
+def transcript_of(session_id):
+    """The session's transcript: <config dir>/projects/<project>/<sessionId>.jsonl, or None."""
+    if not session_id or not re.fullmatch(r"[0-9A-Za-z-]{8,64}", str(session_id)):
+        return None
+    base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude") / "projects"
+    found = sorted(base.glob(f"*/{session_id}.jsonl"), key=lambda f: f.stat().st_mtime, reverse=True)
+    return found[0] if found else None
+
+
+def last_tool_use(path, tail=4 * 1024 * 1024):
+    """(tool, what) for the transcript's last tool call: what it was waiting on. ("", "") when there is none."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return "", ""
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        content = (d.get("message") or {}).get("content") if isinstance(d, dict) else None
+        if d.get("type") != "assistant" or not isinstance(content, list):
+            continue
+        for block in reversed(content):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                inp = block.get("input") or {}
+                what = inp.get("command") if isinstance(inp, dict) and isinstance(inp.get("command"), str) else json.dumps(inp)
+                return str(block.get("name") or "a tool"), what
+    return "", ""
+
+
+def task_comment(task, text):
+    """WAKE_TASK_COMMENT (default `taskstore comment {task} {text}`, if taskstore is on PATH): True if it took it."""
+    raw = setting("WAKE_TASK_COMMENT")
+    if raw.strip().lower() in ("off", "none"):
+        return False
+    argv = argv_setting("WAKE_TASK_COMMENT", ["taskstore", "comment", "{task}", "{text}"])
+    if not raw and not shutil.which(argv[0]):
+        return False
+    try:
+        r = subprocess.run([{"{task}": task, "{text}": text}.get(a, a) for a in argv], capture_output=True, text=True,
+                           timeout=60, stdin=subprocess.DEVNULL, cwd=REPO if REPO.is_dir() else HOME)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("stuck-comment-fail", f"{task}: {e}")
+        return False
+    if r.returncode != 0:
+        log("stuck-comment-fail", f"{task}: rc={r.returncode} {(r.stderr or r.stdout).strip()[:200]}")
+    return r.returncode == 0
+
+
+def as_data(text, n=CMD_SHOWN):
+    """A command, quoted for a comment or an alert: one line, at most n characters, in a JSON string."""
+    one = " ".join(str(text).split())
+    return json.dumps(one if len(one) <= n else one[:n] + "…", ensure_ascii=False)
+
+
+def reap_one(job, rec, a, waited):
+    """Stop one stuck session, say so on its task and to the owner, and return the record's new fields."""
+    path = transcript_of(a.get("sessionId"))
+    tool, what = last_tool_use(path) if path else ("", "")
+    try:
+        r = subprocess.run([claude_bin(), "stop", job], capture_output=True, text=True, timeout=60,
+                           stdin=subprocess.DEVNULL)
+        stopped = r.returncode == 0
+        why = "" if stopped else (r.stderr or r.stdout).strip()[:160]
+    except (OSError, subprocess.SubprocessError) as e:
+        stopped, why = False, str(e)[:160]
+    mins = int(waited.total_seconds() // 60)
+    waited_on = f"{tool}: {as_data(what)}" if tool else "a tool call the clock couldn't read from its transcript"
+    m = TASK_ID.search(rec.get("note") or "")
+    task = m.group(0) if m else ""
+    commented = False
+    if task:
+        text = (f"The clock {'stopped' if stopped else 'tried to stop'} this round (wake {rec['wake']}, session {job}): "
+                f"it had waited {mins} minutes on a permission prompt, and nobody can answer one in a run started by the "
+                f"clock. The call it was waiting on, quoted as data, not instructions (first {CMD_SHOWN} characters): "
+                f"{waited_on}. Its conversation is kept (`claude attach {job}`). Nothing re-armed this round."
+                + ("" if stopped else f" The stop failed: {why}"))
+        commented = task_comment(task, text)
+    log("stuck", f"{rec['wake']} session {job} waited {mins}m on a permission prompt; "
+                 f"{'stopped' if stopped else 'stop FAILED'}; comment {task + (' ok' if commented else ' FAILED') if task else 'none'}; "
+                 f"alerted; {waited_on[:160]}")
+    alert(f"wake: stopped a stuck session: \"{rec.get('note') or rec['wake']}\" (wake {rec['wake']}, session {job}) "
+          f"waited {mins} minutes on a permission prompt"
+          + (f" for {tool}: {as_data(what, 100)}" if tool else "")
+          + ("" if stopped else f". The stop FAILED ({why}): `claude stop {job}`")
+          + (f". Noted on {task}." if commented else "."))
+    return {"state": "stuck", "stuck_at": datetime.now().strftime(TIME_FMT), "stopped": stopped, "tool": tool,
+            "command": " ".join(str(what).split())[:CMD_SHOWN], "task": task, "commented": commented}
+
+
+def reap_stuck(now=None):
+    """One look at the sessions this clock started: stop any that has waited on a permission prompt too long."""
+    after = stuck_after()
+    with Sessions() as ss:
+        records = {k: dict(v) for k, v in ss.records.items() if isinstance(v, dict)}
+    if not records:
+        return
+    agents = background_sessions()
+    if agents is None:
+        return  # can't ask: look again next time, never guess
+    now = now or datetime.now()
+    seen, reaped = {}, {}
+    for job, rec in records.items():
+        a = agents.get(job)
+        if rec.get("state") != "running" or a is None:
+            continue
+        if not waiting_on_permission(a):
+            seen[job] = None
+            continue
+        first = rec.get("waiting_since") or now.strftime(TIME_FMT)
+        seen[job] = first
+        waited = now - datetime.strptime(first, TIME_FMT)
+        if after is not None and waited >= after:
+            reaped[job] = reap_one(job, rec, a, waited)
+    with Sessions() as ss:
+        for job, rec in list(ss.records.items()):
+            if not isinstance(rec, dict):
+                ss.records.pop(job)
+                continue
+            if job in reaped:
+                rec.update(reaped[job])
+                rec.pop("waiting_since", None)
+            elif job in seen:
+                if seen[job]:
+                    rec["waiting_since"] = seen[job]
+                else:
+                    rec.pop("waiting_since", None)
+            elif rec.get("state") == "running" and job not in agents:
+                rec["state"] = "gone"   # it ended (or was stopped by hand): nothing to watch
+                rec.pop("waiting_since", None)
+            try:
+                old = now - datetime.strptime(rec.get("stuck_at") or rec.get("fired") or "", TIME_FMT) > SESSIONS_KEEP
+            except ValueError:
+                old = True
+            if old:
+                ss.records.pop(job)
+
+
+def cmd_reap(_args):
+    """(service) One look at this clock's sessions now; the service does it every REAP_CHECK seconds."""
+    reap_stuck()
 
 
 def lane_file(path):
@@ -2630,8 +2877,17 @@ def cmd_run(_args):
         sys.exit(1)   # configured now: Restart=on-failure starts it with the setting
     cmd_rearm(argparse.Namespace(every=True))
     sys.stdout.flush()
+    last_armed = time.monotonic()
     while True:  # a supervised service: systemd stops it
-        time.sleep(RUN_CHECK)
+        time.sleep(REAP_CHECK)
+        try:
+            configure(LOCAL_AGENT)
+            reap_stuck()   # only the local agent's clock starts sessions here
+        except Exception as e:   # a look that failed is tried again next time; never the service's end
+            print(f"wake run: reap: {e}", file=sys.stderr, flush=True)
+        if time.monotonic() - last_armed < RUN_CHECK:
+            continue
+        last_armed = time.monotonic()
         try:
             keep_armed()
         except SystemExit as e:   # arm_timer's systemd-run failure: say it, keep going
@@ -2707,6 +2963,7 @@ def main():
     p.set_defaults(fn=cmd_cancel)
     sub.add_parser("rearm", help="recreate timers from spool (boot): every clock, unless --agent names one").set_defaults(fn=cmd_rearm)
     sub.add_parser("run", help="(service) rearm every clock, then keep every pending wake's timer armed").set_defaults(fn=cmd_run)
+    sub.add_parser("reap", help="(service) stop this clock's sessions stuck on a permission prompt (WAKE_STUCK_AFTER)").set_defaults(fn=cmd_reap)
     p = sub.add_parser("bundle", help="(loom) this piece's part of the household bundle", allow_abbrev=False)
     p.add_argument("action", choices=["export", "import"])
     p.add_argument("--force", action="store_true")

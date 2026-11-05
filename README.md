@@ -52,6 +52,23 @@ inline prompt.
   from loom-secrets, an approval `a-…`) parks instead of polling: the clock
   checks the request every 5 minutes with no body running, and wakes the
   continuation, told the answer, when it comes (or after 24 hours).
+- **Stuck sessions.** A session the clock started here has nobody at its
+  terminal, so one that stops on a permission prompt would wait forever. The
+  clock keeps a record of the sessions it started (`sessions.json`, by the id
+  `claude --bg` prints) and the service looks at them every 2 minutes
+  (`claude agents --json`). One that has waited on a permission prompt for
+  `WAKE_STUCK_AFTER` minutes (default 10), counted from when the clock first
+  saw it waiting, is stopped (`claude stop`: its conversation is kept), noted
+  on the task its wake's note names (`WAKE_TASK_COMMENT`, with the tool and
+  the first 200 characters of what it was waiting on, quoted as data), logged
+  as `stuck` (not a failure) and said once (`WAKE_ALERT_COMMAND`). Only the
+  sessions in that record are ever looked at: never an interactive session,
+  never one anything else started. `wake reap` does one look now.
+- **Another piece's variables aren't the clock's.** The tasks piece and loom's
+  runtime run `loom-clock in 1m …` with their own `LOOM_PIECE_NAME` and
+  `LOOM_PIECE_HOME`; the clock ignores a `LOOM_PIECE_HOME` whose
+  `LOOM_PIECE_NAME` isn't `clock` and finds its own home from where it's
+  installed, so their wakes land on the owner's clock with its settings.
 - **Failures** back off (15, 30, 60, 120, 240 minutes), say so once at the
   third (`WAKE_ALERT_COMMAND`), and give up at the sixth. A house handed to
   loom-box is checked on later: one that never started is retried like a
@@ -119,7 +136,9 @@ from a `oneshot` user unit.
 | `WAKE_FIRE` | `$WAKE_DATA/fire`, else `local` | `local`, `house` or `mixed` |
 | `WAKE_MODEL` | `claude-sonnet-5` | The model a wake runs on unless it names one |
 | `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}"]` | The session a local wake starts. A JSON list (or a command line); `{prompt}` and `{model}` are whole arguments. The default can stop and ask for permission; an unattended agent that has decided otherwise adds its own flags here |
-| `WAKE_ALERT_COMMAND` | none (the log only) | How the clock reaches the owner when a wake keeps failing; the message is its last argument |
+| `WAKE_STUCK_AFTER` | `10` | Minutes a session the clock started may wait on a permission prompt before it's stopped, noted and said (see "Stuck sessions"); `0` or `off`: never |
+| `WAKE_TASK_COMMENT` | `["taskstore", "comment", "{task}", "{text}"]`, when `taskstore` is on `PATH` | How a stopped session is noted on the task its note names (a `t-NNN`); `off`: never |
+| `WAKE_ALERT_COMMAND` | none (the log only) | How the clock reaches the owner when a wake keeps failing or a session was stopped stuck; the message is its last argument |
 | `WAKE_FIRE_GATE` | none | A command run before any wake: non-zero defers every wake an hour. For a standby that mirrors a primary and must never run the same lanes |
 | `WAKE_PREAMBLE_FILE` | the piece's own | The words every wake starts with: `{name} {where} {id} {kind} {created} {note} {lanes} {body}` |
 | `WAKE_DELIVERY` | `deliver` when `WAKE_DELIVER_TOKEN_FILE` is set and a piece offers delivery, else `spawn` | `deliver`: a house wake goes through loom's `deliver`. `spawn`: the clock asks loom-box for the house itself, as before |
