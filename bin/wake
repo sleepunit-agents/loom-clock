@@ -1281,7 +1281,8 @@ def dispatch(prompt, model, env, mode, agent=None, slot=None):
 # session: the resolver unreachable or failing (logged `resolve-fail`), WAKE_CODEX=off, an agent WAKE_CODEX_FALLBACK
 # doesn't name, a pick that isn't a fallback from Claude, or limits Codex can't keep: the session command's, the
 # Claude settings it would load (claude_guards), or a Codex profile that would apply (codex_profile_reasons) (logged
-# `fallback-refused` and said once; the session runs, and fails, as it would have).
+# `fallback-refused` and said once; the session runs, and fails, as it would have), or a Codex config layer the
+# clock doesn't write (codex_layer_reasons).
 #
 # The limits are the session command's own: its `--disallowedTools` list is the wake's deny list, kept as the
 # runtime keeps a body's (codex_deny: each denied MCP server off, unconditionally; anything else is refused). A
@@ -1459,64 +1460,124 @@ def codex_deny(deny, urls=frozenset()):
     return args, ""
 
 
-MCP_TABLE = re.compile(r"""^\s*\[\s*(?:profiles\.[^\]]*?\.)?mcp_servers\s*\.\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*\]""")
+# ─── The fallback's own Codex home (t-1919) ──────────────────────────────────
+# A denied tool server is kept out by construction, not by reading configs to prove a denial holds: the run gets a
+# CODEX_HOME the clock writes (<clock>/codex-home, 0700) holding only the login (auth.json, linked to the user's, as
+# the runtime links a house's) and a config.toml with the user's own MCP servers (~/.codex/config.toml, or the env's
+# CODEX_HOME's, parsed with tomllib) minus every denied one, each allowed table copied as it is. Nothing else of the
+# user's Codex comes along: no profiles, plugins, skills, hooks, rules or projects. The -c enabled=false denials stay
+# as a second layer.
+#
+# What Codex reads besides CODEX_HOME, per its docs (learn.chatgpt.com/docs/config-file/config-basic, -advanced,
+# -reference; learn.chatgpt.com/codex/enterprise/managed-configuration):
+#   - project .codex/ layers (config, hooks, rules), from the project root (.git) down to the cwd, for trusted
+#     projects only. Untrusted projects skip them (`projects.<path>.trust_level`), so the generated config marks the
+#     cwd and every directory above it untrusted; and, as the docs don't say what lies above the root, a .codex/ on
+#     the way from the cwd to its project root refuses the run outright (it exists: no parsing).
+#   - system and managed layers: /etc/codex/config.toml, managed_config.toml, requirements.toml. No documented switch
+#     turns them off, so any of them existing refuses the run. (Cloud-managed config and MDM can't be seen from here.)
+
+CODEX_SYSTEM_FILES = ("config.toml", "managed_config.toml", "requirements.toml")
 
 
-def codex_configs(cwd, env):
-    """The config.toml files a Codex run started with `env` in `cwd` may read: its home (the env's CODEX_HOME, else
-    the env's HOME's .codex: the child sees only `env`), this process's CODEX_HOME and home too (more files only
-    ever refuse more), and the project's .codex/. One list for the URL hint and the profile gate alike."""
-    homes = [Path(env["CODEX_HOME"]) if env.get("CODEX_HOME") else Path(env.get("HOME") or HOME) / ".codex",
-             Path(os.environ.get("CODEX_HOME") or HOME / ".codex")]
-    files = [h / "config.toml" for h in homes] + [Path(cwd) / ".codex" / "config.toml"]
-    return list(dict.fromkeys(f.expanduser() for f in files))
+def codex_source_home(env):
+    """The Codex home of the account the wake runs as: the env's CODEX_HOME, this process's, else HOME's .codex."""
+    return Path(env.get("CODEX_HOME") or os.environ.get("CODEX_HOME") or Path(env.get("HOME") or HOME) / ".codex")
 
 
-def codex_url_servers(cwd, env):
-    """The MCP servers the configs Codex reads define by URL: only a hint for which stub codex_deny writes, as the
-    runtime's urlServers."""
-    urls = set()
-    for f in codex_configs(cwd, env):
-        try:
-            text = f.read_text()
-        except OSError:
-            continue
-        cur = None
-        for line in text.splitlines():
-            m = MCP_TABLE.match(line)
-            if m:
-                cur = m.group(1) or m.group(2) or m.group(3)
-                continue
-            if re.match(r"^\s*\[", line):
-                cur = None
-                continue
-            if cur and re.match(r"^\s*url\s*=", line):
-                urls.add(cur)
-    return urls
-
-
-def codex_profile_reasons(cwd, env):
-    """Why a Codex profile could apply to the run, or []: the runtime's LOOM_RUNTIME_CODEX_PROFILE (in the wake's
-    env or this process's), or a top-level `profile` key in a config Codex reads, parsed as TOML (a config that's
-    there but can't be read or parsed counts too: fail closed). A profile's own mcp_servers can take precedence over
-    `-c mcp_servers.<s>.enabled=false`, so any of these refuses the fallback (security review, t-1912). Nobody
-    sets one on loom's machine today."""
+def codex_layer_reasons(cwd):
+    """Codex config layers outside the generated home that would apply to a run in cwd, or [] (existence only)."""
     out = []
+    system = Path(os.environ.get("WAKE_CODEX_SYSTEM_DIR") or "/etc/codex")
+    for n in CODEX_SYSTEM_FILES:
+        if os.path.lexists(system / n):
+            out.append(f"{system / n} exists (a system or managed Codex layer nothing can turn off)")
+    d = Path(cwd).resolve()
+    for at in [d, *d.parents]:
+        if os.path.lexists(at / ".codex"):
+            out.append(f"{at / '.codex'} exists (a project Codex layer)")
+        if os.path.lexists(at / ".git"):
+            break   # the project root: Codex's project layers start here
+    return out
+
+
+def toml_key(k):
+    return json.dumps(str(k), ensure_ascii=False)
+
+
+def toml_value(v):
+    """A parsed TOML value written back as TOML (strings as basic strings: JSON's escapes are TOML's)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float) and v == v and v not in (float("inf"), float("-inf")):
+        return repr(v)
+    if isinstance(v, str):
+        return json.dumps(v, ensure_ascii=False)
+    if isinstance(v, list):
+        return "[" + ", ".join(toml_value(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{ " + ", ".join(f"{toml_key(k)} = {toml_value(x)}" for k, x in v.items()) + " }"
+    raise ValueError(f"a {type(v).__name__} value it doesn't write")
+
+
+def codex_config_text(servers, cwd):
+    """The generated config.toml: the allowed servers' tables, and the cwd and every directory above it untrusted."""
+    lines = []
+    for name, table in servers.items():
+        lines.append(f"[mcp_servers.{toml_key(name)}]")
+        lines += [f"{toml_key(k)} = {toml_value(v)}" for k, v in table.items()]
+        lines.append("")
+    d = Path(cwd).resolve()
+    for at in [d, *d.parents]:
+        lines += [f"[projects.{toml_key(str(at))}]", 'trust_level = "untrusted"', ""]
+    return "\n".join(lines)
+
+
+def codex_home(deny, cwd, env):
+    """(the generated CODEX_HOME, the allowed servers' names, the URL-defined names) or raises ValueError(why)."""
+    src = codex_source_home(env)
+    auth = src / "auth.json"
+    if not auth.is_file():
+        raise ValueError(f"there's no Codex login at {auth}")
+    try:
+        user = tomllib.loads((src / "config.toml").read_text())
+    except FileNotFoundError:
+        user = {}
+    except (OSError, ValueError) as e:
+        raise ValueError(f"{src / 'config.toml'} can't be read ({str(e)[:80]})")
+    servers = user.get("mcp_servers") or {}
+    if not isinstance(servers, dict) or not all(isinstance(v, dict) for v in servers.values()):
+        raise ValueError(f"{src / 'config.toml'}'s mcp_servers aren't tables")
+    denied = {d[5:] for d in deny if d.startswith("mcp__")}
+    allowed = {k: v for k, v in servers.items() if k not in denied}
+    text = codex_config_text(allowed, cwd)
+    want = {**({"mcp_servers": allowed} if allowed else {}),
+            "projects": {str(at): {"trust_level": "untrusted"} for at in [Path(cwd).resolve(), *Path(cwd).resolve().parents]}}
+    if tomllib.loads(text) != want:
+        raise ValueError("the generated config.toml doesn't read back as written")
+    home = WAKE_DIR / "codex-home"
+    home.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(home, 0o700)
+    tmp = home / f".config.{secrets.token_hex(4)}"
+    with os.fdopen(os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as f:
+        f.write(text)
+    tmp.replace(home / "config.toml")
+    link = home / f".auth.{secrets.token_hex(4)}"
+    os.symlink(auth.resolve(), link)
+    link.replace(home / "auth.json")
+    urls = {k for k, v in servers.items() if "url" in v}
+    return home, sorted(allowed), urls
+
+
+def codex_profile_reasons(env):
+    """The runtime's LOOM_RUNTIME_CODEX_PROFILE, set in the wake's env or this process's: no run under a profile
+    (its own mcp_servers would win over the denials; nobody sets one on loom's machine)."""
     for src in (env, os.environ):
         if src.get("LOOM_RUNTIME_CODEX_PROFILE"):
-            out.append(f"LOOM_RUNTIME_CODEX_PROFILE={src['LOOM_RUNTIME_CODEX_PROFILE'][:40]}")
-            break
-    for f in codex_configs(cwd, env):
-        try:
-            doc = tomllib.loads(f.read_text())
-        except FileNotFoundError:
-            continue
-        except (OSError, ValueError) as e:
-            out.append(f"{f} can't be read ({str(e)[:60]})")
-            continue
-        if "profile" in doc:
-            out.append(f"{f} selects a profile ({str(doc['profile'])[:40]})")
-    return out
+            return [f"LOOM_RUNTIME_CODEX_PROFILE={src['LOOM_RUNTIME_CODEX_PROFILE'][:40]}"]
+    return []
 
 def resolve_harness(model, agent, env):
     """The runtime's pick for this agent's wake: {model, harness, why}, or None (logged) when it can't be asked."""
@@ -1556,22 +1617,34 @@ def codex_fallback(argv, model, env, agent, cwd):
         log("fallback-refused", f"the runtime picked codex {pick['model']} ({why}) but not as a fallback from "
                                 f"claude; the session command runs as before")
         return None
-    deny, cant = claude_limits(argv)
-    args, err = (None, cant) if cant else codex_deny(deny, codex_url_servers(cwd, env))
+    deny, err = claude_limits(argv)
     guards = [] if err else claude_guards(cwd)
     if guards:
         err = f"its Claude settings guard it in ways a Codex run can't keep: {'; '.join(guards)}"
-    profiles = [] if err else codex_profile_reasons(cwd, env)
+    profiles = [] if err else codex_profile_reasons(env)
     if profiles:
         err = (f"a Codex profile would apply ({'; '.join(profiles)}), and a profile's own MCP servers can turn a "
                f"denied one back on")
+    layers = [] if err else codex_layer_reasons(cwd)
+    if layers:
+        err = f"Codex would read config the clock doesn't write: {'; '.join(layers)}"
+    if not err:
+        _, err = codex_deny(deny)
+    home = None
+    if not err:
+        try:
+            home, allowed, urls = codex_home(deny, cwd, env)
+            args, err = codex_deny(deny, urls)
+        except (OSError, ValueError) as e:
+            err = f"its own Codex home can't be made: {e}"
     if err:
         log("fallback-refused", f"the runtime picked codex {pick['model']} ({why}), but {err}; "
                                 f"the session command runs as before")
         refused_once(err[:600])
         return None
-    log("fallback", f"codex {pick['model']} in place of {model} ({why}); deny: {', '.join(deny) or 'none'}")
-    return {"program": program, "model": pick["model"], "args": args}
+    log("fallback", f"codex {pick['model']} in place of {model} ({why}); deny: {', '.join(deny) or 'none'}; "
+                    f"servers: {', '.join(allowed) or 'none'}")
+    return {"program": program, "model": pick["model"], "args": args, "home": str(home)}
 
 
 def codex_run(key):
@@ -1589,8 +1662,8 @@ def start_codex(prompt, codex, env, cwd):
     # The env keys a Claude Code launcher leaves behind: a Codex body must not look like a Claude session to its tools.
     e = {k: v for k, v in env.items() if not k.startswith("CLAUDE_CODE_") and k not in ("CLAUDECODE", "CLAUDE_JOB_DIR")}
     e["SHUTTLE_BODY"] = key
-    # No profile (-p): a profile's own mcp_servers can turn a denied server back on over the top-level -c denials,
-    # so a profile anywhere refuses the fallback before this (codex_profiles).
+    e["CODEX_HOME"] = codex["home"]   # the clock's own (codex_home): the login and the allowed servers, nothing else
+    # No profile (-p): a profile's own mcp_servers can turn a denied server back on over the top-level -c denials.
     argv = [codex["program"], "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-hook-trust",
             "--dangerously-bypass-approvals-and-sandbox", "-m", codex["model"],
             *codex["args"], "-C", str(cwd), "-o", str(d / "last.txt"), "-"]
