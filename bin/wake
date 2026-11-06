@@ -60,17 +60,20 @@ or 403), it's a session here as before.
 Quota fallback (t-1912): before a session here, the clock asks loom's runtime
 which harness this agent's wake runs on (`loom runtime models resolve --venue
 wake`). Claude: the session command, as before. Codex (Claude's account is out):
-`codex exec` started as the runtime starts a Codex body (WAKE_CODEX; off: never),
-the session command's --disallowedTools kept by turning each denied MCP server
-off, or no fallback at all when Codex can't keep its limits. A resolver that
-can't be asked leaves the session command as it was.
+`codex exec` started as the runtime starts a Codex body (WAKE_CODEX), the session
+command's --disallowedTools kept by turning each denied MCP server off. Only for
+the agents WAKE_CODEX_FALLBACK names (default none), and never while Codex can't
+keep the session's limits: a deny it can't carry, or any hook, deny rule or
+enabled plugin in the Claude settings the session would load (logged
+`fallback-refused`, said once). A resolver that can't be asked leaves the
+session command as it was.
 
 Timers: transient `systemd-run --user` units named wake-<id> (KillMode=process
 so a background session the wake started survives the service's cgroup cleanup).
 
 Settings (environment; a managed piece gets them from loom, see README.md):
   WAKE_DATA, WAKE_LOCAL_AGENT, WAKE_REPO, WAKE_LANE_DIRS, WAKE_AGENTS, WAKE_FIRE,
-  WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_CODEX, WAKE_STUCK_AFTER, WAKE_TASK_COMMENT, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
+  WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_CODEX, WAKE_CODEX_FALLBACK, WAKE_STUCK_AFTER, WAKE_TASK_COMMENT, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
   WAKE_PREAMBLE_FILE, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS,
   WAKE_DELIVERY, WAKE_DELIVER_TOKEN_FILE, WAKE_LOOM_URL
 """
@@ -221,7 +224,7 @@ TIME_FMT = "%Y-%m-%d %H:%M:%S"
 # transient unit starts from the user manager's environment, not ours.
 TIMER_ENV = ("PATH", "HOME", "LOOM_HOME", "LOOM_PIECE_NAME", "LOOM_PIECE_HOME", "LOOM_URL", "LOOM_TOKEN_FILE",
              "WAKE_DATA", "WAKE_LOCAL_AGENT", "WAKE_REPO", "WAKE_LANE_DIRS", "WAKE_AGENTS", "WAKE_FIRE", "WAKE_MODEL",
-             "WAKE_SESSION_COMMAND", "WAKE_CODEX", "WAKE_STUCK_AFTER", "WAKE_TASK_COMMENT", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
+             "WAKE_SESSION_COMMAND", "WAKE_CODEX", "WAKE_CODEX_FALLBACK", "WAKE_STUCK_AFTER", "WAKE_TASK_COMMENT", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
              "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS",
              "WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL")
 
@@ -1297,6 +1300,73 @@ def codex_program():
     return None if v.lower() in ("off", "no", "none", "0") else v
 
 
+def fallback_agents():
+    """WAKE_CODEX_FALLBACK: the agents whose local wakes may fall back to Codex (comma-separated). Off by default:
+    an agent opts in, knowing its Claude hooks and settings don't come along (claude_guards refuses while any do)."""
+    return {a.strip() for a in setting("WAKE_CODEX_FALLBACK").split(",") if AGENT_NAME.match(a.strip())}
+
+
+def claude_settings_files(cwd):
+    """The Claude Code settings a session started in cwd loads: managed, the user's, the project's and its local."""
+    user = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+    return [Path(os.environ.get("WAKE_CLAUDE_MANAGED_SETTINGS") or "/etc/claude-code/managed-settings.json"),
+            user / "settings.json", user / "settings.local.json",
+            Path(cwd) / ".claude" / "settings.json", Path(cwd) / ".claude" / "settings.local.json"]
+
+
+def claude_guards(cwd):
+    """What a Claude session here would be guarded by that a Codex run never sees (security review, t-1912): every
+    hook (a guard like poll-guard or slack-as-art is a hook), every deny rule in a settings file, and every enabled
+    plugin (it can carry hooks). A file that's there but can't be read counts too: fail closed. → [reason]."""
+    out = []
+    for f in claude_settings_files(cwd):
+        if not f.exists():
+            continue
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError) as e:
+            out.append(f"{f} can't be read ({str(e)[:60]})")
+            continue
+        if not isinstance(d, dict):
+            out.append(f"{f} isn't a settings object")
+            continue
+        hooks = d.get("hooks") if not d.get("disableAllHooks") else None
+        if isinstance(hooks, dict):
+            cmds = []
+            for event, groups in hooks.items():
+                for g in groups if isinstance(groups, list) else [groups]:
+                    for h in (g.get("hooks") if isinstance(g, dict) else None) or [g]:
+                        c = h.get("command") if isinstance(h, dict) else None
+                        cmds.append(f"{event}:{Path(c.split()[0]).name if isinstance(c, str) and c.split() else '?'}")
+            if cmds:
+                out.append(f"{f} has hooks ({', '.join(dict.fromkeys(cmds))})")
+        elif hooks not in (None, {}):
+            out.append(f"{f} has hooks it can't read")
+        perms = d.get("permissions") if isinstance(d.get("permissions"), dict) else {}
+        if perms.get("deny"):
+            out.append(f"{f} has deny rules ({', '.join(map(str, perms['deny']))[:120]})")
+        plugins = [k for k, v in (d.get("enabledPlugins") or {}).items() if v] if isinstance(d.get("enabledPlugins"), dict) else []
+        if plugins:
+            out.append(f"{f} enables plugins that may carry hooks ({', '.join(plugins)[:120]})")
+    return out
+
+
+def refused_once(text):
+    """A refused fallback is said to the owner once per reason (WAKE_ALERT_COMMAND), not once per wake."""
+    mark = WAKE_DIR / "fallback-refused.said"
+    digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+    try:
+        if mark.read_text().strip() == digest:
+            return
+    except OSError:
+        pass
+    alert(f"wake: a local wake can't move to Codex while Claude is out, so it runs (and fails) on Claude: {text}")
+    try:
+        mark.write_text(digest + "\n")
+    except OSError:
+        pass
+
+
 def claude_limits(argv):
     """The Claude session command's limits as (deny list, why a Codex body can't keep them or "")."""
     if not argv or Path(argv[0]).name != "claude":
@@ -1406,17 +1476,22 @@ def codex_fallback(argv, model, env, agent):
     """{program, model, args}: a Codex run in place of the session command, when the resolver says so and the
     session's limits can be kept there; else None (the session command runs)."""
     program = codex_program()
-    if not program:
-        return None
+    if not program or agent not in fallback_agents():
+        return None   # not opted in (WAKE_CODEX_FALLBACK): not even a question to the resolver
     pick = resolve_harness(model, agent, env)
     if not pick or pick["harness"] != "codex":
         return None
     why = " / ".join(str(w) for w in pick.get("why") or [])[:240]
+    cwd = REPO if REPO.is_dir() else HOME
     deny, cant = claude_limits(argv)
-    args, err = (None, cant) if cant else codex_deny(deny, codex_url_servers(REPO if REPO.is_dir() else HOME, env))
+    args, err = (None, cant) if cant else codex_deny(deny, codex_url_servers(cwd, env))
+    guards = [] if err else claude_guards(cwd)
+    if guards:
+        err = f"its Claude settings guard it in ways a Codex run can't keep: {'; '.join(guards)}"
     if err:
         log("fallback-refused", f"the runtime picked codex {pick['model']} ({why}), but {err}; "
                                 f"the session command runs as before")
+        refused_once(err[:600])
         return None
     log("fallback", f"codex {pick['model']} in place of {model} ({why}); deny: {', '.join(deny) or 'none'}")
     return {"program": program, "model": pick["model"], "args": args}
@@ -2146,10 +2221,27 @@ def codex_last_tool(events):
     for e in reversed(events):
         item = e.get("item")
         if e.get("type") in ("item.started", "item.completed") and isinstance(item, dict) and item.get("type") in CODEX_TOOLS:
-            what = item.get("command") if isinstance(item.get("command"), str) else json.dumps(
-                {k: v for k, v in item.items() if k not in ("id", "type", "aggregated_output")})
-            return item["type"], what
+            return item["type"], codex_item_words(item)
     return "", ""
+
+
+def codex_item_words(item):
+    """What a tool step was, from an allow-list of its fields only (never its result, output, error or a file's
+    contents, which can carry secrets into a task comment agents read): a command, a search's query, the paths a
+    change touched, an MCP call's server, tool and argument names (no values). as_data redacts and caps it."""
+    t = item.get("type")
+    if t == "command_execution":
+        return str(item.get("command") or "")
+    if t == "web_search":
+        return str(item.get("query") or "")
+    if t == "file_change":
+        changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+        return ", ".join(str(c.get("path")) for c in changes if isinstance(c, dict) and c.get("path"))
+    if t == "mcp_tool_call":
+        args = item.get("arguments")
+        keys = sorted(map(str, args)) if isinstance(args, dict) else []
+        return f"{item.get('server') or '?'}.{item.get('tool') or '?'}({', '.join(keys)})"
+    return ""
 
 
 def reap_codex(job, rec, waited):

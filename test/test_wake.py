@@ -2325,8 +2325,11 @@ class QuotaFallback(unittest.TestCase):
                               "echo '{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"command\":\"git status\"}}'\n"
                               "echo '{\"type\":\"turn.completed\"}'\n"
                               "sleep \"${FAKE_LINGER:-0}\"\n")
-        for f in (loom, self.claude, self.codex):
+        alert = t / "bin" / "alert"
+        alert.write_text(f"#!/bin/sh\nprintf '%s\\n' \"$1\" >> \"{t / 'alerts'}\"\n")
+        for f in (loom, self.claude, self.codex, alert):
             f.chmod(0o755)
+        (t / "claude-home").mkdir()
         self.resolve = t / "resolve.json"
         self.codex_home = t / "codex-home"
         self.codex_home.mkdir()
@@ -2338,7 +2341,9 @@ class QuotaFallback(unittest.TestCase):
             mock.patch.dict(wake_cli.os.environ, {
                 "FAKE_DIR": str(t), "FAKE_RESOLVE": str(self.resolve), "FAKE_RESOLVE_RC": "0", "FAKE_LINGER": "0",
                 "CODEX_HOME": str(self.codex_home), "WAKE_CODEX": str(self.codex), "WAKE_STUCK_AFTER": "",
-                "WAKE_TASK_COMMENT": "off", "WAKE_ALERT_COMMAND": "",
+                "WAKE_TASK_COMMENT": "off", "WAKE_ALERT_COMMAND": json.dumps([str(t / "bin" / "alert")]),
+                "WAKE_CODEX_FALLBACK": "ada", "CLAUDE_CONFIG_DIR": str(t / "claude-home"),
+                "WAKE_CLAUDE_MANAGED_SETTINGS": str(t / "managed-settings.json"),
                 "WAKE_SESSION_COMMAND": json.dumps(self.session_command())}),
         ]
         for p in self.patches:
@@ -2478,6 +2483,89 @@ class QuotaFallback(unittest.TestCase):
             self.assertFalse((self.t / "codex.argv").exists(), how)
         self.assertEqual(len(self.logged("resolve-fail")), 4)
 
+    def test_the_fallback_is_off_unless_the_agent_opted_in(self):
+        self.resolves("codex")
+        for opted in ("", "mark", "mark,bob"):
+            os.environ["WAKE_CODEX_FALLBACK"] = opted
+            (self.t / "claude.argv").unlink(missing_ok=True)
+            wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+            self.assertTrue((self.t / "claude.argv").exists(), opted)
+        self.assertFalse((self.t / "resolve.argv").exists())
+        self.assertFalse((self.t / "codex.argv").exists())
+        os.environ["WAKE_CODEX_FALLBACK"] = "mark, ada"
+        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.until(lambda: (self.t / "codex.env").exists(), "codex started")
+
+    def test_a_claude_hook_or_settings_deny_or_plugin_blocks_the_fallback_and_is_said_once(self):
+        hooked = {"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command",
+                                                                         "command": "/home/x/hooks/poll-guard.py"}]}]}}
+        for where, doc in ((self.t / "claude-home" / "settings.json", hooked),
+                           (self.t / "repo" / ".claude" / "settings.json", {"permissions": {"deny": ["Bash(rm:*)"]}}),
+                           (self.t / "repo" / ".claude" / "settings.local.json", {"enabledPlugins": {"superpowers@x": True}}),
+                           (self.t / "managed-settings.json", "not json")):
+            where.parent.mkdir(parents=True, exist_ok=True)
+            where.write_text(doc if isinstance(doc, str) else json.dumps(doc))
+            self.resolves("codex")
+            (self.t / "claude.argv").unlink(missing_ok=True)
+            for _ in range(3):
+                r = wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+                self.assertEqual(r.returncode, 0)
+            self.assertTrue((self.t / "claude.argv").exists(), where)
+            self.assertFalse((self.t / "codex.argv").exists(), where)
+            self.assertIn(str(where), self.logged("fallback-refused")[-1])
+            where.unlink()
+        refused = self.logged("fallback-refused")
+        self.assertIn("PreToolUse:poll-guard.py", refused[0])
+        self.assertEqual(len(refused), 12)
+        self.assertIn("Bash(rm:*)", refused[3])
+        self.assertIn("superpowers@x", refused[6])
+        alerts = self.read("alerts")
+        self.assertEqual(len(alerts), 4)   # once per reason, not once per wake (12 wakes)
+        self.assertIn("can't move to Codex", alerts[0])
+        self.assertIn("poll-guard.py", alerts[0])
+        # Hooks switched off (disableAllHooks) aren't a guard; an empty hooks table isn't either.
+        (self.t / "claude-home" / "settings.json").write_text(json.dumps({**hooked, "disableAllHooks": True}))
+        (self.t / "repo" / ".claude" / "settings.local.json").write_text(json.dumps({"hooks": {}}))
+        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.until(lambda: (self.t / "codex.env").exists(), "codex started")
+
+    def test_a_tool_steps_output_never_reaches_the_comment_or_the_log(self):
+        secret = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
+        items = [
+            {"type": "mcp_tool_call", "server": "github", "tool": "get_token",
+             "arguments": {"repo": "x/" + secret, "scope": "all"}, "result": {"token": secret}, "error": secret},
+            {"type": "file_change", "changes": [{"path": "/home/art/.env", "kind": "add", "content": secret}],
+             "output": secret},
+            {"type": "web_search", "query": "how to", "result": secret},
+            {"type": "command_execution", "command": "echo hi", "aggregated_output": secret, "output": secret},
+        ]
+        words = [wake_cli.codex_item_words(i) for i in items]
+        self.assertEqual(words, ["github.get_token(repo, scope)", "/home/art/.env", "how to", "echo hi"])
+        for w in words:
+            self.assertNotIn(secret, w)
+        # End to end: the stuck line, the comment and the alert for a session whose last step carried one.
+        comments = self.t / "comments"
+        os.environ["WAKE_TASK_COMMENT"] = json.dumps([str(self.t / "bin" / "alert").replace("alert", "comment"),
+                                                      "{task}", "{text}"])
+        (self.t / "bin" / "comment").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$2\" >> \"{comments}\"\n")
+        (self.t / "bin" / "comment").chmod(0o755)
+        os.environ["FAKE_LINGER"] = "300"
+        self.codex.write_text("#!/bin/sh\ncat > /dev/null\n"
+                              f"echo '{json.dumps({'type': 'item.completed', 'item': items[0]})}'\n"
+                              "echo '{\"type\":\"turn.completed\"}'\nsleep 300\n")
+        self.resolves("codex")
+        job, _ = self.fire()
+        run = self.t / "clock" / "codex-runs" / job
+        self.until(lambda: '"turn.completed"' in (run / "events.jsonl").read_text(), "its turn ended")
+        now = wake_cli.datetime.now().replace(microsecond=0)
+        wake_cli.reap_stuck(now)
+        wake_cli.reap_stuck(now + wake_cli.timedelta(minutes=10))
+        shown = {"log": "\n".join(self.read("clock/wake.log")), "comment": "\n".join(self.read("comments")),
+                 "alert": "\n".join(self.read("alerts")), "record": json.dumps(self.records())}
+        self.assertIn("github.get_token(repo, scope)", shown["comment"])
+        for where, text in shown.items():
+            self.assertNotIn(secret, text, where)
+
     def test_off_never_asks(self):
         os.environ["WAKE_CODEX"] = "off"
         self.resolves("codex")
@@ -2534,7 +2622,7 @@ class QuotaFallback(unittest.TestCase):
         self.assertEqual((rec["state"], rec["stopped"], rec["tool"]), ("stuck", True, "command_execution"))
         stuck = self.logged("stuck")
         self.assertEqual(len(stuck), 1)
-        self.assertRegex(stuck[0], rf"\| stuck \| w-aaa111 session={job} alerted=no stopped=yes task=t-40 comment=failed "
+        self.assertRegex(stuck[0], rf"\| stuck \| w-aaa111 session={job} alerted=yes stopped=yes task=t-40 comment=failed "
                                    r"waited=10m \| command_execution: \"git status\"")
         self.until(lambda: not wake_cli.codex_alive(job), "it stopped")
         self.until(lambda: not Path(f"/proc/{pid}").exists() or "Z" in Path(f"/proc/{pid}/stat").read_text().split()[2],

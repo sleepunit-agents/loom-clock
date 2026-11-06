@@ -76,6 +76,11 @@
         "hint": "when loom's runtime says the session's Claude account is out, a local wake runs as `codex exec` (this program, default codex on the wake's PATH), its --disallowedTools kept; off: never"
       },
       {
+        "name": "WAKE_CODEX_FALLBACK",
+        "label": "Agents whose local wakes may fall back to Codex",
+        "hint": "comma-separated agent ids; default none. Even then, no fallback while the Claude settings the session would load have hooks, deny rules or enabled plugins: Codex runs none of them"
+      },
+      {
         "name": "WAKE_STUCK_AFTER",
         "label": "Minutes a session may wait on a permission prompt",
         "hint": "a session the clock started that waits this long on a permission prompt is stopped, noted on its task and said once; default 10, 0 or off: never",
