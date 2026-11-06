@@ -171,7 +171,8 @@ Read from the environment only: `WAKE_HOUSEHOLD` (default
 `$LOOM_HOME/household.json`, loom's household file: its `agents` and `owner`), `WAKE_LOOM` (the `loom` CLI, default `loom` on `PATH`),
 `WAKE_APPROVALS` (default `loom approvals`), `WAKE_CLAUDE_MANAGED_SETTINGS` (Claude
 Code's managed settings file the fallback reads, default
-`/etc/claude-code/managed-settings.json`), and `WAKE_NO_FORWARD=1` (see
+`/etc/claude-code/managed-settings.json`), `LOOM_RUNTIME_CODEX_PROFILE` (the
+runtime's Codex profile: read only to refuse the fallback when it's set), and `WAKE_NO_FORWARD=1` (see
 "In a house").
 
 The default session command skips the agent harness's permission prompts,

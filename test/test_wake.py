@@ -2585,21 +2585,62 @@ class QuotaFallback(unittest.TestCase):
         self.assertIn("unexpected argument", r.stderr)
         self.assertIsNone(wake_cli.CODEX_JOB.search(r.stdout))
 
-    def test_a_codex_profile_anywhere_refuses_the_fallback_and_is_said(self):
-        # A denied server enabled inside a profile could come back on under it: the run is refused instead.
-        (self.codex_home / "config.toml").write_text(
-            'profile = "bodies"\n\n[profiles.bodies.mcp_servers.handoff]\ncommand = "handoff"\nenabled = true\n')
+    PROFILE = 'profile = "bodies"\n\n[profiles.bodies.mcp_servers.handoff]\ncommand = "handoff"\nenabled = true\n'
+
+    def refused_for_profile(self, env=None, why="selects a profile"):
         self.resolves("codex")
-        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        (self.t / "claude.argv").unlink(missing_ok=True)
+        wake_cli.dispatch("p", "claude-sonnet-5", env or self.env(), "local")
         self.assertFalse((self.t / "codex.argv").exists())
         self.assertTrue((self.t / "claude.argv").exists())
-        self.assertIn("selects a profile", self.logged("fallback-refused")[-1])
-        (self.codex_home / "config.toml").write_text('[profiles.bodies.mcp_servers.handoff]\ncommand = "handoff"\n')
-        wake_cli.dispatch("p", "claude-sonnet-5", {**self.env(), "LOOM_RUNTIME_CODEX_PROFILE": "bodies"}, "local")
-        self.assertFalse((self.t / "codex.argv").exists())
-        self.assertIn("LOOM_RUNTIME_CODEX_PROFILE=bodies", self.logged("fallback-refused")[-1])
+        self.assertIn(why, self.logged("fallback-refused")[-1])
+
+    def test_a_denied_server_enabled_inside_a_selected_profile_refuses_the_run(self):
+        # handoff is denied; the profile turns it back on: the run must not start under it.
+        (self.codex_home / "config.toml").write_text(self.PROFILE)
+        self.refused_for_profile()
+        self.assertIn("selects a profile (bodies)", self.read("alerts")[-1])
+        self.assertEqual(self.logged("fallback-refused")[-1].count("selects a profile"), 1)   # one file, said once
+
+    def test_a_profile_in_the_project_config_or_the_runs_own_home_refuses(self):
+        (self.t / "repo" / ".codex").mkdir()
+        (self.t / "repo" / ".codex" / "config.toml").write_text(self.PROFILE)
+        self.refused_for_profile()
+        (self.t / "repo" / ".codex" / "config.toml").unlink()
+        # The run's env has its own HOME and no CODEX_HOME: its ~/.codex is the one the child reads.
+        home = self.t / "other-home"
+        (home / ".codex").mkdir(parents=True)
+        (home / ".codex" / "config.toml").write_text(self.PROFILE)
+        env = {k: v for k, v in self.env().items() if k != "CODEX_HOME"}
+        self.refused_for_profile({**env, "HOME": str(home)})
+
+    def test_a_profile_after_a_multiline_string_that_starts_a_line_with_a_bracket_still_refuses(self):
+        (self.codex_home / "config.toml").write_text('instructions = """\n[note] keep this short\n"""\n' + self.PROFILE)
+        self.refused_for_profile()
+
+    def test_an_unreadable_or_unparsable_codex_config_refuses(self):
+        cfg = self.codex_home / "config.toml"
+        cfg.write_text("this is = = not toml")
+        self.refused_for_profile(why="can't be read")
+        cfg.write_text("model = \"x\"\n")
+        cfg.chmod(0)
+        try:
+            if os.access(cfg, os.R_OK):
+                self.skipTest("running as a user who reads mode-0 files")
+            self.refused_for_profile(why="can't be read")
+        finally:
+            cfg.chmod(0o600)
+
+    def test_the_runtimes_profile_setting_refuses_from_the_wakes_env_or_the_clocks(self):
+        self.refused_for_profile({**self.env(), "LOOM_RUNTIME_CODEX_PROFILE": "bodies"}, "LOOM_RUNTIME_CODEX_PROFILE=bodies")
         self.assertIn("LOOM_RUNTIME_CODEX_PROFILE=bodies", self.read("alerts")[-1])
-        # A profile table nobody selects is not applied: the run goes ahead, with no -p.
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_RUNTIME_CODEX_PROFILE": "other"}):
+            self.refused_for_profile({k: v for k, v in self.env().items() if k != "LOOM_RUNTIME_CODEX_PROFILE"},
+                                     "LOOM_RUNTIME_CODEX_PROFILE=other")
+
+    def test_a_profile_table_nobody_selects_doesnt_refuse_and_no_p_is_passed(self):
+        (self.codex_home / "config.toml").write_text('[profiles.bodies.mcp_servers.handoff]\ncommand = "handoff"\n')
+        self.resolves("codex")
         wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
         self.until(lambda: (self.t / "codex.env").exists(), "codex started")
         self.assertNotIn("-p", self.read("codex.argv"))
