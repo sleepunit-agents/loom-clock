@@ -71,6 +71,11 @@
         "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\"]"
       },
       {
+        "name": "WAKE_CODEX",
+        "label": "The Codex a local wake falls back to",
+        "hint": "when loom's runtime says the session's Claude account is out, a local wake runs as `codex exec` (this program, default codex on the wake's PATH), its --disallowedTools kept; off: never"
+      },
+      {
         "name": "WAKE_STUCK_AFTER",
         "label": "Minutes a session may wait on a permission prompt",
         "hint": "a session the clock started that waits this long on a permission prompt is stopped, noted on its task and said once; default 10, 0 or off: never",
