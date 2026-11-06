@@ -60,7 +60,7 @@ inline prompt.
   `WAKE_STUCK_AFTER` minutes (default 10), counted from when the clock first
   saw it waiting, is stopped (`claude stop`: its conversation is kept), noted
   on the task its wake's note names (`WAKE_TASK_COMMENT`, with the tool and
-  the first 200 characters of what it was waiting on, quoted as data), logged
+  the first 120 characters of what it was waiting on, quoted as data), logged
   as `stuck` (not a failure) and said once (`WAKE_ALERT_COMMAND`). Only the
   sessions in that record are ever looked at: never an interactive session,
   never one anything else started. `wake reap` does one look now.

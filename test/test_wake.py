@@ -763,23 +763,39 @@ class Delivery(unittest.TestCase):
         finally:
             srv.shutdown()
 
-    def test_the_manifest_fits_looms_limits(self):
-        # loom refuses a piece whose manifest doesn't (src/cli/pieces-managed.ts): `loom pieces update clock` failed
-        # on "setting WAKE_CODEX: hint is not a string" (a 239-character hint) at bcf3a7c.
-        loom = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom"]
-        self.assertLessEqual(len(loom["settings"]), 20)
-        self.assertLessEqual(len(loom.get("description", "")), 300)
-        for s in loom["settings"]:
-            self.assertTrue(isinstance(s["label"], str) and 0 < len(s["label"]) <= 100, s["name"])
-            self.assertTrue(isinstance(s.get("hint", ""), str) and len(s.get("hint", "")) <= 200, s["name"])
-            self.assertLessEqual(len(s.get("default", "")), 500, s["name"])
-
     def test_the_piece_says_it_delivers_on_cores_wake(self):
         loom = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom"]
         self.assertEqual(loom["venues"], {"wake": {}})
         names = {x["name"] for x in loom["settings"]}
         self.assertTrue({"WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL"} <= names)
         self.assertTrue({"WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL"} <= set(wake_cli.TIMER_ENV))
+
+
+MANIFEST = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom"]
+
+
+class Manifest(unittest.TestCase):
+    def test_the_manifest_fits_looms_limits(self):
+        # loom's checks (src/cli/pieces-managed.ts): `settings.length > 20`, `str(b.description, 300)`,
+        # `str(s.label, 100)`, `str(s.hint, 200)` ("setting X: hint is not a string" when it's longer), and
+        # `s.default.length > 500`. bcf3a7c broke the hint one, and `loom pieces update clock` refused the piece.
+        self.assertLessEqual(len(MANIFEST["settings"]), 20)
+        self.assertLessEqual(len(str(MANIFEST.get("description", ""))), 300)
+        for s in MANIFEST["settings"]:
+            name = s.get("name")
+            self.assertTrue(isinstance(s.get("label"), str) and 0 < len(s["label"]) <= 100, name)
+            self.assertTrue(isinstance(s.get("hint", ""), str) and len(s.get("hint", "")) <= 200, name)
+            self.assertTrue(isinstance(s.get("default", ""), str) and len(s.get("default", "")) <= 500, name)
+
+    def test_the_clock_runs_no_harness_of_its_own_choosing(self):
+        # Every execution goes through loom's runtime (Jonathan, 2026-11-06): no Codex fallback here (#8-#10 reverted).
+        self.assertFalse("codex" in SCRIPT.read_text().lower(), "bin/wake names codex")
+        names = {s.get("name") for s in MANIFEST["settings"]}
+        for gone in ("WAKE_CODEX", "WAKE_CODEX_FALLBACK", "WAKE_CLAUDE_MANAGED_SETTINGS", "WAKE_CODEX_SYSTEM_DIR"):
+            self.assertNotIn(gone, names)
+            self.assertNotIn(gone, wake_cli.TIMER_ENV)
+        self.assertFalse(hasattr(wake_cli, "resolve_harness"))
+        self.assertFalse("models resolve" in SCRIPT.read_text(), "bin/wake asks the resolver")
 
 
 class Clocks(unittest.TestCase):
