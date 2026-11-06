@@ -2366,10 +2366,12 @@ class QuotaFallback(unittest.TestCase):
         return [str(self.t / "bin" / "claude"), "--bg", "{prompt}", "--model", "{model}",
                 *(["--dangerously-skip-permissions"] if bypass else []), *(["--disallowedTools", *deny] if deny else [])]
 
-    def resolves(self, harness, model=None, rc=0):
+    def resolves(self, harness, model=None, rc=0, fallback=True):
         model = model or ("gpt-6.1-sol" if harness == "codex" else "claude-opus-5-5")
         self.resolve.write_text(json.dumps({"model": model, "harness": harness, "family": "x", "kind": "scheduled",
-                                            "why": ["a fallback: claude-opus-5-5 (claude) is preferred, and Claude Max out of quota"]}))
+                                            "why": ["a fallback: claude-opus-5-5 (claude) is preferred, and Claude Max out of quota"],
+                                            **({"fallback": {"from": "claude", "account": "Claude Max"}}
+                                               if harness == "codex" and fallback else {})}))
         os.environ["FAKE_RESOLVE_RC"] = str(rc)
 
     def env(self):
@@ -2515,10 +2517,10 @@ class QuotaFallback(unittest.TestCase):
             self.assertIn(str(where), self.logged("fallback-refused")[-1])
             where.unlink()
         refused = self.logged("fallback-refused")
-        self.assertIn("PreToolUse:poll-guard.py", refused[0])
+        self.assertIn("hooks (PreToolUse:poll-guard.py)", refused[0])
         self.assertEqual(len(refused), 12)
-        self.assertIn("Bash(rm:*)", refused[3])
-        self.assertIn("superpowers@x", refused[6])
+        self.assertIn("permissions.deny (Bash(rm:*))", refused[3])
+        self.assertIn("enabledPlugins (superpowers@x)", refused[6])
         alerts = self.read("alerts")
         self.assertEqual(len(alerts), 4)   # once per reason, not once per wake (12 wakes)
         self.assertIn("can't move to Codex", alerts[0])
@@ -2528,6 +2530,118 @@ class QuotaFallback(unittest.TestCase):
         (self.t / "repo" / ".claude" / "settings.local.json").write_text(json.dumps({"hooks": {}}))
         wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
         self.until(lambda: (self.t / "codex.env").exists(), "codex started")
+
+    def test_only_settings_known_to_be_harmless_let_the_fallback_through(self):
+        f = self.t / "repo" / ".claude" / "settings.json"
+        f.parent.mkdir(parents=True)
+        refusing = [({"permissions": {"ask": ["Bash(git push:*)"]}}, "permissions.ask"),
+                    ({"sandbox": {"enabled": True}}, "sandbox"),
+                    ({"disableBypassPermissionsMode": "disable"}, "disableBypassPermissionsMode"),
+                    ({"someFutureGuard": 1}, "someFutureGuard"),
+                    ({"permissions": {"defaultMode": "acceptEdits"}}, "permissions.defaultMode"),
+                    ({"permissions": {"allow": "Bash"}}, "permissions.allow"),
+                    ({"permissions": "all"}, "permissions"),
+                    ({"hooks": ["x"]}, "hooks (a shape it can't read)"),
+                    ({"enabledPlugins": ["x"]}, "enabledPlugins")]
+        for doc, key in refusing:
+            f.write_text(json.dumps(doc))
+            self.resolves("codex")
+            (self.t / "claude.argv").unlink(missing_ok=True)
+            wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+            self.assertTrue((self.t / "claude.argv").exists(), doc)
+            self.assertFalse((self.t / "codex.argv").exists(), doc)
+            self.assertIn(f"{f}: {key}", self.logged("fallback-refused")[-1], doc)
+        # What Art's own files hold besides hooks and plugins: harmless, so they alone don't refuse.
+        f.write_text(json.dumps({"theme": "dark", "model": "opus", "effortLevel": "high", "worktree": {},
+                                 "permissions": {"allow": ["Bash(ls:*)"], "defaultMode": "bypassPermissions"},
+                                 "enabledPlugins": {"x@y": False}, "hooks": {}, "statusLine": {"type": "command"}}))
+        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.until(lambda: (self.t / "codex.env").exists(), "codex started")
+
+    def test_a_codex_pick_that_isnt_a_fallback_from_claude_is_left_alone(self):
+        self.resolves("codex", fallback=False)   # the agent's own settings prefer Codex; Claude has room
+        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.assertTrue((self.t / "claude.argv").exists())
+        self.assertFalse((self.t / "codex.argv").exists())
+        self.assertIn("not as a fallback from claude", self.logged("fallback-refused")[-1])
+
+    def test_a_named_permission_mode_other_than_bypass_refuses_whatever_else_is_there(self):
+        for extra in (["--permission-mode", "plan"], ["--permission-mode=acceptEdits"], ["--permission-mode", "default"]):
+            os.environ["WAKE_SESSION_COMMAND"] = json.dumps([*self.session_command(), *extra])
+            self.resolves("codex")
+            wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+            self.assertFalse((self.t / "codex.argv").exists(), extra)
+            self.assertIn("--permission-mode", self.logged("fallback-refused")[-1])
+        os.environ["WAKE_SESSION_COMMAND"] = json.dumps([*self.session_command(bypass=False), "--permission-mode",
+                                                         "bypassPermissions", "--disallowedTools", "mcp__handoff"])
+        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.until(lambda: (self.t / "codex.env").exists(), "codex started")
+
+    def test_a_codex_that_exits_at_once_is_a_failed_dispatch(self):
+        self.codex.write_text("#!/bin/sh\ncat > /dev/null\necho 'error: unexpected argument' >&2\nexit 2\n")
+        self.resolves("codex")
+        r = wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unexpected argument", r.stderr)
+        self.assertIsNone(wake_cli.CODEX_JOB.search(r.stdout))
+
+    def test_the_runtimes_codex_profile_is_used(self):
+        self.resolves("codex")
+        wake_cli.dispatch("p", "claude-sonnet-5", {**self.env(), "LOOM_RUNTIME_CODEX_PROFILE": "bodies"}, "local")
+        self.until(lambda: (self.t / "codex.env").exists(), "codex started")
+        argv = self.read("codex.argv")
+        self.assertEqual(argv[argv.index("-p") + 1], "bodies")
+
+    def test_each_refusal_reason_is_said_once_even_when_they_alternate(self):
+        f = self.t / "repo" / ".claude" / "settings.json"
+        f.parent.mkdir(parents=True)
+        for _ in range(3):
+            for doc in ({"sandbox": {}}, {"someFutureGuard": 1}):
+                f.write_text(json.dumps(doc))
+                self.resolves("codex")
+                wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.assertEqual(len(self.read("alerts")), 2)
+
+    def test_a_codex_run_wedged_in_its_turn_is_stopped_after_six_hours_and_a_live_one_keeps_its_record(self):
+        self.codex.write_text("#!/bin/sh\ncat > /dev/null\necho '{\"type\":\"thread.started\",\"thread_id\":\"t\"}'\n"
+                              "sleep 300\n")
+        self.resolves("codex")
+        job, _ = self.fire()
+        self.until(lambda: wake_cli.codex_alive(job), "it started")
+        now = wake_cli.datetime.now().replace(microsecond=0)
+        with mock.patch.object(wake_cli, "CODEX_MAX_RUN", wake_cli.timedelta(days=30)):
+            wake_cli.reap_stuck(now + wake_cli.timedelta(days=8))   # past SESSIONS_KEEP, still alive: kept
+        self.assertEqual(self.records()[job]["state"], "running")
+        wake_cli.reap_stuck(now + wake_cli.timedelta(hours=5, minutes=59))
+        self.assertEqual(self.records()[job]["state"], "running")
+        wake_cli.reap_stuck(now + wake_cli.timedelta(hours=6))
+        self.assertEqual(self.records()[job]["state"], "stuck")
+        self.assertIn("ran 360 minutes without ending its turn", self.read("alerts")[-1])
+        self.until(lambda: not wake_cli.codex_alive(job), "it stopped")
+
+    def test_a_codex_command_is_redacted_and_capped_where_its_shown(self):
+        bearer = "abcDEF1234567890xyzSECRETbearer"
+        command = f"curl -H 'Authorization: Bearer {bearer}' https://example.com/" + "x " * 150
+        comments = self.t / "comments"
+        (self.t / "bin" / "comment").write_text(f"#!/bin/sh\nprintf '%s\\n' \"$2\" >> \"{comments}\"\n")
+        (self.t / "bin" / "comment").chmod(0o755)
+        os.environ["WAKE_TASK_COMMENT"] = json.dumps([str(self.t / "bin" / "comment"), "{task}", "{text}"])
+        item = {"type": "item.completed", "item": {"type": "command_execution", "command": command}}
+        events = self.t / "events.json"
+        events.write_text(json.dumps(item) + "\n" + '{"type":"turn.completed"}\n')
+        self.codex.write_text(f"#!/bin/sh\ncat > /dev/null\ncat '{events}'\nsleep 300\n")
+        self.resolves("codex")
+        job, _ = self.fire()
+        run = self.t / "clock" / "codex-runs" / job
+        self.until(lambda: '"turn.completed"' in (run / "events.jsonl").read_text(), "its turn ended")
+        now = wake_cli.datetime.now().replace(microsecond=0)
+        wake_cli.reap_stuck(now)
+        wake_cli.reap_stuck(now + wake_cli.timedelta(minutes=10))
+        for where, text in (("log", "\n".join(self.read("clock/wake.log"))), ("comment", "\n".join(self.read("comments"))),
+                            ("alert", "\n".join(self.read("alerts"))), ("record", json.dumps(self.records()))):
+            self.assertNotIn(bearer, text, where)
+            self.assertNotIn("x " * 60, text, where)
+        self.assertIn("[redacted]", "\n".join(self.read("comments")))
 
     def test_a_tool_steps_output_never_reaches_the_comment_or_the_log(self):
         secret = "ghp_" + "Z9y8X7w6V5u4T3s2R1q0P9o8N7m6L5k4J3i2"
@@ -2602,6 +2716,8 @@ class QuotaFallback(unittest.TestCase):
 
     def test_the_reaper_finds_and_stops_a_codex_session_the_clock_started(self):
         os.environ["FAKE_LINGER"] = "300"
+        self.codex.write_text(self.codex.read_text().replace('sleep "${FAKE_LINGER:-0}"\n',
+                                                             'sleep 300 & echo $! > "$FAKE_DIR/child.pid"; wait\n'))
         self.resolves("codex")
         job, rec = self.fire()
         self.assertEqual((rec["wake"], rec["harness"], rec["state"]), ("w-aaa111", "codex", "running"))
@@ -2625,6 +2741,9 @@ class QuotaFallback(unittest.TestCase):
         self.assertRegex(stuck[0], rf"\| stuck \| w-aaa111 session={job} alerted=yes stopped=yes task=t-40 comment=failed "
                                    r"waited=10m \| command_execution: \"git status\"")
         self.until(lambda: not wake_cli.codex_alive(job), "it stopped")
+        child = int((self.t / "child.pid").read_text())   # its process group went, not only its own pid
+        self.until(lambda: not Path(f"/proc/{child}").exists() or "Z" in Path(f"/proc/{child}/stat").read_text().split()[2],
+                   "its child is gone")
         self.until(lambda: not Path(f"/proc/{pid}").exists() or "Z" in Path(f"/proc/{pid}/stat").read_text().split()[2],
                    "its process is gone")
 
