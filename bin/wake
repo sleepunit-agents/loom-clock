@@ -1485,6 +1485,36 @@ def codex_url_servers(cwd, env):
     return urls
 
 
+def codex_profiles(cwd, env):
+    """Where a Codex profile would apply to the run: the runtime's LOOM_RUNTIME_CODEX_PROFILE, or a top-level
+    `profile = …` in a config Codex reads (its home's, the env's CODEX_HOME, the project's). A profile's own
+    mcp_servers can take precedence over `-c mcp_servers.<s>.enabled=false`, so any of them refuses the fallback
+    (security review, t-1912). Nobody sets one on loom's machine today. → [reason]."""
+    out = []
+    for src in (env, os.environ):
+        if src.get("LOOM_RUNTIME_CODEX_PROFILE"):
+            out.append(f"LOOM_RUNTIME_CODEX_PROFILE={src['LOOM_RUNTIME_CODEX_PROFILE'][:40]}")
+            break
+    homes = [Path(os.environ.get("CODEX_HOME") or HOME / ".codex")]
+    if env.get("CODEX_HOME"):
+        homes.append(Path(env["CODEX_HOME"]))
+    for f in [h / "config.toml" for h in homes] + [Path(cwd) / ".codex" / "config.toml"]:
+        try:
+            text = f.read_text()
+        except FileNotFoundError:
+            continue
+        except OSError as e:
+            out.append(f"{f} can't be read ({str(e)[:60]})")
+            continue
+        for line in text.splitlines():
+            if re.match(r"^\s*\[", line):
+                break   # past the top-level keys
+            if re.match(r"""^\s*(profile|"profile"|'profile')\s*=""", line):
+                out.append(f"{f} selects a profile ({line.strip()[:60]})")
+                break
+    return out
+
+
 def resolve_harness(model, agent, env):
     """The runtime's pick for this agent's wake: {model, harness, why}, or None (logged) when it can't be asked."""
     cmd = [LOOM, "runtime", "models", "resolve", "--agent", agent, "--venue", "wake", "--venue-kind", "scheduled",
@@ -1528,6 +1558,10 @@ def codex_fallback(argv, model, env, agent, cwd):
     guards = [] if err else claude_guards(cwd)
     if guards:
         err = f"its Claude settings guard it in ways a Codex run can't keep: {'; '.join(guards)}"
+    profiles = [] if err else codex_profiles(cwd, env)
+    if profiles:
+        err = (f"a Codex profile would apply ({'; '.join(profiles)}), and a profile's own MCP servers can turn a "
+               f"denied one back on")
     if err:
         log("fallback-refused", f"the runtime picked codex {pick['model']} ({why}), but {err}; "
                                 f"the session command runs as before")
@@ -1552,12 +1586,10 @@ def start_codex(prompt, codex, env, cwd):
     # The env keys a Claude Code launcher leaves behind: a Codex body must not look like a Claude session to its tools.
     e = {k: v for k, v in env.items() if not k.startswith("CLAUDE_CODE_") and k not in ("CLAUDECODE", "CLAUDE_JOB_DIR")}
     e["SHUTTLE_BODY"] = key
-    # The runtime's profile, when it runs its Codex bodies under one (LOOM_RUNTIME_CODEX_PROFILE), so a wake's Codex
-    # reads the same config (and MCP servers) as every house body.
-    profile = env.get("LOOM_RUNTIME_CODEX_PROFILE") or ""
+    # No profile (-p): a profile's own mcp_servers can turn a denied server back on over the top-level -c denials,
+    # so a profile anywhere refuses the fallback before this (codex_profiles).
     argv = [codex["program"], "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-hook-trust",
-            "--dangerously-bypass-approvals-and-sandbox", *(["-p", profile] if profile else []),
-            "-m", codex["model"], *codex["args"], "-C", str(cwd), "-o", str(d / "last.txt"), "-"]
+            "--dangerously-bypass-approvals-and-sandbox", "-m", codex["model"], *codex["args"], "-C", str(cwd), "-o", str(d / "last.txt"), "-"]
 
     def private(name):
         return os.fdopen(os.open(d / name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab")

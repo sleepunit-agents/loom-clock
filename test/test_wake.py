@@ -2585,12 +2585,24 @@ class QuotaFallback(unittest.TestCase):
         self.assertIn("unexpected argument", r.stderr)
         self.assertIsNone(wake_cli.CODEX_JOB.search(r.stdout))
 
-    def test_the_runtimes_codex_profile_is_used(self):
+    def test_a_codex_profile_anywhere_refuses_the_fallback_and_is_said(self):
+        # A denied server enabled inside a profile could come back on under it: the run is refused instead.
+        (self.codex_home / "config.toml").write_text(
+            'profile = "bodies"\n\n[profiles.bodies.mcp_servers.handoff]\ncommand = "handoff"\nenabled = true\n')
         self.resolves("codex")
+        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
+        self.assertFalse((self.t / "codex.argv").exists())
+        self.assertTrue((self.t / "claude.argv").exists())
+        self.assertIn("selects a profile", self.logged("fallback-refused")[-1])
+        (self.codex_home / "config.toml").write_text('[profiles.bodies.mcp_servers.handoff]\ncommand = "handoff"\n')
         wake_cli.dispatch("p", "claude-sonnet-5", {**self.env(), "LOOM_RUNTIME_CODEX_PROFILE": "bodies"}, "local")
+        self.assertFalse((self.t / "codex.argv").exists())
+        self.assertIn("LOOM_RUNTIME_CODEX_PROFILE=bodies", self.logged("fallback-refused")[-1])
+        self.assertIn("LOOM_RUNTIME_CODEX_PROFILE=bodies", self.read("alerts")[-1])
+        # A profile table nobody selects is not applied: the run goes ahead, with no -p.
+        wake_cli.dispatch("p", "claude-sonnet-5", self.env(), "local")
         self.until(lambda: (self.t / "codex.env").exists(), "codex started")
-        argv = self.read("codex.argv")
-        self.assertEqual(argv[argv.index("-p") + 1], "bodies")
+        self.assertNotIn("-p", self.read("codex.argv"))
 
     def test_each_refusal_reason_is_said_once_even_when_they_alternate(self):
         f = self.t / "repo" / ".claude" / "settings.json"
