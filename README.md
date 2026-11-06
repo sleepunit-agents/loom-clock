@@ -80,8 +80,10 @@ inline prompt.
   session's limits: a deny it can't carry, a session that can stop and ask or
   narrows its tools, or any Claude settings key not known to be harmless in the
   files the session would load (hooks, deny or ask rules, the sandbox, plugins
-  that are on, anything unknown). A resolver that can't be asked leaves the
-  session command as it was.
+  that are on, anything unknown), or a Codex profile that would apply
+  (`LOOM_RUNTIME_CODEX_PROFILE`, or a top-level `profile =` in a config Codex
+  reads: a profile's own MCP servers can turn a denied one back on). A resolver
+  that can't be asked leaves the session command as it was.
 - **Another piece's variables aren't the clock's.** The tasks piece and loom's
   runtime run `loom-clock in 1m …` with their own `LOOM_PIECE_NAME` and
   `LOOM_PIECE_HOME`; the clock ignores a `LOOM_PIECE_HOME` whose
@@ -169,7 +171,8 @@ Read from the environment only: `WAKE_HOUSEHOLD` (default
 `$LOOM_HOME/household.json`, loom's household file: its `agents` and `owner`), `WAKE_LOOM` (the `loom` CLI, default `loom` on `PATH`),
 `WAKE_APPROVALS` (default `loom approvals`), `WAKE_CLAUDE_MANAGED_SETTINGS` (Claude
 Code's managed settings file the fallback reads, default
-`/etc/claude-code/managed-settings.json`), and `WAKE_NO_FORWARD=1` (see
+`/etc/claude-code/managed-settings.json`), `LOOM_RUNTIME_CODEX_PROFILE` (the
+runtime's Codex profile: read only to refuse the fallback when it's set), and `WAKE_NO_FORWARD=1` (see
 "In a house").
 
 The default session command skips the agent harness's permission prompts,
