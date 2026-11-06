@@ -71,16 +71,6 @@
         "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\"]"
       },
       {
-        "name": "WAKE_CODEX",
-        "label": "The Codex a local wake falls back to",
-        "hint": "the Codex program a fallback runs (default codex on the wake's PATH); off: never. Only for agents WAKE_CODEX_FALLBACK names"
-      },
-      {
-        "name": "WAKE_CODEX_FALLBACK",
-        "label": "Agents whose local wakes may fall back to Codex",
-        "hint": "comma-separated agent ids; default none. Even then, no fallback while the Claude settings the session would load have hooks, deny rules or enabled plugins: Codex runs none of them"
-      },
-      {
         "name": "WAKE_STUCK_AFTER",
         "label": "Minutes a session may wait on a permission prompt",
         "hint": "a session the clock started that waits this long on a permission prompt is stopped, noted on its task and said once; default 10, 0 or off: never",
