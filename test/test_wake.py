@@ -764,6 +764,17 @@ class Delivery(unittest.TestCase):
         finally:
             srv.shutdown()
 
+    def test_the_manifest_fits_looms_limits(self):
+        # loom refuses a piece whose manifest doesn't (src/cli/pieces-managed.ts): `loom pieces update clock` failed
+        # on "setting WAKE_CODEX: hint is not a string" (239 characters) after #8.
+        loom = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom"]
+        self.assertLessEqual(len(loom["settings"]), 20)
+        self.assertLessEqual(len(loom.get("description", "")), 300)
+        for s in loom["settings"]:
+            self.assertTrue(isinstance(s["label"], str) and 0 < len(s["label"]) <= 100, s["name"])
+            self.assertTrue(isinstance(s.get("hint", ""), str) and len(s.get("hint", "")) <= 200, s["name"])
+            self.assertLessEqual(len(s.get("default", "")), 500, s["name"])
+
     def test_the_piece_says_it_delivers_on_cores_wake(self):
         loom = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom"]
         self.assertEqual(loom["venues"], {"wake": {}})
