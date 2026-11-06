@@ -57,12 +57,23 @@ taken out: the field says it, never the words), and the runtime runs its body
 on loom's machine, if it runs local bodies for this agent; if it refuses (400
 or 403), it's a session here as before.
 
+Quota fallback (t-1912): before a session here, the clock asks loom's runtime
+which harness this agent's wake runs on (`loom runtime models resolve --venue
+wake`). Claude: the session command, as before. Codex as a fallback from Claude:
+`codex exec` started as the runtime starts a Codex body (WAKE_CODEX), the session
+command's --disallowedTools kept by turning each denied MCP server off. Only for
+the agents WAKE_CODEX_FALLBACK names (default none), and never while Codex can't
+keep the session's limits: a deny it can't carry, or any hook, deny rule or
+enabled plugin in the Claude settings the session would load (logged
+`fallback-refused`, said once). A resolver that can't be asked leaves the
+session command as it was.
+
 Timers: transient `systemd-run --user` units named wake-<id> (KillMode=process
 so a background session the wake started survives the service's cgroup cleanup).
 
 Settings (environment; a managed piece gets them from loom, see README.md):
   WAKE_DATA, WAKE_LOCAL_AGENT, WAKE_REPO, WAKE_LANE_DIRS, WAKE_AGENTS, WAKE_FIRE,
-  WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_STUCK_AFTER, WAKE_TASK_COMMENT, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
+  WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_CODEX, WAKE_CODEX_FALLBACK, WAKE_STUCK_AFTER, WAKE_TASK_COMMENT, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
   WAKE_PREAMBLE_FILE, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS,
   WAKE_DELIVERY, WAKE_DELIVER_TOKEN_FILE, WAKE_LOOM_URL
 """
@@ -76,6 +87,7 @@ import re
 import secrets
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -212,7 +224,7 @@ TIME_FMT = "%Y-%m-%d %H:%M:%S"
 # transient unit starts from the user manager's environment, not ours.
 TIMER_ENV = ("PATH", "HOME", "LOOM_HOME", "LOOM_PIECE_NAME", "LOOM_PIECE_HOME", "LOOM_URL", "LOOM_TOKEN_FILE",
              "WAKE_DATA", "WAKE_LOCAL_AGENT", "WAKE_REPO", "WAKE_LANE_DIRS", "WAKE_AGENTS", "WAKE_FIRE", "WAKE_MODEL",
-             "WAKE_SESSION_COMMAND", "WAKE_STUCK_AFTER", "WAKE_TASK_COMMENT", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
+             "WAKE_SESSION_COMMAND", "WAKE_CODEX", "WAKE_CODEX_FALLBACK", "WAKE_CLAUDE_MANAGED_SETTINGS", "WAKE_STUCK_AFTER", "WAKE_TASK_COMMENT", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
              "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS",
              "WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL")
 
@@ -1249,10 +1261,330 @@ def dispatch(prompt, model, env, mode, agent=None, slot=None):
             task = json.dumps({"prompt": prompt, "model": model})
             return subprocess.run([LOOM, "box", "up", "--agent", agent, *(["--slot", slot] if slot else []), "--task", "-"],
                                   input=task, capture_output=True, text=True, cwd=cwd, env=env)
-        return subprocess.run(session_argv(prompt, model), capture_output=True, text=True, cwd=cwd, env=env)
+        argv = session_argv(prompt, model)
+        codex = codex_fallback(argv, model, env, agent, cwd)
+        if codex:
+            return start_codex(prompt, codex, env, cwd)
+        return subprocess.run(argv, capture_output=True, text=True, cwd=cwd, env=env)
     except OSError as e:
         # A command that isn't there is a failed dispatch like any other: retried, then said.
         return subprocess.CompletedProcess(args=[], returncode=127, stdout="", stderr=str(e))
+
+
+# ─── Quota fallback (t-1912) ────────────────────────────────────────────────
+# A local wake bypasses the runtime, so when the session command's harness is out of quota (Claude Max at 99%)
+# it failed while a house wake moved to Codex (loom-box 411f703, t-1907). Now, before starting a local session,
+# the clock asks the runtime's resolver which model and harness this agent's wake runs on (`loom runtime models
+# resolve --venue wake --prefer <the wake's model>`). Claude: the session command, exactly as before. Codex: a
+# Codex body started as the runtime starts one (runners.mjs, CodexRunner.launch). Anything else keeps today's
+# session: the resolver unreachable or failing (logged `resolve-fail`), WAKE_CODEX=off, or a session command whose
+# limits Codex can't keep (logged `fallback-refused`; the session runs, and fails, as it would have).
+#
+# The limits are the session command's own: its `--disallowedTools` list is the wake's deny list, kept as the
+# runtime keeps a body's (codex_deny: each denied MCP server off, unconditionally; anything else is refused). A
+# command that doesn't skip permissions (a session that can stop and ask), or narrows its tools some other way
+# (an allow list, its own MCP config or settings), has limits a Codex run with approvals bypassed can't keep.
+
+CODEX_JOB = re.compile(r"^codex · ([0-9a-f]{8})\b", re.M)
+RESOLVE_TIMEOUT = 60   # seconds the resolver may take
+CODEX_SETTLE = 3       # seconds a started Codex is watched for an exit at once
+# Claude Code flags that narrow a session in ways a Codex body can't carry: no fallback for a command with one.
+CLAUDE_NARROWING = ("--allowedTools", "--allowed-tools", "--tools", "--mcp-config", "--strict-mcp-config",
+                    "--settings", "--permission-prompt-tool", "--agents", "--agent")
+CLAUDE_DENY = ("--disallowedTools", "--disallowed-tools")
+SERVER_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def codex_program():
+    """WAKE_CODEX: the Codex a local wake falls back to (default `codex` on the wake's PATH); off: no fallback."""
+    v = setting("WAKE_CODEX", "codex").strip()
+    return None if v.lower() in ("off", "no", "none", "0") else v
+
+
+def fallback_agents():
+    """WAKE_CODEX_FALLBACK: the agents whose local wakes may fall back to Codex (comma-separated). Off by default:
+    an agent opts in, knowing its Claude hooks and settings don't come along (claude_guards refuses while any do)."""
+    return {a.strip() for a in setting("WAKE_CODEX_FALLBACK").split(",") if AGENT_NAME.match(a.strip())}
+
+
+def claude_settings_files(cwd):
+    """The Claude Code settings a session started in cwd loads: managed, the user's, the project's and its local."""
+    user = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+    return [Path(os.environ.get("WAKE_CLAUDE_MANAGED_SETTINGS") or "/etc/claude-code/managed-settings.json"),
+            user / "settings.json", user / "settings.local.json",
+            Path(cwd) / ".claude" / "settings.json", Path(cwd) / ".claude" / "settings.local.json"]
+
+
+# The Claude settings keys a Codex run can safely do without: cosmetic, notification, model and effort choices
+# (Codex takes the runtime's model, not these), and keys that only widen what Claude may do. An allow-list, so a
+# guard this list never heard of (permissions.ask, sandbox, disableBypassPermissionsMode, a future key) refuses
+# the fallback by default (security review, t-1912).
+HARMLESS_SETTINGS = {"$schema", "theme", "tui", "statusLine", "outputStyle", "spinnerTipsEnabled",
+                     "agentPushNotifEnabled", "voiceEnabled", "remoteControlAtStartup", "includeCoAuthoredBy",
+                     "cleanupPeriodDays", "model", "effortLevel", "alwaysThinkingEnabled",
+                     "skipDangerousModePermissionPrompt", "syncClaudeAiPlugins", "syncClaudeAiSkills", "worktree"}
+# Under permissions: only grants (allow, additionalDirectories) and a default mode that already bypasses.
+HARMLESS_PERMISSIONS = {"allow", "additionalDirectories"}
+
+
+def claude_guards(cwd):
+    """What a Claude session here would be guarded by that a Codex run never sees: every settings key outside
+    HARMLESS_SETTINGS (hooks unless switched off or empty, deny and ask rules, the sandbox, plugins that are on,
+    anything unknown), and any value whose shape this can't read. A file that's there but can't be read counts
+    too: fail closed. → [reason], naming the file and the key."""
+    out = []
+    for f in claude_settings_files(cwd):
+        if not f.exists():
+            continue
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError) as e:
+            out.append(f"{f} can't be read ({str(e)[:60]})")
+            continue
+        if not isinstance(d, dict):
+            out.append(f"{f} isn't a settings object")
+            continue
+        keys = []
+        for k, v in d.items():
+            if k in HARMLESS_SETTINGS:
+                continue
+            if k == "disableAllHooks" and v is True:
+                continue
+            if k == "hooks":
+                if v == {} or d.get("disableAllHooks") is True:
+                    continue
+                cmds = []
+                for event, groups in (v.items() if isinstance(v, dict) else []):
+                    for g in groups if isinstance(groups, list) else [groups]:
+                        for h in (g.get("hooks") if isinstance(g, dict) else None) or [g]:
+                            c = h.get("command") if isinstance(h, dict) else None
+                            cmds.append(f"{event}:{Path(c.split()[0]).name if isinstance(c, str) and c.split() else '?'}")
+                keys.append(f"hooks ({', '.join(dict.fromkeys(cmds))})" if cmds else "hooks (a shape it can't read)")
+                continue
+            if k == "enabledPlugins" and isinstance(v, dict) and not any(v.values()):
+                continue
+            if k == "enabledPlugins" and isinstance(v, dict):
+                keys.append(f"enabledPlugins ({', '.join(p for p, on in v.items() if on)[:120]})")
+                continue
+            if k == "permissions" and isinstance(v, dict):
+                bad = [pk for pk, pv in v.items() if pk not in HARMLESS_PERMISSIONS
+                       and not (pk == "defaultMode" and pv == "bypassPermissions")]
+                bad += [pk for pk in HARMLESS_PERMISSIONS if pk in v and not (isinstance(v[pk], list)
+                        and all(isinstance(x, str) for x in v[pk]))]
+                if bad:
+                    keys.append(", ".join(f"permissions.{pk}" + (f" ({', '.join(map(str, v[pk]))[:80]})"
+                                                                 if isinstance(v[pk], list) else "") for pk in bad))
+                continue
+            keys.append(k)
+        if keys:
+            out.append(f"{f}: {'; '.join(keys)}")
+    return out
+
+def refused_once(text):
+    """A refused fallback is said to the owner once per reason (WAKE_ALERT_COMMAND), not once per wake."""
+    mark = WAKE_DIR / "fallback-refused.said"
+    digest = hashlib.sha256(text.encode()).hexdigest()[:16]
+    try:
+        said = mark.read_text().split()
+    except OSError:
+        said = []
+    if digest in said:
+        return
+    alert(f"wake: a local wake can't move to Codex while Claude is out, so it runs (and fails) on Claude: {text}")
+    try:
+        mark.write_text("\n".join([*said[-63:], digest]) + "\n")
+    except OSError:
+        pass
+
+
+def claude_limits(argv):
+    """The Claude session command's limits as (deny list, why a Codex body can't keep them or "")."""
+    if not argv or Path(argv[0]).name != "claude":
+        return [], f"the session command isn't Claude Code's ({Path(argv[0]).name if argv else 'empty'})"
+    deny, bypass, narrows, modes = [], False, [], []
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        name, eq, val = a.partition("=") if a.startswith("--") else (a, "", "")
+        if name in CLAUDE_DENY:
+            vals = [val] if eq else []
+            while not eq and i + 1 < len(argv) and not argv[i + 1].startswith("-"):
+                i += 1
+                vals.append(argv[i])
+            deny += [x for v in vals for x in re.split(r"[,\s]+", v) if x]
+        elif name == "--dangerously-skip-permissions":
+            bypass = True
+        elif name == "--permission-mode":
+            modes.append(val if eq else (argv[i + 1] if i + 1 < len(argv) else ""))
+            i += 0 if eq else 1
+        elif name in CLAUDE_NARROWING:
+            narrows.append(name)
+        i += 1
+    if narrows:
+        return deny, f"it narrows its tools with {', '.join(dict.fromkeys(narrows))}, which a Codex body can't keep"
+    # A permission mode other than bypassPermissions is a limit, whatever else the command says (fail closed:
+    # which flag Claude Code lets win is not this check's to guess).
+    if any(m != "bypassPermissions" for m in modes):
+        return deny, (f"it names --permission-mode {', '.join(m for m in modes if m != 'bypassPermissions') or '(none)'}, "
+                      f"and a Codex body runs with approvals bypassed")
+    bypass = bypass or bool(modes)
+    if not bypass:
+        return deny, "it can stop and ask (no --dangerously-skip-permissions), and a Codex body runs with approvals bypassed"
+    return deny, ""
+
+
+def codex_deny(deny, urls=frozenset()):
+    """A deny list (Claude Code's tool names) as Codex keeps it, as the runtime does (runners.mjs, codexDeny):
+    every mcp__<server> becomes `-c mcp_servers.<server>={enabled=false, …}`, whether or not a config defines it
+    (`-c` merges over every config Codex reads). The stub is `url` for a server a config names by URL (a hint
+    only), else `command`. Anything else (a tool within a server, a built-in) Codex can't keep. → (args, error)."""
+    off, bad = set(), []
+    for d in deny:
+        name = d[5:] if d.startswith("mcp__") else None
+        # A server's name can hold single underscores (claude_ai_Gmail); a double one is a tool within it.
+        if not name or "__" in name or not SERVER_NAME.match(name):
+            bad.append(d)
+            continue
+        off.add(name)
+    if bad:
+        return None, (f"the codex runner can't deny {', '.join(bad)} (it turns off whole MCP servers, nothing else): "
+                      f"refusing to start a body that would keep them")
+    args = []
+    for s in sorted(off):
+        stub = 'url="http://127.0.0.1:9/denied"' if s in urls else 'command="false"'
+        args += ["-c", f"mcp_servers.{s}={{enabled=false, {stub}}}"]
+    return args, ""
+
+
+MCP_TABLE = re.compile(r"""^\s*\[\s*(?:profiles\.[^\]]*?\.)?mcp_servers\s*\.\s*(?:"([^"]+)"|'([^']+)'|([A-Za-z0-9_-]+))\s*\]""")
+
+
+def codex_url_servers(cwd, env):
+    """The MCP servers the configs Codex reads define by URL (its home's, the env's CODEX_HOME, the project's):
+    only a hint for which stub codex_deny writes, as the runtime's urlServers."""
+    homes = [Path(os.environ.get("CODEX_HOME") or HOME / ".codex")]
+    if env.get("CODEX_HOME"):
+        homes.append(Path(env["CODEX_HOME"]))
+    urls = set()
+    for f in [h / "config.toml" for h in homes] + [Path(cwd) / ".codex" / "config.toml"]:
+        try:
+            text = f.read_text()
+        except OSError:
+            continue
+        cur = None
+        for line in text.splitlines():
+            m = MCP_TABLE.match(line)
+            if m:
+                cur = m.group(1) or m.group(2) or m.group(3)
+                continue
+            if re.match(r"^\s*\[", line):
+                cur = None
+                continue
+            if cur and re.match(r"^\s*url\s*=", line):
+                urls.add(cur)
+    return urls
+
+
+def resolve_harness(model, agent, env):
+    """The runtime's pick for this agent's wake: {model, harness, why}, or None (logged) when it can't be asked."""
+    cmd = [LOOM, "runtime", "models", "resolve", "--agent", agent, "--venue", "wake", "--venue-kind", "scheduled",
+           "--prefer", model, "--json"]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=RESOLVE_TIMEOUT, env=env,
+                           stdin=subprocess.DEVNULL, cwd=REPO if REPO.is_dir() else HOME)
+    except (OSError, subprocess.SubprocessError) as e:
+        log("resolve-fail", f"{str(e)[:160]}; the session command runs as before")
+        return None
+    try:
+        pick = json.loads(r.stdout) if r.returncode == 0 else None
+    except ValueError:
+        pick = None
+    if not (isinstance(pick, dict) and pick.get("harness") in ("claude", "codex")
+            and isinstance(pick.get("model"), str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,79}", pick["model"])):
+        said = (r.stderr or r.stdout or "").strip().replace("\n", " ")[:200]
+        log("resolve-fail", f"rc={r.returncode} {said or 'no answer it could read'}; the session command runs as before")
+        return None
+    return pick
+
+
+def codex_fallback(argv, model, env, agent, cwd):
+    """{program, model, args}: a Codex run in place of the session command, when the resolver says so and the
+    session's limits can be kept there; else None (the session command runs)."""
+    program = codex_program()
+    if not program or agent not in fallback_agents():
+        return None   # not opted in (WAKE_CODEX_FALLBACK): not even a question to the resolver
+    pick = resolve_harness(model, agent, env)
+    if not pick or pick["harness"] != "codex":
+        return None
+    why = " / ".join(str(w) for w in pick.get("why") or [])[:240]
+    if not (isinstance(pick.get("fallback"), dict) and pick["fallback"].get("from") == "claude"):
+        # Codex because the agent's own settings or a scorecard prefer it, not because Claude is out: this
+        # fallback is for quota only; the session command runs as it always has.
+        log("fallback-refused", f"the runtime picked codex {pick['model']} ({why}) but not as a fallback from "
+                                f"claude; the session command runs as before")
+        return None
+    deny, cant = claude_limits(argv)
+    args, err = (None, cant) if cant else codex_deny(deny, codex_url_servers(cwd, env))
+    guards = [] if err else claude_guards(cwd)
+    if guards:
+        err = f"its Claude settings guard it in ways a Codex run can't keep: {'; '.join(guards)}"
+    if err:
+        log("fallback-refused", f"the runtime picked codex {pick['model']} ({why}), but {err}; "
+                                f"the session command runs as before")
+        refused_once(err[:600])
+        return None
+    log("fallback", f"codex {pick['model']} in place of {model} ({why}); deny: {', '.join(deny) or 'none'}")
+    return {"program": program, "model": pick["model"], "args": args}
+
+
+def codex_run(key):
+    return WAKE_DIR / "codex-runs" / key
+
+
+def start_codex(prompt, codex, env, cwd):
+    """A Codex body, as the runtime starts one (CodexRunner.launch): `codex exec --json`, approvals bypassed, the
+    deny list's -c args, the prompt on stdin; its own session (start_new_session), events and stderr in files under
+    <clock>/codex-runs/<key>/ with its pid, so it outlives this process and the reaper can find it."""
+    key = secrets.token_hex(4)
+    d = codex_run(key)
+    d.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    d.mkdir(mode=0o700)
+    # The env keys a Claude Code launcher leaves behind: a Codex body must not look like a Claude session to its tools.
+    e = {k: v for k, v in env.items() if not k.startswith("CLAUDE_CODE_") and k not in ("CLAUDECODE", "CLAUDE_JOB_DIR")}
+    e["SHUTTLE_BODY"] = key
+    # The runtime's profile, when it runs its Codex bodies under one (LOOM_RUNTIME_CODEX_PROFILE), so a wake's Codex
+    # reads the same config (and MCP servers) as every house body.
+    profile = env.get("LOOM_RUNTIME_CODEX_PROFILE") or ""
+    argv = [codex["program"], "exec", "--json", "--skip-git-repo-check", "--dangerously-bypass-hook-trust",
+            "--dangerously-bypass-approvals-and-sandbox", *(["-p", profile] if profile else []),
+            "-m", codex["model"], *codex["args"], "-C", str(cwd), "-o", str(d / "last.txt"), "-"]
+
+    def private(name):
+        return os.fdopen(os.open(d / name, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600), "ab")
+
+    with private("events.jsonl") as out, private("stderr.txt") as err:
+        child = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out, stderr=err, cwd=cwd, env=e,
+                                 start_new_session=True)
+    with private("pid") as f:
+        f.write(f"{child.pid}\n".encode())
+    try:
+        child.stdin.write(prompt.encode())
+        child.stdin.close()
+    except OSError:
+        pass   # it died at once: said below
+    # A Codex that exits at once (a flag it doesn't know, no login) is a failed dispatch like a session command's
+    # (retried, then said), not a wake reported started.
+    try:
+        rc = child.wait(timeout=CODEX_SETTLE)
+    except subprocess.TimeoutExpired:
+        rc = None
+    if rc:
+        try:
+            said = (d / "stderr.txt").read_text(errors="replace").strip()[-300:]
+        except OSError:
+            said = ""
+        return subprocess.CompletedProcess(args=argv, returncode=rc, stdout="", stderr=f"codex exited {rc}: {said}")
+    return subprocess.CompletedProcess(args=argv, returncode=0, stdout=f"codex · {key} ({codex['model']})\n", stderr="")
 
 
 RETRY_ALERT_AT = 3
@@ -1558,8 +1890,11 @@ def cmd_fire(args):
     log("fire", f"{entry['id']} {(out.splitlines() or [''])[0][:120]}")
     if mode != "house":
         job = SESSION_JOB.search(out)
+        codex = CODEX_JOB.search(out)
         if job:
             record_session(job.group(1), entry)
+        elif codex:
+            record_session(codex.group(1), entry, harness="codex")
     m = HOUSE_ID.match(out) if mode == "house" else None
     if m:
         # Handed over isn't started: look at the house again in a while.
@@ -1705,10 +2040,11 @@ class Sessions:
         return False
 
 
-def record_session(job, entry):
+def record_session(job, entry, harness="claude"):
     with Sessions() as ss:
         ss.records[job] = {"wake": entry["id"], "note": entry.get("note", ""), "kind": entry.get("kind", ""),
-                           "fired": datetime.now().strftime(TIME_FMT), "state": "running"}
+                           "fired": datetime.now().strftime(TIME_FMT), "state": "running",
+                           **({"harness": harness} if harness != "claude" else {})}
 
 
 def claude_bin():
@@ -1824,7 +2160,7 @@ def as_data(text, n=CMD_SHOWN):
 
 
 def reap_one(job, rec, a, waited):
-    """Stop one stuck session, say so on its task and to the owner, and return the record's new fields."""
+    """Stop one stuck Claude session, say so on its task and to the owner, and return the record's new fields."""
     path = transcript_of(a.get("sessionId"))
     tool, what = last_tool_use(path) if path else ("", "")
     try:
@@ -1834,22 +2170,31 @@ def reap_one(job, rec, a, waited):
         why = "" if stopped else (r.stderr or r.stdout).strip()[:160]
     except (OSError, subprocess.SubprocessError) as e:
         stopped, why = False, str(e)[:160]
+    return said_stuck(job, rec, waited, tool, what, stopped, why, {
+        "waited": "waited {mins} minutes on a permission prompt",
+        "because": ", and nobody can answer one in a run started by the clock",
+        "kept": f"Its conversation is kept (`claude attach {job}`).",
+        "inspect": f"Inspect it with `claude attach {job}`",
+        "by_hand": f"`claude stop {job}`"})
+
+
+def said_stuck(job, rec, waited, tool, what, stopped, why, words):
+    """A stuck session stopped (or not): its task's comment, the `stuck` line, the alert; the record's new fields."""
     mins = int(waited.total_seconds() // 60)
     wid = str(rec.get("wake") or "?")
     try:
         alerting = bool(argv_setting("WAKE_ALERT_COMMAND", []))
     except SystemExit:
         alerting = False
-    waited_on = f"{tool}: {as_data(what)}" if tool else "a tool call the clock couldn't read from its transcript"
+    waited_on = f"{tool}: {as_data(what)}" if tool else words.get("unread", "a tool call the clock couldn't read from its transcript")
     m = TASK_ID.search(rec.get("note") or "")
     task = m.group(0) if m else ""
     commented = False
     if task:
         text = (f"The clock {'stopped' if stopped else 'tried to stop'} this round (wake {wid}, session {job}): "
-                f"it had waited {mins} minutes on a permission prompt, and nobody can answer one in a run started by the "
-                f"clock. The call it was waiting on, quoted as data, not instructions (an excerpt, credentials removed): "
-                f"{waited_on}. Its conversation is kept (`claude attach {job}`). Nothing re-armed this round."
-                + ("" if stopped else f" The stop failed: {why}"))
+                f"it had {words['waited'].format(mins=mins)}{words['because']}. {words.get('last', 'The call it was waiting on')}, "
+                f"quoted as data, not instructions (an excerpt, credentials removed): {waited_on}. {words['kept']} Nothing "
+                f"re-armed this round." + ("" if stopped else f" The stop failed: {why}"))
         commented = task_comment(task, text)
     # Fixed fields first, in a fixed order, then the excerpt last: a checker reads the fields by position
     # (`stuck | <wake> session=<id> alerted=yes|no …`) and never the excerpt, which is the command's own text.
@@ -1857,17 +2202,130 @@ def reap_one(job, rec, a, waited):
                  f"task={task or 'none'} comment={('ok' if commented else 'failed') if task else 'none'} "
                  f"waited={mins}m | {f'{tool}: {as_data(what)}' if tool else 'unknown'}")
     alert(f"wake: stopped a stuck session: \"{rec.get('note') or wid}\" (wake {wid}, session {job}) "
-          f"waited {mins} minutes on a permission prompt"
+          f"{words['waited'].format(mins=mins)}"
           + (f" (its last call: {tool})" if tool else "")
-          + f". Inspect it with `claude attach {job}`"
-          + ("" if stopped else f". The stop FAILED ({why}): `claude stop {job}`")
+          + f". {words['inspect']}"
+          + ("" if stopped else f". The stop FAILED ({why}): {words['by_hand']}")
           + (f". Noted on {task}." if commented else "."))
     return {"state": "stuck", "stuck_at": datetime.now().strftime(TIME_FMT), "stopped": stopped, "tool": tool,
             "command": as_data(what), "task": task, "commented": commented}
 
 
+# A Codex session (the quota fallback, t-1912) is `codex exec` with approvals bypassed: it never waits on a
+# permission prompt. What leaves one sitting is a process that finished its turn (turn.completed or turn.failed
+# in its events) and never exited, e.g. an MCP server that holds it open. The reaper finds it by its run dir
+# (<clock>/codex-runs/<key>/: pid, events.jsonl), never by `claude agents`, and one whose turn has been over for
+# WAKE_STUCK_AFTER minutes while its process lives on is stopped (SIGTERM to its process group, as the runtime's
+# CodexRunner.end), logged `stuck` with the same fields, commented and said once. One still in its turn is left be.
+CODEX_KEY = re.compile(r"^[0-9a-f]{8}$")
+# A Codex run still in its turn this long after it was fired is stopped too: a run wedged on a tool call would
+# otherwise live on unbounded (a Claude session there would be the same, but `claude --bg`'s are its own to end).
+CODEX_MAX_RUN = timedelta(hours=6)
+CODEX_TOOLS = ("command_execution", "mcp_tool_call", "file_change", "web_search")
+
+
+def codex_pid(job):
+    if not CODEX_KEY.match(str(job)):
+        return None
+    try:
+        pid = int((codex_run(job) / "pid").read_text().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def codex_alive(job):
+    """Its process is still this run's codex: a recycled pid's argv doesn't name this run's dir."""
+    pid = codex_pid(job)
+    if not pid:
+        return False
+    try:
+        return str(codex_run(job)).encode() in Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return False
+
+
+def codex_stop(job):
+    """SIGTERM to its process group (it started in its own session), only while it's still this run's codex."""
+    if not codex_alive(job):
+        return False
+    try:
+        os.killpg(codex_pid(job), signal.SIGTERM)
+        return True
+    except OSError:
+        return False
+
+
+def codex_events(job, tail=TRANSCRIPT_TAIL):
+    try:
+        with open(codex_run(job) / "events.jsonl", "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - tail))
+            lines = f.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in lines:
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(d, dict):
+            out.append(d)
+    return out
+
+
+def codex_turn_over(events):
+    return any(e.get("type") in ("turn.completed", "turn.failed") for e in events)
+
+
+def codex_last_tool(events):
+    """(item type, what) for its last tool step, as last_tool_use does for a Claude transcript."""
+    for e in reversed(events):
+        item = e.get("item")
+        if e.get("type") in ("item.started", "item.completed") and isinstance(item, dict) and item.get("type") in CODEX_TOOLS:
+            return item["type"], codex_item_words(item)
+    return "", ""
+
+
+def codex_item_words(item):
+    """What a tool step was, from an allow-list of its fields only (never its result, output, error or a file's
+    contents, which can carry secrets into a task comment agents read): a command, a search's query, the paths a
+    change touched, an MCP call's server, tool and argument names (no values). as_data redacts and caps it."""
+    t = item.get("type")
+    if t == "command_execution":
+        return str(item.get("command") or "")
+    if t == "web_search":
+        return str(item.get("query") or "")
+    if t == "file_change":
+        changes = item.get("changes") if isinstance(item.get("changes"), list) else []
+        return ", ".join(str(c.get("path")) for c in changes if isinstance(c, dict) and c.get("path"))
+    if t == "mcp_tool_call":
+        args = item.get("arguments")
+        keys = sorted(map(str, args)) if isinstance(args, dict) else []
+        return f"{item.get('server') or '?'}.{item.get('tool') or '?'}({', '.join(keys)})"
+    return ""
+
+
+def reap_codex(job, rec, waited, overran=False):
+    tool, what = codex_last_tool(codex_events(job))
+    stopped = codex_stop(job)
+    run = codex_run(job)
+    return said_stuck(job, rec, waited, tool, what, stopped, "" if stopped else "its process didn't take the signal", {
+        "waited": ("ran {mins} minutes without ending its turn" if overran else
+                   "sat {mins} minutes (counted from when the clock first saw its turn over) and its Codex process "
+                   "never exited"),
+        "last": "Its last tool step",
+        "because": "",
+        "kept": f"Its events are kept in {run}/events.jsonl.",
+        "inspect": f"Its events are in {run}/events.jsonl",
+        "unread": "a step the clock couldn't read from its events",
+        "by_hand": f"`kill -TERM -{codex_pid(job)}`"})
+
+
 def reap_stuck(now=None):
-    """One look at the sessions this clock started: stop any that has waited on a permission prompt too long."""
+    """One look at the sessions this clock started: stop any that has waited on a permission prompt too long, or
+    (Codex) has sat on after its turn too long."""
     after = stuck_after()
     if after is None:
         return   # WAKE_STUCK_AFTER=off: not even a look
@@ -1875,25 +2333,45 @@ def reap_stuck(now=None):
         records = {k: dict(v) for k, v in ss.records.items() if isinstance(v, dict)}
     if not records:
         return
-    agents = background_sessions()
-    if agents is None:
-        return  # can't ask: look again next time, never guess
+    codex = {k for k, v in records.items() if v.get("harness") == "codex"}
+    # `claude agents` only for Claude's sessions; can't ask: those are looked at again next time, never guessed.
+    agents = background_sessions() if len(codex) < len(records) else {}
     now = now or datetime.now()
-    # seen: for each recorded session this look found listed and running, when it started waiting on a permission
-    # prompt (None: it isn't waiting). A record not in `seen` wasn't listed, or isn't running.
-    seen, reaped = {}, {}
+    # seen: for each recorded session this look found running, when it started waiting (on a permission prompt;
+    # a Codex one: past its turn's end), or None when it isn't. gone: running records that ended.
+    seen, reaped, gone = {}, {}, set()
     for job, rec in records.items():
-        a = agents.get(job)
-        if rec.get("state") != "running" or a is None:
+        if rec.get("state") != "running":
             continue
-        if not waiting_on_permission(a):
+        if job in codex:
+            if not codex_alive(job):
+                gone.add(job)
+                continue
+            waiting = codex_turn_over(codex_events(job))
+            try:
+                ran = now - datetime.strptime(rec.get("fired") or "", TIME_FMT)
+            except (ValueError, TypeError):
+                ran = timedelta(0)
+            if not waiting and ran >= CODEX_MAX_RUN:
+                reaped[job] = reap_codex(job, rec, ran, overran=True)
+                continue
+        else:
+            if agents is None:
+                continue
+            a = agents.get(job)
+            if a is None:
+                if listed_long(rec, now):
+                    gone.add(job)
+                continue
+            waiting = waiting_on_permission(a)
+        if not waiting:
             seen[job] = None
             continue
         first = rec.get("waiting_since") or now.strftime(TIME_FMT)
         seen[job] = first
         waited = now - datetime.strptime(first, TIME_FMT)
-        if after is not None and waited >= after:
-            reaped[job] = reap_one(job, rec, a, waited)
+        if waited >= after:
+            reaped[job] = reap_codex(job, rec, waited) if job in codex else reap_one(job, rec, agents[job], waited)
     with Sessions() as ss:
         for job, rec in list(ss.records.items()):
             if not isinstance(rec, dict):
@@ -1907,15 +2385,19 @@ def reap_stuck(now=None):
                     rec["waiting_since"] = seen[job]
                 else:
                     rec.pop("waiting_since", None)
-            elif rec.get("state") == "running" and job in records and job not in agents and listed_long(rec, now):
+            elif job in gone and rec.get("state") == "running":
                 rec["state"] = "gone"   # it ended (or was stopped by hand): nothing to watch
                 rec.pop("waiting_since", None)
             try:
                 old = now - datetime.strptime(rec.get("stuck_at") or rec.get("fired") or "", TIME_FMT) > SESSIONS_KEEP
             except (ValueError, TypeError):
                 old = True
+            if old and rec.get("harness") == "codex" and codex_alive(job):
+                old = False   # a live run keeps its record: the reaper is all that can find it
             if old:
                 ss.records.pop(job)
+                if rec.get("harness") == "codex" and CODEX_KEY.match(str(job)):
+                    shutil.rmtree(codex_run(job), ignore_errors=True)
 
 
 GONE_GRACE = timedelta(minutes=5)   # a session just started may not be listed yet

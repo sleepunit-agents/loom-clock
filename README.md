@@ -63,7 +63,25 @@ inline prompt.
   the first 200 characters of what it was waiting on, quoted as data), logged
   as `stuck` (not a failure) and said once (`WAKE_ALERT_COMMAND`). Only the
   sessions in that record are ever looked at: never an interactive session,
-  never one anything else started. `wake reap` does one look now.
+  never one anything else started. `wake reap` does one look now. A Codex
+  session (the quota fallback, below) is found by its run directory
+  (`codex-runs/<key>/`: its pid, whose command line must name that directory,
+  and its events), never by `claude agents`. `codex exec` with approvals
+  bypassed can't wait on a prompt; one whose turn is over but whose process
+  lives on for `WAKE_STUCK_AFTER` minutes, or that is still in its turn 6 hours
+  after it fired, is stopped (SIGTERM to its process group) and said the same way.
+- **Quota fallback to Codex (opt-in).** For an agent `WAKE_CODEX_FALLBACK`
+  names, a local wake first asks loom's runtime (`loom runtime models resolve
+  --venue wake --prefer <model>`). Claude: the session command, unchanged.
+  Codex, flagged as a fallback from Claude (its account out): `codex exec`,
+  started as the runtime starts a Codex body, with the session command's
+  `--disallowedTools` kept by turning each denied MCP server off. It refuses
+  (logged `fallback-refused`, said once per reason) when Codex can't keep the
+  session's limits: a deny it can't carry, a session that can stop and ask or
+  narrows its tools, or any Claude settings key not known to be harmless in the
+  files the session would load (hooks, deny or ask rules, the sandbox, plugins
+  that are on, anything unknown). A resolver that can't be asked leaves the
+  session command as it was.
 - **Another piece's variables aren't the clock's.** The tasks piece and loom's
   runtime run `loom-clock in 1m …` with their own `LOOM_PIECE_NAME` and
   `LOOM_PIECE_HOME`; the clock ignores a `LOOM_PIECE_HOME` whose
@@ -136,6 +154,8 @@ from a `oneshot` user unit.
 | `WAKE_FIRE` | `$WAKE_DATA/fire`, else `local` | `local`, `house` or `mixed` |
 | `WAKE_MODEL` | `claude-sonnet-5` | The model a wake runs on unless it names one |
 | `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}"]` | The session a local wake starts. A JSON list (or a command line); `{prompt}` and `{model}` are whole arguments. The default can stop and ask for permission; an unattended agent that has decided otherwise adds its own flags here |
+| `WAKE_CODEX_FALLBACK` | none | Agents whose local wakes may fall back to Codex when the runtime says Claude's account is out (see "Quota fallback") |
+| `WAKE_CODEX` | `codex` on the wake's `PATH` | The Codex program the fallback runs; `off`: never |
 | `WAKE_STUCK_AFTER` | `10` | Minutes a session the clock started may wait on a permission prompt before it's stopped, noted and said (see "Stuck sessions"); `0` or `off`: never |
 | `WAKE_TASK_COMMENT` | `["taskstore", "comment", "{task}", "{text}"]`, when `taskstore` is on `PATH` | How a stopped session is noted on the task its note names (a `t-NNN`); `off`: never |
 | `WAKE_ALERT_COMMAND` | none (the log only) | How the clock reaches the owner when a wake keeps failing or a session was stopped stuck; the message is its last argument |
@@ -147,7 +167,9 @@ from a `oneshot` user unit.
 
 Read from the environment only: `WAKE_HOUSEHOLD` (default
 `$LOOM_HOME/household.json`, loom's household file: its `agents` and `owner`), `WAKE_LOOM` (the `loom` CLI, default `loom` on `PATH`),
-`WAKE_APPROVALS` (default `loom approvals`), and `WAKE_NO_FORWARD=1` (see
+`WAKE_APPROVALS` (default `loom approvals`), `WAKE_CLAUDE_MANAGED_SETTINGS` (Claude
+Code's managed settings file the fallback reads, default
+`/etc/claude-code/managed-settings.json`), and `WAKE_NO_FORWARD=1` (see
 "In a house").
 
 The default session command skips the agent harness's permission prompts,
