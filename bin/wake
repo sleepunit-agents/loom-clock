@@ -270,17 +270,17 @@ def principal_argv():
 def split_principal(argv):
     """argv without the `--principal <statement>` the house wrapper appends to every clock call from a body that has
     one, and that statement ("" when there's none). Only trailing pairs: the wrapper appends, so one in the middle is a
-    body's own words, and argparse refuses it. With more than one, the last is the wrapper's."""
-    argv, statement = list(argv), ""
+    body's own words, and argparse refuses it. With more than one, the last is the wrapper's, even an empty one (which
+    is none: an earlier one is never used in its place)."""
+    argv, statement, found = list(argv), "", False
     while True:
         if len(argv) >= 2 and argv[-2] == "--principal":
-            statement = statement or argv[-1]
-            argv = argv[:-2]
+            statement, argv = (statement if found else argv[-1]), argv[:-2]
         elif argv and argv[-1].startswith("--principal="):
-            statement = statement or argv[-1].split("=", 1)[1]
-            argv = argv[:-1]
+            statement, argv = (statement if found else argv[-1].split("=", 1)[1]), argv[:-1]
         else:
             return argv, statement
+        found = True
 
 
 def caller_agent():
@@ -302,9 +302,13 @@ def verify_principal(statement):
         r = subprocess.run([*principal_argv(), "--verify"], input=statement, capture_output=True, text=True,
                            timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
         v = json.loads(r.stdout) if r.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError, SystemExit):  # SystemExit: WAKE_PRINCIPAL malformed
+    except (OSError, subprocess.SubprocessError, ValueError, SystemExit) as e:  # SystemExit: WAKE_PRINCIPAL malformed
+        log("principal-fail", f"the runtime's principal command didn't verify ({type(e).__name__}): taken as unknown")
         return None
     return v if isinstance(v, dict) and v.get("ok") is True else None
+
+
+_PRINCIPAL = {}
 
 
 def principal_for():
@@ -314,13 +318,20 @@ def principal_for():
     if not os.environ.get("WAKE_ORIGIN", "").strip():
         return "owner"
     statement = os.environ.get("WAKE_PRINCIPAL_STATEMENT", "")
-    v = verify_principal(statement) if statement else None
     agent = caller_agent()
-    if not v or not agent or v.get("agent") != agent:
-        return "-"
-    if v.get("owner") is True:
-        return "owner"
-    return v["for"] if isinstance(v.get("for"), str) and PRINCIPAL_SLUG.match(v["for"]) else "-"
+    # Once per run: the wake, its approval and that approval's spend all say the same.
+    key = (statement, agent)
+    if key not in _PRINCIPAL:
+        v = verify_principal(statement) if statement else None
+        if not v or not agent or v.get("agent") != agent:
+            _PRINCIPAL[key] = "-"
+        elif v.get("owner") is True:
+            _PRINCIPAL[key] = "owner"
+        else:
+            f = v.get("for")
+            # A person whose slug is "owner" is a person, not the owner: unknown here (the words are the same).
+            _PRINCIPAL[key] = f if isinstance(f, str) and PRINCIPAL_SLUG.match(f) and f != "owner" else "-"
+    return _PRINCIPAL[key]
 
 
 def narrower(a, b):
@@ -338,11 +349,12 @@ def entry_for(entry):
     return v if v in ("owner", "-") or (isinstance(v, str) and PRINCIPAL_SLUG.match(v)) else "-"
 
 
-def hand_over_principal(agent, place, for_):
-    """Tell the runtime whom the wake about to be delivered is for (`<cmd> --wake --agent … --place … --for …`). Not
-    fatal: a failure is logged, the delivery goes ahead, and the runtime treats the wake as unknown (it fails closed)."""
+def hand_over_principal(agent, place, delivery_id, for_):
+    """Tell the runtime whom the wake about to be delivered is for (`<cmd> --wake --agent … --place … --id … --for …`),
+    for exactly that delivery (its id). Not fatal: a failure is logged, the delivery goes ahead, and the runtime treats
+    the wake as unknown (it fails closed)."""
     try:
-        r = subprocess.run([*principal_argv(), "--wake", "--agent", agent, "--place", place, "--for", for_],
+        r = subprocess.run([*principal_argv(), "--wake", "--agent", agent, "--place", place, "--id", delivery_id, "--for", for_],
                            capture_output=True, text=True, timeout=PRINCIPAL_TIMEOUT_S, stdin=subprocess.DEVNULL,
                            env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
     except (OSError, subprocess.SubprocessError, SystemExit) as e:  # SystemExit: WAKE_PRINCIPAL malformed
@@ -1663,7 +1675,7 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
     # Whom it's for, handed to the runtime before the delivery it belongs to (t-1943). Not fatal: without it the
     # runtime treats the wake as unknown. (A wake that goes the old way, a spawned house or a session here, has no
     # runtime record to hand it to: there it's unknown.)
-    hand_over_principal(agent, body["place"], entry_for(entry))
+    hand_over_principal(agent, body["place"], body["id"], entry_for(entry))
     status, ans = post_delivery(body)
     err = str(ans.get("error") or ans.get("reason") or "")[:200]
     if auto and status == 503 and NO_DELIVERY in err:

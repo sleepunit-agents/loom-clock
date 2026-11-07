@@ -119,6 +119,15 @@ inline prompt.
   owner hears of it once a day. `WAKE_LOCAL_RUN=session` is the way back: a
   local wake is a session again, delivered only when it names its place.
   `WAKE_DELIVERY=spawn` puts every wake back on the old way.
+- **On whose behalf, the runtime's answer.** `--verify` answers
+  `{ok, agent, conversation, for, owner, people, exp}`: `owner` is true or
+  false (true: every voice that conversation heard was one of the agent's
+  owners, the members who own it), `for` a person's slug or null. The clock
+  takes it only when `ok` is true and `agent` is the calling agent; a `for` of
+  `owner` without `owner: true` is a person by that name, and unknown here.
+  The hand-over names the delivery's id, so a word for a wake that's never
+  delivered is never another wake's. A run verifies once and uses that answer
+  for the wake, its approval and its spend.
 - **On whose behalf** (t-1943). The owner's standing permissions (his merge
   rules, say) cover work a body does for him; work it does for someone else (a
   person who messaged it in Slack or Discord) needs that person's own grant, or
@@ -188,7 +197,7 @@ from a `oneshot` user unit.
 | `WAKE_PREAMBLE_FILE` | the piece's own | The words every wake starts with: `{name} {where} {id} {kind} {created} {note} {lanes} {body}` |
 | `WAKE_DELIVERY` | `deliver` when `WAKE_DELIVER_TOKEN_FILE` is set and a piece offers delivery, else `spawn` | `deliver`: a house wake goes through loom's `deliver`. `spawn`: the clock asks loom-box for the house itself, as before |
 | `WAKE_DELIVER_TOKEN_FILE` | none | A file holding a piece token of this clock's (`loom token create --piece clock/<name> --label …`), to deliver with |
-| `WAKE_PRINCIPAL` | `loom runtime principal` | loom's runtime's principal command (a command line or a JSON list): `--verify` reads a body's principal statement on stdin, `--wake --agent … --place … --for …` hands over whom a delivered wake is for (see "On whose behalf") |
+| `WAKE_PRINCIPAL` | `loom runtime principal` | loom's runtime's principal command (a command line or a JSON list): `--verify` reads a body's principal statement on stdin, `--wake --agent … --place … --id … --for …` hands over whom that delivered wake is for (see "On whose behalf") |
 | `WAKE_LOOM_URL` | `http://127.0.0.1:8787` | loom's address for its HTTP API, as this machine reaches it (an MCP URL's `/mcp` is dropped) |
 
 Read from the environment only: `WAKE_HOUSEHOLD` (default

@@ -2558,6 +2558,7 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
 
     def cli(self, *argv, statement=None, answer=None, exit_code=0, over_api=True):
+        wake_cli._PRINCIPAL.clear()     # each call is its own run (its own process, in a real one)
         env = {"PRINCIPAL_ANSWER": json.dumps(answer) if answer is not None else "", "PRINCIPAL_EXIT": str(exit_code)}
         if over_api:
             env.update(WAKE_ORIGIN="agent:ada", WAKE_CALLER=json.dumps(self.ADA), WAKE_PRINCIPAL_STATEMENT=statement or "")
@@ -2592,6 +2593,20 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         filed, spent = [a for a in seen if a[0] != str(self.fake)]
         self.assertEqual(filed[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
         self.assertEqual(spent[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
+
+    def test_a_person_whose_slug_is_owner_is_not_the_owner(self):
+        self.assertEqual(self.set_for(statement="stmt-o", answer=self.verified("ada", "owner", False)), "-")
+        self.assertEqual(self.set_for(statement="stmt-j", answer=self.verified("ada", "jonathan-barket", True)), "owner")
+
+    def test_two_different_people_narrow_to_unknown(self):
+        self.assertEqual(wake_cli.narrower("loren", "dan"), "-")
+        self.assertEqual(wake_cli.narrower("loren", "owner"), "loren")
+        self.assertEqual(wake_cli.narrower("owner", "loren"), "loren")
+        self.assertEqual(wake_cli.narrower("owner", "owner"), "owner")
+
+    def test_an_empty_last_principal_is_none_not_the_one_before(self):
+        self.assertEqual(wake_cli.split_principal(["in", "1h", "--principal", "FORGED", "--principal", ""]), (["in", "1h"], ""))
+        self.assertEqual(wake_cli.split_principal(["in", "1h", "--principal", "FORGED", "--principal=real"]), (["in", "1h"], "real"))
 
     def test_a_wake_set_on_loom_s_machine_is_the_owner_s(self):
         self.assertEqual(self.set_for(over_api=False), "owner")
@@ -2703,10 +2718,10 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         at_post, posts, _ = self.deliver({**self.base, "origin": "agent:ada", "for": "loren"})
         (seen,) = at_post
         self.assertEqual([c["argv"] for c in seen],
-                         [["--wake", "--agent", "ada", "--place", "wake:w-dddddd", "--for", "loren"]], "before the POST")
+                         [["--wake", "--agent", "ada", "--place", "wake:w-dddddd", "--id", "w-dddddd", "--for", "loren"]], "before the POST, for that delivery")
         self.assertEqual(posts[0]["place"], "wake:w-dddddd")
         at_post, *_ = self.deliver({**self.base, "schedule": "nightly", "kind": "schedule", "for": "owner"})
-        self.assertEqual(at_post[0][0]["argv"], ["--wake", "--agent", "ada", "--place", "lane:nightly", "--for", "owner"])
+        self.assertEqual(at_post[0][0]["argv"], ["--wake", "--agent", "ada", "--place", "lane:nightly", "--id", "w-dddddd", "--for", "owner"])
 
     def test_a_hand_over_that_fails_doesnt_stop_the_delivery(self):
         _, posts, logged = self.deliver({**self.base, "for": "owner"}, exit_code=1)
