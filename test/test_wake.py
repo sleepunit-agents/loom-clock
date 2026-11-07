@@ -503,6 +503,13 @@ class AgentWakes(unittest.TestCase):
             [e] = [wake_cli.json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
             self.assertEqual((e["prompt"], e["note"], e["local_approval"]), (prompt, "t-1 install", "a-0000aaaa"))
             self.assertEqual(json_keys(Path(td) / "filed.json"), {"a-0000aaaa"})
+            # Kept words whose recorded target isn't their hash are refused, before anything is spent.
+            f = Path(td) / "filed.json"
+            d = wake_cli.json.loads(f.read_text())
+            d["a-0000aaaa"]["target"] = "ada:0000000000000000"
+            f.write_text(wake_cli.json.dumps(d))
+            self.assertIn("don't match", set_(["in", "1m", "--approval", "a-0000aaaa"]) or "")
+            self.assertEqual(len(spent), 1)
 
     def test_an_allowed_local_wake_runs_on_loom_s_machine(self):
         entry = {"id": "w-aaaaaa", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "n",
@@ -1095,6 +1102,16 @@ class Clocks(unittest.TestCase):
         # The continuation itself runs where any continuation runs: the quote carries no house marker.
         self.assertNotIn(wake_cli.HOUSE_LOCAL, e["prompt"])
         self.assertTrue(wake_cli.house_ready(e, e["prompt"]))
+        # A wake approval whose words this clock no longer has: no spend line (the piece wouldn't run it).
+        lost = wake_cli.spend_words("a-7a2b3c4d", {"kind": "local-wake", "target": "ada:0123456789abcdef"})
+        self.assertNotIn("approvals use", lost)
+        self.assertNotIn("--approval a-7a2b3c4d", lost)
+        # Filed words past FILED_KEEP are gone.
+        f = wake_cli.filed_path()
+        d = wake_cli.json.loads(f.read_text())
+        d["a-3a2b3c4d"]["at"] = "2000-01-01 00:00:00"
+        f.write_text(wake_cli.json.dumps(d))
+        self.assertNotIn("a-3a2b3c4d", wake_cli.filed_wakes())
         # A card whose id isn't the one parked on is nobody's.
         with mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=wake_cli.json.dumps({**card, "id": "a-6a2b3c4d"}), stderr="")):
             self.assertIsNone(wake_cli.approval_card("a-3a2b3c4d"))

@@ -740,6 +740,12 @@ def spend_words(rid, card):
         words = filed["prompt"].replace(HOUSE_LOCAL, "").strip()
         return (f"Pick up where you left off. It's a local wake: set it with exactly `wake in 1m --approval {rid}`, "
                 f"no -p (the clock uses the words it filed for {rid}). What the owner allowed it to do: {words}")
+    if (card or {}).get("kind") == "local-wake":
+        # Its words are gone from this clock (expired, or filed before it kept them): nothing here can set it, and
+        # spending it any other way would use up the owner's yes and run nothing.
+        return (f"The clock no longer has the words {rid} was filed for, so it can't be set from it. Don't spend it: "
+                f"comment on the task what was waiting, set the wake again with its words (-p) so the owner is asked "
+                f"once more, and park on the new id.")
     if card:
         return (f"Pick up where you left off, and spend it on exactly the action it allows ({card['kind']} for "
                 f"{card['target']}): `approvals use {rid} --kind {card['kind']} --target {shlex.quote(card['target'])}`, "

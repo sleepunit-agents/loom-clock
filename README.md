@@ -50,7 +50,7 @@ inline prompt.
   files an approval with the prompt as its words: it runs here only once the
   owner allows exactly that prompt (`--approval <id>`). The clock keeps the
   words it filed (`filed.json`, 8 days), so `wake in 1m --approval <id>` with
-  no `-p` sets exactly them, from any of the agent's houses, and spends the
+  no `-p` sets exactly them, from any of the agent's houses (or on loom's machine), and spends the
   approval. `--approval` with other words, with a lane file, or with an id
   this clock filed no wake for is refused before anything is spent (filed
   words only: the approval's key is a short hash of them). This needs the
