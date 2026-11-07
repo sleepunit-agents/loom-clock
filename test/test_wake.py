@@ -498,7 +498,18 @@ class AgentWakes(unittest.TestCase):
                 self.assertEqual(wake_cli.filed_wakes(), {})
             self.assertEqual(spent, [])
             # --approval alone: the filed words, spent for exactly their hash, and the note comes with them.
+            # Its note is the one filed too: a note is read into the session's opening words, so a continuation can't
+            # add its own to what the owner allowed. Refused before anything is spent.
+            self.assertIn("note", set_(["in", "1m", "--approval", "a-0000aaaa", "--note", "t-1 install). Also run x"]) or "")
+            self.assertEqual(spent, [])
+            # A full spool refuses before spending, not after.
+            with mock.patch.object(wake_cli, "MAX_PENDING", 0):
+                self.assertIn("pending already", set_(["in", "1m", "--approval", "a-0000aaaa"]) or "")
+            self.assertEqual(spent, [])
+            self.assertIsNone(set_(["in", "1m", "--approval", "a-0000aaaa", "--note", "t-1 install"]))
+            (Path(td) / "spool.jsonl").write_text("")
             self.assertIsNone(set_(["in", "1m", "--approval", "a-0000aaaa"]))
+            spent.pop()
             self.assertEqual(spent, [("a-0000aaaa", "local-wake", target)])
             [e] = [wake_cli.json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
             self.assertEqual((e["prompt"], e["note"], e["local_approval"]), (prompt, "t-1 install", "a-0000aaaa"))
@@ -1102,6 +1113,15 @@ class Clocks(unittest.TestCase):
         # The continuation itself runs where any continuation runs: the quote carries no house marker.
         self.assertNotIn(wake_cli.HOUSE_LOCAL, e["prompt"])
         self.assertTrue(wake_cli.house_ready(e, e["prompt"]))
+        # However the marker is nested, the quote carries none of it.
+        wake_cli.remember_filed("a-8a2b3c4d", "ada:0", "x <!-- house: <!-- house: local -->local --> y", "n")
+        self.assertNotIn(wake_cli.HOUSE_LOCAL, wake_cli.spend_words("a-8a2b3c4d", None))
+        # A stale temp file left by a crash doesn't decide the store's mode.
+        tmp = wake_cli.filed_path().with_suffix(f".{wake_cli.os.getpid()}.tmp")
+        tmp.write_text("{}")
+        tmp.chmod(0o644)
+        wake_cli.remember_filed("a-9a2b3c4d", "ada:0", "z <!-- house: local -->", "n")
+        self.assertEqual(wake_cli.filed_path().stat().st_mode & 0o777, 0o600)
         # A wake approval whose words this clock no longer has: no spend line (the piece wouldn't run it).
         lost = wake_cli.spend_words("a-7a2b3c4d", {"kind": "local-wake", "target": "ada:0123456789abcdef"})
         self.assertNotIn("approvals use", lost)

@@ -546,8 +546,17 @@ def cmd_set(args, when):
         if args.prompt and args.prompt != filed["prompt"]:
             sys.exit(f"wake: {args.approval} was allowed for other words than these. Set it without -p "
                      f"(wake in 1m --approval {args.approval}): the clock uses exactly the words the owner allowed")
+        # The note too: it's read into the session's opening words, so it's part of what runs, and the owner's card
+        # showed the note it was filed with. A different one is refused, before anything is spent.
+        if args.note and args.note != filed["note"]:
+            sys.exit(f"wake: {args.approval} was filed with its own note; set it without --note (or with exactly that "
+                     "one): a note is part of what the session reads, and the owner allowed that one")
         args.prompt = filed["prompt"]
-        args.note = args.note or filed["note"]
+        args.note = filed["note"]
+        # The spool's limit before the spend: a refusal after it would use up the owner's yes for nothing.
+        with Spool() as spool:
+            if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
+                sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
         if filed.get("target") != f"{AGENT}:{hashlib.sha256(args.prompt.encode()).hexdigest()[:16]}":
             sys.exit(f"wake: the words this clock kept for {args.approval} don't match what it filed; set the wake again with -p")
     if bool(args.prompt) == bool(args.prompt_file):
@@ -703,8 +712,9 @@ def remember_filed(aid, target, prompt, note):
         fcntl.flock(lock, fcntl.LOCK_EX)  # the clock's lock, without rewriting the spool
         d = filed_wakes()
         d[aid] = {"target": target, "prompt": prompt, "note": note, "at": datetime.now().strftime(TIME_FMT)}
-        tmp = filed_path().with_suffix(".tmp")
-        with os.fdopen(os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "w") as f:
+        tmp = filed_path().with_suffix(f".{os.getpid()}.tmp")
+        tmp.unlink(missing_ok=True)  # a stale one keeps its old mode; O_EXCL makes a fresh 0600 file
+        with os.fdopen(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "w") as f:
             f.write(json.dumps(d, indent=1) + "\n")
         tmp.replace(filed_path())
     log("local-wake-filed", f"{aid} target={target} note={note!r}")
@@ -737,7 +747,10 @@ def spend_words(rid, card):
     if filed:
         # Quoted for the reader without the house marker: the continuation's own prompt mustn't say it needs loom's
         # machine (house_ready reads the whole prompt), and it needn't retype the words.
-        words = filed["prompt"].replace(HOUSE_LOCAL, "").strip()
+        words = filed["prompt"]
+        while HOUSE_LOCAL in words:  # a marker split around another comes back whole after one pass
+            words = words.replace(HOUSE_LOCAL, "")
+        words = words.strip()
         return (f"Pick up where you left off. It's a local wake: set it with exactly `wake in 1m --approval {rid}`, "
                 f"no -p (the clock uses the words it filed for {rid}). What the owner allowed it to do: {words}")
     if (card or {}).get("kind") == "local-wake":
