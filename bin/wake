@@ -321,7 +321,8 @@ def fetch_principal(conversation):
     except (OSError, subprocess.SubprocessError, ValueError, SystemExit):
         return ""
     st = v.get("statement") if isinstance(v, dict) and v.get("ok") is True else None
-    return st if isinstance(st, str) and 0 < len(st) <= 1100 and not re.search(r"\s", st) else ""
+    # Opaque, the runtime's to read: one word (it travels as one argv item), within the API door's own cap.
+    return st if isinstance(st, str) and 0 < len(st) <= 65536 and not re.search(r"\s", st) else ""
 
 
 def principal_for():
@@ -332,9 +333,11 @@ def principal_for():
     if not os.environ.get("WAKE_ORIGIN", "").strip():
         # On loom's machine. A body the runtime runs here (a local wake: LOOM_BODY_CONVERSATION) acts for whom its
         # conversation says, never for the owner by being here; anything else here is the owner's own account.
-        conv = os.environ.get("LOOM_BODY_CONVERSATION", "")
-        if not re.fullmatch(r"cv-[0-9a-f]{12}", conv):
+        conv = os.environ.get("LOOM_BODY_CONVERSATION", "").strip()
+        if not conv:
             return "owner"
+        if not re.fullmatch(r"cv-[0-9a-f]{12}", conv):     # a body, with a conversation no one can read: unknown
+            return "-"
         statement = statement or fetch_principal(conv)
         agent = AGENT
     else:

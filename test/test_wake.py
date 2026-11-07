@@ -2612,8 +2612,16 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
             self.assertEqual(self.set_for(over_api=False, answer={**self.verified(agent, "jonathan-barket", True), "statement": "st-local"}), "owner")
             # The runtime can't say: unknown, never the owner for being here.
             self.assertEqual(self.set_for(over_api=False, answer={"ok": False}, exit_code=1), "-")
+        # A conversation no one can read is a body all the same: unknown, not the owner.
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": "conversation-7"}):
+            self.assertEqual(self.set_for(over_api=False), "-")
         # No conversation: the owner's own account.
-        self.assertEqual(self.set_for(over_api=False), "owner")
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": ""}):
+            self.assertEqual(self.set_for(over_api=False), "owner")
+        # A long statement is the runtime's to judge, not cut here.
+        long = "a" * 3000 + "." + "b" * 43
+        with mock.patch.dict(wake_cli.os.environ, {**cv, "PRINCIPAL_ANSWER": json.dumps({**self.verified(agent, "loren"), "statement": long})}):
+            self.assertEqual(wake_cli.fetch_principal("cv-0123456789ab"), long)
 
     def test_setting_a_schedule_again_never_widens_whom_it_is_for(self):
         self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", "routines/nightly.md",
@@ -2761,6 +2769,14 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         self.assertEqual(posts[0]["place"], "wake:w-dddddd")
         at_post, *_ = self.deliver({**self.base, "schedule": "nightly", "kind": "schedule", "for": "owner"})
         self.assertEqual(at_post[0][0]["argv"], ["--wake", "--agent", "ada", "--place", "lane:nightly", "--id", "w-dddddd", "--for", "owner"])
+
+    def test_a_retried_delivery_hands_over_for_the_id_loom_is_given(self):
+        # A retry re-ids the entry but resends the delivery it kept: the hand-over names the delivery's id.
+        body = {"id": "w-dddddd", "agent": "ada", "venue": "wake", "place": "wake:w-dddddd", "label": "x",
+                "from": {"kind": "schedule"}, "kind": "wake", "at": "2026-01-01T00:00:00Z", "text": "check PR 12"}
+        at_post, posts, _ = self.deliver({**self.base, "id": "w-eeeeee", "origin": "agent:ada", "for": "loren", "delivery": body})
+        self.assertEqual(at_post[0][0]["argv"][:8], ["--wake", "--agent", "ada", "--place", "wake:w-dddddd", "--id", "w-dddddd", "--for"])
+        self.assertEqual(posts[0]["id"], "w-dddddd")
 
     def test_a_hand_over_that_fails_doesnt_stop_the_delivery(self):
         _, posts, logged = self.deliver({**self.base, "for": "owner"}, exit_code=1)
