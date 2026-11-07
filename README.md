@@ -48,12 +48,23 @@ inline prompt.
   set for itself through loom's API. A wake set from a house that says it
   needs loom's machine (`<!-- house: local -->`) is refused, and the clock
   files an approval with the prompt as its words: it runs here only once the
-  owner allows exactly that prompt (`--approval <id>`). This needs the
+  owner allows exactly that prompt (`--approval <id>`). The clock keeps the
+  words it filed (`filed.json`, 8 days), so `wake in 1m --approval <id>` with
+  no `-p` sets exactly them, from any of the agent's houses (or on loom's machine), and spends the
+  approval, with the note it was filed with. `--approval` with other words, another
+  `--note`, a lane file, a full spool, or an id
+  this clock filed no wake for is refused before anything is spent (filed
+  words only: the approval's key is a short hash of them). This needs the
   [approvals piece](https://github.com/sleepunit-agents/loom-approvals).
 - **Parking.** A body blocked on the owner's answer (a secret request `q-…`
   from loom-secrets, an approval `a-…`) parks instead of polling: the clock
   checks the request every 5 minutes with no body running, and wakes the
-  continuation, told the answer, when it comes (or after 24 hours).
+  continuation, told the answer, when it comes (or after 24 hours). Parked on
+  an approval, the clock reads its kind and exact target as filed
+  (`approvals check <id> --json`, only when it is this agent's own) and keeps them with the parked wake; told
+  yes, the continuation is handed the exact way to spend it (`approvals use
+  <id> --kind … --target …`, or for a local wake `wake in 1m --approval <id>`),
+  so it never asks the owner again in its own words.
 - **Stuck sessions.** (A body the runtime runs is the runtime's to stop:
   `LOOM_RUNTIME_STUCK_AFTER`. This is for the sessions the clock still starts
   itself: `WAKE_LOCAL_RUN=session`, or the runtime refusing.) A session the clock started here has nobody at its
@@ -193,7 +204,7 @@ changing a setting, run `wake rearm` to re-arm the pending wakes with it.
   so a wake set there lands in the one spool, never the house's own copy.
   `WAKE_NO_FORWARD=1` keeps it local.
 - **The bundle.** `bundle export` / `bundle import` is the clock's part of
-  loom's household bundle: every agent's spool, schedules and pause, the
+  loom's household bundle: every agent's spool, schedules, pause and filed local-wake words, the
   lanes and the fire mode, encrypted with `age` to the owner's
   recipients (logs stay behind). A restored clock comes up **paused**, since
   the old machine may still be running the same lanes; resume it when this

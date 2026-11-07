@@ -532,6 +532,33 @@ def schedule_for_file(path):
 
 
 def cmd_set(args, when):
+    if getattr(args, "approval", ""):
+        # A local wake the owner allowed is set with the words this clock filed for it, byte for byte, and only those:
+        # a continuation in a later house can't be trusted to retype them, and a body that brings its own words could
+        # bring other words with the same short hash. Other words, or an id this clock filed no wake for, are refused
+        # before anything is spent.
+        if args.prompt_file:
+            sys.exit("wake: --approval is for a local wake the clock asked the owner about, not a lane file (-f)")
+        filed = filed_wakes().get(args.approval)
+        if not filed:
+            sys.exit(f"wake: this clock filed no local wake as {args.approval}. Set the wake again with its words (-p, "
+                     "no --approval): the clock asks the owner and keeps those words for the continuation")
+        if args.prompt and args.prompt != filed["prompt"]:
+            sys.exit(f"wake: {args.approval} was allowed for other words than these. Set it without -p "
+                     f"(wake in 1m --approval {args.approval}): the clock uses exactly the words the owner allowed")
+        # The note too: it's read into the session's opening words, so it's part of what runs, and the owner's card
+        # showed the note it was filed with. A different one is refused, before anything is spent.
+        if args.note and args.note != filed["note"]:
+            sys.exit(f"wake: {args.approval} was filed with its own note; set it without --note (or with exactly that "
+                     "one): a note is part of what the session reads, and the owner allowed that one")
+        args.prompt = filed["prompt"]
+        args.note = filed["note"]
+        # The spool's limit before the spend: a refusal after it would use up the owner's yes for nothing.
+        with Spool() as spool:
+            if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
+                sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
+        if filed.get("target") != f"{AGENT}:{hashlib.sha256(args.prompt.encode()).hexdigest()[:16]}":
+            sys.exit(f"wake: the words this clock kept for {args.approval} don't match what it filed; set the wake again with -p")
     if bool(args.prompt) == bool(args.prompt_file):
         sys.exit("wake: exactly one of --prompt/-p or --prompt-file/-f required")
     if args.prompt and looks_like_path(args.prompt):
@@ -577,7 +604,8 @@ def cmd_set(args, when):
         # A house's wake runs in a house: a steered body mustn't put itself on loom's machine. One
         # that says it needs loom's machine is told so at once (rather than silently sent to a
         # house), and runs there only with the owner's approval, for exactly this prompt.
-        if origin and HOUSE_LOCAL in args.prompt:
+        # With --approval the approval is spent here too (on loom's machine as well), so one Allow runs it once.
+        if (origin or getattr(args, "approval", "")) and HOUSE_LOCAL in args.prompt:
             target = f"{AGENT}:{hashlib.sha256(args.prompt.encode()).hexdigest()[:16]}"
             if not getattr(args, "approval", ""):
                 # The clock files the ask itself, with the prompt as its words: the owner approves what
@@ -589,9 +617,11 @@ def cmd_set(args, when):
                     sys.exit(f"wake: a local wake's prompt is {LOCAL_WAKE_MAX} characters at most, so the owner's card shows "
                              "all of it; say plainly what it does on loom's machine")
                 aid = file_approval("local-wake", target, f"run on loom's machine: {body}", f"set from a house, note: {args.note}")
+                remember_filed(aid, target, args.prompt, args.note)
                 sys.exit("wake: a wake set from a house runs in a house; <!-- house: local --> needs the owner's approval. "
-                         + f"Asked them ({aid}, a card on loom's Home with this prompt). Once it's allowed "
-                           f"(approvals check {aid}), set this wake again with --approval {aid}."
+                         + f"Asked them ({aid}, a card on loom's Home with this prompt). Park on it "
+                           f"(wake park --on {aid} -p \"<what to do next>\" --note …) and end: once it's allowed, the "
+                           f"continuation sets it with `wake in 1m --approval {aid}`, no -p, and the clock uses these exact words."
                          + " Most work needs no host: a house can do it.")
             no = spend_approval(args.approval, "local-wake", target)
             if no:
@@ -624,6 +654,10 @@ def cmd_set(args, when):
         entry["prompt_file"] = str(pf)
     if getattr(args, "park_on", ""):
         entry["kind"], entry["on"] = "parked", args.park_on
+        # What the owner is asked to allow, as filed (kind and exact target): the continuation is handed it whole.
+        card = approval_card(args.park_on) if args.park_on.startswith("a-") else None
+        if card:
+            entry["approval"] = card
         entry["until"] = (datetime.now() + PARK_FOR).strftime(TIME_FMT)
     with Spool() as spool:
         if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
@@ -650,6 +684,88 @@ def cmd_park(args):
     cmd_set(args, datetime.now() + PARK_CHECK)
 
 
+FILED_KEEP = timedelta(days=8)
+
+
+def filed_path():
+    return WAKE_DIR / "filed.json"
+
+
+def filed_wakes():
+    """The local wakes this clock filed approvals for, by approval id: their exact prompt, target and note."""
+    try:
+        d = json.loads(filed_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    cutoff = (datetime.now() - FILED_KEEP).strftime(TIME_FMT)
+    return {k: v for k, v in d.items() if isinstance(v, dict) and isinstance(v.get("prompt"), str) and HOUSE_LOCAL in v["prompt"]
+            and isinstance(v.get("note"), str) and isinstance(v.get("at"), str) and v["at"] >= cutoff}
+
+
+def remember_filed(aid, target, prompt, note):
+    """Keep the words a local wake's approval was filed for, so its continuation sets exactly them (cmd_set). Kept
+    FILED_KEEP: longer than a park waits (PARK_FOR) and than an allowed approval lasts."""
+    WAKE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # the clock's lock, without rewriting the spool
+        d = filed_wakes()
+        d[aid] = {"target": target, "prompt": prompt, "note": note, "at": datetime.now().strftime(TIME_FMT)}
+        tmp = filed_path().with_suffix(f".{os.getpid()}.tmp")
+        tmp.unlink(missing_ok=True)  # a stale one keeps its old mode; O_EXCL makes a fresh 0600 file
+        with os.fdopen(os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "w") as f:
+            f.write(json.dumps(d, indent=1) + "\n")
+        tmp.replace(filed_path())
+    log("local-wake-filed", f"{aid} target={target} note={note!r}")
+
+
+def approval_card(aid):
+    """The approval's kind and exact target as filed (approvals check --json, for the body this runs for), or None
+    when the piece can't say: an older piece, or another agent's approval."""
+    argv = [*approvals_argv(), "check", aid, "--json"]
+    caller = os.environ.get("WAKE_CALLER", "").strip()
+    if caller:
+        argv += ["--as", caller]
+    try:
+        # Short: over the piece API the whole wake call has 12 seconds, and a park without the card still parks.
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5,
+                           env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+        card = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    # Only this clock's agent's own: never another agent's kind and target handed to this one's continuation.
+    if not isinstance(card, dict) or card.get("id") != aid or card.get("agent") != AGENT \
+            or not all(isinstance(card.get(k), str) and card[k] for k in ("kind", "target")):
+        return None
+    return {"kind": card["kind"], "target": card["target"]}
+
+
+def spend_words(rid, card):
+    """How the continuation spends the owner's yes, exactly as filed, so it never asks again in its own words."""
+    filed = filed_wakes().get(rid)
+    if filed:
+        # Quoted for the reader without the house marker: the continuation's own prompt mustn't say it needs loom's
+        # machine (house_ready reads the whole prompt), and it needn't retype the words.
+        words = filed["prompt"]
+        while HOUSE_LOCAL in words:  # a marker split around another comes back whole after one pass
+            words = words.replace(HOUSE_LOCAL, "")
+        words = words.strip()
+        return (f"Pick up where you left off. It's a local wake: set it with exactly `wake in 1m --approval {rid}`, "
+                f"no -p (the clock uses the words it filed for {rid}). What the owner allowed it to do: {words}")
+    if (card or {}).get("kind") == "local-wake":
+        # Its words are gone from this clock (expired, or filed before it kept them): nothing here can set it, and
+        # spending it any other way would use up the owner's yes and run nothing.
+        return (f"The clock no longer has the words {rid} was filed for, so it can't be set from it. Don't spend it: "
+                f"comment on the task what was waiting, set the wake again with its words (-p) so the owner is asked "
+                f"once more, and park on the new id.")
+    if card:
+        return (f"Pick up where you left off, and spend it on exactly the action it allows ({card['kind']} for "
+                f"{card['target']}): `approvals use {rid} --kind {card['kind']} --target {shlex.quote(card['target'])}`, "
+                f"or the tool that asked with this id ({rid}). Don't ask again: any of this agent's bodies spends it, once.")
+    return f"Pick up where you left off, and spend it with --approval {rid} on exactly the action it allows."
+
+
 def request_state(rid):
     """A request's state, read on loom's machine: secrets' q-… or approvals' a-…; 'unknown' if it can't be read."""
     argv = [LOOM, "secrets", "state", rid] if rid.startswith("q-") else [*approvals_argv(), "check", rid]
@@ -668,7 +784,7 @@ def unpark(entry, state):
     if state in ("granted", "allowed"):
         how = (f"Pick up where you left off. A secret: request it again (the secrets piece's `request <name> --why …`), "
                f"and it's granted to this house at once; then get it." if rid.startswith("q-") else
-               f"Pick up where you left off, and spend it with --approval {rid} on exactly the action it allows.")
+               spend_words(rid, entry.get("approval")))
         head = f"The owner allowed {rid}. {how}"
     elif state == "pending":
         head = (f"No answer to {rid} after {PARK_FOR.seconds // 3600 + PARK_FOR.days * 24}h. Leave a comment saying what's "
@@ -1011,10 +1127,10 @@ def cmd_rearm(args):
 
 # ---------------------------------------------------------------- the bundle
 # loom's household bundle (loom docs/extensions.md, "The bundle: a piece's part"):
-# every agent's clock (its spool, schedules and pause) and loom's lanes, encrypted
+# every agent's clock (its spool, schedules, pause and filed local-wake words) and loom's lanes, encrypted
 # by this piece to the owner's recipients. Logs stay behind. Plaintext only on pipes.
 BUNDLE_FORMAT = "loom-clock/1"
-CLOCK_FILES = ("spool.jsonl", "schedules.json", "paused")
+CLOCK_FILES = ("spool.jsonl", "schedules.json", "paused", "filed.json")
 
 
 def age_bin():
