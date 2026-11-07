@@ -2511,5 +2511,202 @@ class StuckSessions(unittest.TestCase):
         self.assertEqual(wake_cli.last_tool_use(other), ("EnterWorktree", '{"path": "/home/art/Art/.worktrees/x"}'))
 
 
+class OnWhoseBehalf(unittest.TestCase):
+    """t-1943: every wake and schedule records whom it's for (`for`): the owner's on loom's machine; over the piece API,
+    what the body's principal statement says once the runtime verifies it for this same agent, else "-" (unknown).
+    The house wrapper's `--principal <statement>` is taken off at the API door, and just before a delivery the clock
+    hands the wake's `for` to the runtime. The runtime's command (WAKE_PRINCIPAL) is a stand-in script here: it records
+    its argv and stdin, and answers what PRINCIPAL_ANSWER / PRINCIPAL_EXIT say."""
+
+    FAKE = """#!/usr/bin/env python3
+import json, os, sys
+stdin = sys.stdin.read() if "--verify" in sys.argv else ""
+with open(os.environ["PRINCIPAL_RECORD"], "a") as f:
+    f.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin}) + "\\n")
+sys.stdout.write(os.environ.get("PRINCIPAL_ANSWER", ""))
+sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
+"""
+    ADA = {"kind": "agent", "agent": "ada"}
+
+    def setUp(self):
+        self.td = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.td, True)
+        self.fake = self.td / "principal"
+        self.fake.write_text(self.FAKE)
+        self.fake.chmod(0o755)
+        self.record = self.td / "principal.jsonl"
+        env = {"WAKE_PRINCIPAL": str(self.fake), "PRINCIPAL_RECORD": str(self.record), "PRINCIPAL_ANSWER": "",
+               "PRINCIPAL_EXIT": "0", "WAKE_ORIGIN": "", "WAKE_CALLER": "", "WAKE_PRINCIPAL_STATEMENT": ""}
+        w = self.td / "clocks" / "ada"
+        self.patches = [
+            mock.patch.dict(wake_cli.os.environ, env),
+            mock.patch.object(wake_cli, "WAKE_DIR", w), mock.patch.object(wake_cli, "SPOOL", w / "spool.jsonl"),
+            mock.patch.object(wake_cli, "LOCK", w / "spool.lock"), mock.patch.object(wake_cli, "LOG", w / "wake.log"),
+            mock.patch.object(wake_cli, "SCHEDULES", w / "schedules.json"), mock.patch.object(wake_cli, "CLOCKS", self.td / "clocks"),
+            mock.patch.object(wake_cli, "PAUSED", w / "paused"), mock.patch.object(wake_cli, "AGENT", "ada"),
+            mock.patch.object(wake_cli, "arm_timer", return_value="armed"), mock.patch.object(wake_cli, "disarm_timer"),
+        ]
+        for p in self.patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in reversed(self.patches)])
+
+    def calls(self):
+        return [json.loads(l) for l in self.record.read_text().splitlines()] if self.record.exists() else []
+
+    def spool(self):
+        f = wake_cli.SPOOL
+        return [json.loads(l) for l in f.read_text().splitlines()] if f.exists() else []
+
+    def cli(self, *argv, statement=None, answer=None, exit_code=0, over_api=True):
+        env = {"PRINCIPAL_ANSWER": json.dumps(answer) if answer is not None else "", "PRINCIPAL_EXIT": str(exit_code)}
+        if over_api:
+            env.update(WAKE_ORIGIN="agent:ada", WAKE_CALLER=json.dumps(self.ADA), WAKE_PRINCIPAL_STATEMENT=statement or "")
+        with mock.patch.dict(wake_cli.os.environ, env), mock.patch.object(wake_cli.sys, "argv", ["wake", *argv]), \
+             contextlib.redirect_stdout(io.StringIO()):
+            try:
+                wake_cli.main()
+            except SystemExit as e:
+                return str(e.code)
+        return None
+
+    def set_for(self, **kw):
+        self.assertIsNone(self.cli("in", "1h", "-p", "check the soak", "--note", "t-1 r1", **kw))
+        return self.spool()[-1]["for"]
+
+    @staticmethod
+    def verified(agent="ada", for_=None, owner=False):
+        return {"ok": True, "agent": agent, "conversation": "cv-0123456789ab", "for": for_, "owner": owner}
+
+    def test_a_wake_set_on_loom_s_machine_is_the_owner_s(self):
+        self.assertEqual(self.set_for(over_api=False), "owner")
+        self.assertEqual(self.calls(), [], "nothing to verify on loom's machine")
+
+    def test_a_wake_set_over_the_api_is_for_whom_its_verified_statement_says(self):
+        self.assertEqual(self.set_for(statement="stmt-owner", answer=self.verified("ada", "jonathan-barket", True)), "owner")
+        (call,) = self.calls()
+        self.assertEqual((call["argv"], call["stdin"]), (["--verify"], "stmt-owner"), "the statement goes on stdin")
+        self.assertEqual(self.set_for(statement="stmt-loren", answer=self.verified("ada", "loren")), "loren")
+        # Another agent's statement, a missing one, a verifier that fails or says no, or a slug that isn't one: unknown.
+        self.assertEqual(self.set_for(statement="stmt-bo", answer=self.verified("bo", "loren", True)), "-")
+        self.assertEqual(self.set_for(statement="stmt-null", answer=self.verified("ada", None)), "-")
+        before = len(self.calls())
+        self.assertEqual(self.set_for(), "-")
+        self.assertEqual(len(self.calls()), before, "no statement: nothing to verify")
+        self.assertEqual(self.set_for(statement="stmt-bad", answer={"ok": False}, exit_code=1), "-")
+        self.assertEqual(self.set_for(statement="stmt-no", answer={**self.verified("ada", "loren"), "ok": False}), "-")
+        self.assertEqual(self.set_for(statement="stmt-weird", answer=self.verified("ada", "../owner")), "-")
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_PRINCIPAL": str(self.td / "missing")}):
+            self.assertEqual(self.set_for(statement="stmt-x", answer=self.verified("ada", "loren", True)), "-")
+        # The statement itself is never written down: only what it verified to.
+        logged = wake_cli.LOG.read_text() + wake_cli.SPOOL.read_text()
+        self.assertNotIn("stmt-", logged)
+
+    def test_a_park_is_for_whom_its_body_works_too(self):
+        with mock.patch.object(wake_cli, "approval_card", return_value=None):
+            self.assertIsNone(self.cli("park", "--on", "a-0000aaaa", "-p", "next", "--note", "t-1 r2",
+                                       statement="s", answer=self.verified("ada", "loren")))
+        self.assertEqual(self.spool()[-1]["for"], "loren")
+
+    def test_the_principal_is_taken_off_at_the_api_door(self):
+        self.assertEqual(wake_cli.split_principal(["list", "--principal", "S"]), (["list"], "S"))
+        self.assertEqual(wake_cli.split_principal(["list", "--principal=S"]), (["list"], "S"))
+        self.assertEqual(wake_cli.split_principal(["list", "--principal", "MINE", "--principal", "S"]), (["list"], "S"))
+        self.assertEqual(wake_cli.split_principal(["in", "1h", "-p", "--principal", "--note", "n"]),
+                         (["in", "1h", "-p", "--principal", "--note", "n"], ""), "only a trailing pair")
+        seen = []
+
+        def child(argv, **kw):
+            seen.append((argv, kw["env"]))
+            return _completed(0, "ok\n")
+        req = {"caller": self.ADA, "path": "run", "body": {"argv": ["list", "--principal", "stmt-1"]}}
+        out = io.StringIO()
+        with mock.patch.object(wake_cli.sys, "stdin", io.StringIO(json.dumps(req))), \
+             mock.patch.object(wake_cli.subprocess, "run", side_effect=child), contextlib.redirect_stdout(out):
+            wake_cli.cmd_api(None)
+        ((argv, env),) = seen
+        self.assertEqual(argv[-3:], ["--agent", "ada", "list"])
+        self.assertEqual((env["WAKE_PRINCIPAL_STATEMENT"], env["WAKE_ORIGIN"]), ("stmt-1", "agent:ada"))
+        self.assertEqual(json.loads(out.getvalue())["status"], 200)
+
+    def test_wake_list_over_the_api_with_a_principal_appended_still_works(self):
+        req = {"caller": self.ADA, "path": "run", "body": {"argv": ["list", "--principal", "stmt-1"]}}
+        out = io.StringIO()
+        with mock.patch.object(wake_cli.sys, "stdin", io.StringIO(json.dumps(req))), contextlib.redirect_stdout(out):
+            wake_cli.cmd_api(None)
+        ans = json.loads(out.getvalue())
+        self.assertEqual((ans["status"], ans["body"]["exit"]), (200, 0), ans)
+        self.assertNotIn("unrecognized", ans["body"]["stderr"])
+        # And typed on loom's machine, it's taken off too.
+        self.assertIsNone(self.cli("list", "--principal", "stmt-1", over_api=False))
+
+    def test_a_schedule_set_over_the_api_carries_its_principal_into_every_occurrence(self):
+        self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", "routines/nightly.md",
+                                   statement="s", answer=self.verified("ada", "loren")))
+        sc = wake_cli.load_schedules()["nightly"]
+        self.assertEqual(sc["for"], "loren")
+        self.assertEqual(self.spool()[-1]["for"], "loren")
+        self.assertEqual(wake_cli.schedule_entry("nightly", sc, wake_cli.datetime.now())["for"], "loren", "the next one too")
+        # Run now by the owner's body: no wider than the schedule's.
+        self.assertIsNone(self.cli("schedule", "run", "nightly", statement="s", answer=self.verified("ada", owner=True)))
+        self.assertEqual(self.spool()[-1]["for"], "loren")
+        # The owner's schedule (set here), run now by a body working for someone else: theirs, not the owner's.
+        self.assertIsNone(self.cli("schedule", "set", "weekly", "--at", "17:47", "-f", "routines/x.md", over_api=False))
+        self.assertEqual(wake_cli.load_schedules()["weekly"]["for"], "owner")
+        self.assertIsNone(self.cli("schedule", "run", "weekly", statement="s", answer=self.verified("ada", "loren")))
+        self.assertEqual(self.spool()[-1]["for"], "loren")
+        self.assertIsNone(self.cli("schedule", "run", "weekly", statement="s", answer=self.verified("ada", owner=True)))
+        self.assertEqual(self.spool()[-1]["for"], "owner")
+        self.assertIsNone(self.cli("schedule", "run", "weekly", over_api=False))
+        self.assertEqual(self.spool()[-1]["for"], "owner")
+
+    def deliver(self, entry, exit_code=0, principal=None):
+        """Fire `entry` into a delivery: (hand-over calls seen when the POST went, the posts, the log)."""
+        posts, at_post = [], []
+        tok = self.td / "token"
+        tok.write_text("clock-token\n")
+        env = {"WAKE_FIRE": "house", "WAKE_DELIVERY": "deliver", "WAKE_DELIVER_TOKEN_FILE": str(tok),
+               "PRINCIPAL_EXIT": str(exit_code), **({"WAKE_PRINCIPAL": principal} if principal else {})}
+        wake_cli.SPOOL.parent.mkdir(parents=True, exist_ok=True)
+        wake_cli.SPOOL.write_text(json.dumps(entry) + "\n")
+        self.record.unlink(missing_ok=True)
+
+        def post(b):
+            at_post.append(self.calls())
+            posts.append(b)
+            return 200, {"conversation": "cv-0123456789ab", "seq": 1, "body": "started"}
+        with mock.patch.dict(wake_cli.os.environ, env), mock.patch.object(wake_cli, "ensure_deadman"), \
+             mock.patch.object(wake_cli, "post_delivery", post), mock.patch.object(wake_cli, "dispatch") as dispatch:
+            wake_cli.cmd_fire(mock.Mock(id=entry["id"]))
+        dispatch.assert_not_called()
+        return at_post, posts, wake_cli.LOG.read_text() if wake_cli.LOG.exists() else ""
+
+    base = {"id": "w-dddddd", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "t-9 round 2", "model": "m",
+            "created": "x", "prompt": "check PR 12"}
+
+    def test_a_delivery_hands_over_whom_the_wake_is_for_first(self):
+        at_post, posts, _ = self.deliver({**self.base, "origin": "agent:ada", "for": "loren"})
+        (seen,) = at_post
+        self.assertEqual([c["argv"] for c in seen],
+                         [["--wake", "--agent", "ada", "--place", "wake:w-dddddd", "--for", "loren"]], "before the POST")
+        self.assertEqual(posts[0]["place"], "wake:w-dddddd")
+        at_post, *_ = self.deliver({**self.base, "schedule": "nightly", "kind": "schedule", "for": "owner"})
+        self.assertEqual(at_post[0][0]["argv"], ["--wake", "--agent", "ada", "--place", "lane:nightly", "--for", "owner"])
+
+    def test_a_hand_over_that_fails_doesnt_stop_the_delivery(self):
+        _, posts, logged = self.deliver({**self.base, "for": "owner"}, exit_code=1)
+        self.assertEqual(len(posts), 1)
+        self.assertIn("principal-fail | wake:w-dddddd for=owner: exit 1", logged)
+        _, posts, logged = self.deliver({**self.base, "for": "owner"}, principal=str(self.td / "missing"))
+        self.assertEqual(len(posts), 1)
+        self.assertIn("didn't run", logged)
+
+    def test_a_wake_from_before_hands_over_owner_or_unknown_by_where_it_was_set(self):
+        at_post, *_ = self.deliver(dict(self.base))
+        self.assertEqual(at_post[0][0]["argv"][-2:], ["--for", "owner"])
+        at_post, *_ = self.deliver({**self.base, "origin": "agent:ada"})
+        self.assertEqual(at_post[0][0]["argv"][-2:], ["--for", "-"])
+        self.assertEqual(wake_cli.entry_for({"for": "../x"}), "-")
+
+
 if __name__ == "__main__":
     unittest.main()

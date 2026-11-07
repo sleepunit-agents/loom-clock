@@ -71,8 +71,15 @@ so a background session the wake started survives the service's cgroup cleanup).
 Settings (environment; a managed piece gets them from loom, see README.md):
   WAKE_DATA, WAKE_LOCAL_AGENT, WAKE_REPO, WAKE_LANE_DIRS, WAKE_AGENTS, WAKE_FIRE,
   WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_STUCK_AFTER, WAKE_TASK_COMMENT, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
-  WAKE_PREAMBLE_FILE, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS,
+  WAKE_PREAMBLE_FILE, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS, WAKE_PRINCIPAL,
   WAKE_DELIVERY, WAKE_DELIVER_TOKEN_FILE, WAKE_LOOM_URL, WAKE_LOCAL_RUN
+
+On whose behalf (t-1943): every wake and schedule records `for`, whom it is for. Set on loom's machine, the owner's;
+set over the piece API, what the body's principal statement says once loom's runtime verifies it (`WAKE_PRINCIPAL
+--verify`, default `loom runtime principal`) and it names the calling agent: "owner", a person's slug, else "-"
+(unknown). The house wrapper appends `--principal <statement>` to every clock call; the API door takes it off. Just
+before a delivery the clock hands the wake's `for` to the runtime (`--wake --agent … --place … --for …`), so a wake
+can't turn someone else's request into the owner's.
 """
 
 import argparse
@@ -221,7 +228,7 @@ TIME_FMT = "%Y-%m-%d %H:%M:%S"
 TIMER_ENV = ("PATH", "HOME", "LOOM_HOME", "LOOM_PIECE_NAME", "LOOM_PIECE_HOME", "LOOM_URL", "LOOM_TOKEN_FILE",
              "WAKE_DATA", "WAKE_LOCAL_AGENT", "WAKE_REPO", "WAKE_LANE_DIRS", "WAKE_AGENTS", "WAKE_FIRE", "WAKE_MODEL",
              "WAKE_SESSION_COMMAND", "WAKE_STUCK_AFTER", "WAKE_TASK_COMMENT", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
-             "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS",
+             "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS", "WAKE_PRINCIPAL",
              "WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL", "WAKE_LOCAL_RUN")
 
 
@@ -243,6 +250,108 @@ def lane_dirs_text():
 def approvals_argv():
     """The approvals piece, as loom reaches it (`loom approvals`), unless WAKE_APPROVALS names it."""
     return argv_setting("WAKE_APPROVALS", [LOOM, "approvals"])
+
+
+# ─── On whose behalf (t-1943) ──────────────────────────────────────────────
+# The owner's standing permissions (his merge rules, say) cover work a body does for him; work it does for someone
+# else (a person who messaged it in Slack or Discord) needs that person's own grant, or it asks. Who a body acts for is
+# its principal, and loom's runtime is the root of trust for it. A wake keeps the principal of the body that set it, so
+# a wake can't turn a non-owner's request into the owner's: `for` on every wake and schedule is "owner", a person's
+# slug, or "-" (unknown, which the runtime treats as not the owner).
+PRINCIPAL_SLUG = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+PRINCIPAL_TIMEOUT_S = 5
+
+
+def principal_argv():
+    """The runtime's principal command (`loom runtime principal`), unless WAKE_PRINCIPAL names it."""
+    return argv_setting("WAKE_PRINCIPAL", [LOOM, "runtime", "principal"])
+
+
+def split_principal(argv):
+    """argv without the `--principal <statement>` the house wrapper appends to every clock call from a body that has
+    one, and that statement ("" when there's none). Only trailing pairs: the wrapper appends, so one in the middle is a
+    body's own words, and argparse refuses it. With more than one, the last is the wrapper's."""
+    argv, statement = list(argv), ""
+    while True:
+        if len(argv) >= 2 and argv[-2] == "--principal":
+            statement = statement or argv[-1]
+            argv = argv[:-2]
+        elif argv and argv[-1].startswith("--principal="):
+            statement = statement or argv[-1].split("=", 1)[1]
+            argv = argv[:-1]
+        else:
+            return argv, statement
+
+
+def caller_agent():
+    """The agent the piece API says is calling: its origin (`agent:<name>`), else WAKE_CALLER's agent."""
+    origin = os.environ.get("WAKE_ORIGIN", "").strip()
+    if origin.startswith("agent:"):
+        return origin.split(":", 1)[1]
+    try:
+        caller = json.loads(os.environ.get("WAKE_CALLER") or "{}")
+    except ValueError:
+        return None
+    return caller.get("agent") if isinstance(caller, dict) and caller.get("kind") == "agent" else None
+
+
+def verify_principal(statement):
+    """The runtime's reading of a principal statement (`<cmd> --verify`, the statement on stdin): its verified fields,
+    or None when it's invalid or can't be read. The statement itself is never logged or printed: only these fields."""
+    try:
+        r = subprocess.run([*principal_argv(), "--verify"], input=statement, capture_output=True, text=True,
+                           timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+        v = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, SystemExit):  # SystemExit: WAKE_PRINCIPAL malformed
+        return None
+    return v if isinstance(v, dict) and v.get("ok") is True else None
+
+
+def principal_for():
+    """Whom a wake or schedule set by this run is for. On loom's machine (no WAKE_ORIGIN, the owner's own account and
+    the household's lanes): the owner. Over the piece API: what the caller's verified statement says, when it is this
+    same agent's ("owner", or the person's slug); no statement, one that doesn't verify, or one for another agent: "-"."""
+    if not os.environ.get("WAKE_ORIGIN", "").strip():
+        return "owner"
+    statement = os.environ.get("WAKE_PRINCIPAL_STATEMENT", "")
+    v = verify_principal(statement) if statement else None
+    agent = caller_agent()
+    if not v or not agent or v.get("agent") != agent:
+        return "-"
+    if v.get("owner") is True:
+        return "owner"
+    return v["for"] if isinstance(v.get("for"), str) and PRINCIPAL_SLUG.match(v["for"]) else "-"
+
+
+def narrower(a, b):
+    """The narrower of two principals: the owner's is the widest, and two different people make it unknown."""
+    if a == b or b == "owner":
+        return a
+    return b if a == "owner" else "-"
+
+
+def entry_for(entry):
+    """A wake's principal; one set before t-1943 has none: the owner's when it was set on loom's machine, else unknown."""
+    v = entry.get("for")
+    if v is None:
+        return "-" if entry.get("origin") else "owner"
+    return v if v in ("owner", "-") or (isinstance(v, str) and PRINCIPAL_SLUG.match(v)) else "-"
+
+
+def hand_over_principal(agent, place, for_):
+    """Tell the runtime whom the wake about to be delivered is for (`<cmd> --wake --agent … --place … --for …`). Not
+    fatal: a failure is logged, the delivery goes ahead, and the runtime treats the wake as unknown (it fails closed)."""
+    try:
+        r = subprocess.run([*principal_argv(), "--wake", "--agent", agent, "--place", place, "--for", for_],
+                           capture_output=True, text=True, timeout=PRINCIPAL_TIMEOUT_S, stdin=subprocess.DEVNULL,
+                           env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+    except (OSError, subprocess.SubprocessError, SystemExit) as e:  # SystemExit: WAKE_PRINCIPAL malformed
+        log("principal-fail", f"{place} for={for_}: the runtime's principal command didn't run ({e}); delivered as unknown")
+        return False
+    if r.returncode != 0:
+        log("principal-fail", f"{place} for={for_}: exit {r.returncode} {(r.stderr or '').strip()[:200]}; delivered as unknown")
+        return False
+    return True
 
 
 PREAMBLE = """You are {name}, waking from a self-set alarm {where} \
@@ -431,6 +540,7 @@ def ensure_deadman(spool):
         "note": "dead-man default: spool emptied",
         "prompt": DEADMAN_PROMPT,
         "model": DEFAULT_MODEL,
+        "for": "owner",  # the clock's own default, with its own fixed words: nobody's request
         "created": datetime.now().strftime(TIME_FMT),
     }
     spool.entries.append(entry)
@@ -515,7 +625,8 @@ def schedule_entry(name, sched, at):
         "model": sched.get("model") or DEFAULT_MODEL,
         "created": datetime.now().strftime(TIME_FMT),
     }
-    for k in ("prompt", "prompt_file", "lane", "origin", "slot"):
+    # Its principal goes with it, like its origin: an occurrence is for whomever the schedule was set for.
+    for k in ("prompt", "prompt_file", "lane", "origin", "for", "slot"):
         if sched.get(k):
             entry[k] = sched[k]
     return entry
@@ -584,6 +695,8 @@ def cmd_set(args, when):
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     if origin:
         entry["origin"] = origin
+    # On whose behalf: the owner's on loom's machine, else what the body's verified principal says (or unknown).
+    entry["for"] = principal_for()
     place = (getattr(args, "place", "") or "").strip()
     if place:
         # A place is a conversation: what's delivered there feeds the body that has it. Set here, on loom's machine,
@@ -879,6 +992,9 @@ def cmd_schedule(args):
         if caller:
             # An agent running an owner-set schedule still only runs it in a house.
             entry["origin"] = caller
+            # And for no one wider than both: a body working for someone else can't run the owner's schedule as the
+            # owner's, nor the owner's body someone else's as his. On loom's machine it stays the schedule's own.
+            entry["for"] = narrower(entry_for(scheds[args.name]), principal_for())
         with Spool() as spool:
             if sum(1 for e in spool.entries if e["kind"] == "wake") >= MAX_PENDING:
                 sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
@@ -919,6 +1035,8 @@ def cmd_schedule(args):
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     if origin:
         sc["origin"] = origin
+    # A loom lane is set here too, on loom's machine: the owner's. Over the API, the caller's verified principal.
+    sc["for"] = principal_for()
     if args.slot:
         if not SLOT_NAME.match(args.slot):
             sys.exit(f"wake: --slot is lowercase letters, digits and dashes, not {args.slot!r}")
@@ -1244,7 +1362,8 @@ def cmd_now(args):
     who = os.environ.get("WAKE_BY") or "the owner"
     entry = {"id": "w-" + secrets.token_hex(3), "kind": "wake", "now": True,
              "at": datetime.now().strftime(TIME_FMT), "note": args.note or "woken now from loom",
-             "prompt": NOW_PROMPT.format(who=who), "model": DEFAULT_MODEL, "created": datetime.now().strftime(TIME_FMT)}
+             "prompt": NOW_PROMPT.format(who=who), "model": DEFAULT_MODEL, "created": datetime.now().strftime(TIME_FMT),
+             "for": "owner"}  # loom's page, on loom's machine (not a verb the piece API passes)
     with Spool() as spool:
         for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
             disarm_timer(dm["id"])
@@ -1537,6 +1656,10 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
                 "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text[:DELIVER_TEXT_MAX],
                 **({"local": True} if local else {})}
+    # Whom it's for, handed to the runtime before the delivery it belongs to (t-1943). Not fatal: without it the
+    # runtime treats the wake as unknown. (A wake that goes the old way, a spawned house or a session here, has no
+    # runtime record to hand it to: there it's unknown.)
+    hand_over_principal(agent, body["place"], entry_for(entry))
     status, ans = post_delivery(body)
     err = str(ans.get("error") or ans.get("reason") or "")[:200]
     if auto and status == 503 and NO_DELIVERY in err:
@@ -2146,8 +2269,18 @@ def cmd_api(_args):
     except ValueError:
         request = None
 
+    # The house wrapper appends `--principal <statement>` to every clock call from a body that has one (`wake list` too):
+    # taken off here, at the door, before anything reads the argv, and handed to the run on its own, to verify.
+    statement = ""
+    body = request.get("body") if isinstance(request, dict) else None
+    if isinstance(body, dict) and isinstance(body.get("argv"), list) and all(isinstance(a, str) for a in body["argv"]):
+        body["argv"], statement = split_principal(body["argv"])
+        if len(statement) > 64 * 1024 or "\0" in statement:
+            statement = ""
+
     def run(argv, origin, agent):
-        env = {**os.environ, "WAKE_ORIGIN": origin, "WAKE_CALLER": json.dumps(request.get("caller") or {}) if isinstance(request, dict) else ""}
+        env = {**os.environ, "WAKE_ORIGIN": origin, "WAKE_CALLER": json.dumps(request.get("caller") or {}) if isinstance(request, dict) else "",
+               "WAKE_PRINCIPAL_STATEMENT": statement}
         r = subprocess.run([sys.executable, str(SELF), "--agent", agent, *argv], capture_output=True, text=True,
                            cwd=REPO if REPO.is_dir() else HOME, stdin=subprocess.DEVNULL, timeout=12, env=env)
         return r.returncode, r.stdout, r.stderr
@@ -3130,6 +3263,9 @@ def main():
     # command goes to the clock piece instead (WAKE_NO_FORWARD=1 keeps it here).
     if os.environ.get("HOUSE_ID") and not os.environ.get("WAKE_NO_FORWARD"):
         forward("clock", sys.argv[1:])
+    # A `--principal <statement>` typed here (or left on by a wrapper) needs nothing on loom's machine, where a wake is
+    # the owner's: taken off like the API door does. Over the API the statement comes in WAKE_PRINCIPAL_STATEMENT.
+    sys.argv[1:], _ = split_principal(sys.argv[1:])
     ap = argparse.ArgumentParser(prog="wake", description=__doc__, allow_abbrev=False,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--agent", default=os.environ.get("WAKE_AGENT") or LOCAL_AGENT,
