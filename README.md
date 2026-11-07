@@ -119,6 +119,53 @@ inline prompt.
   owner hears of it once a day. `WAKE_LOCAL_RUN=session` is the way back: a
   local wake is a session again, delivered only when it names its place.
   `WAKE_DELIVERY=spawn` puts every wake back on the old way.
+- **On whose behalf, the runtime's answer.** `--verify` answers
+  `{ok, agent, conversation, for, owner, people, exp}`: `owner` is true or
+  false (true: every voice that conversation heard was one of the agent's
+  owners, the members who own it), `for` a person's slug or null. The clock
+  takes it only when `ok` is true and `agent` is the calling agent; a `for` of
+  `owner` without `owner: true` is a person by that name, and unknown here.
+  The hand-over names the delivery's id, so a word for a wake that's never
+  delivered is never another wake's. A run verifies once and uses that answer
+  for the wake, its approval and its spend.
+- **Here, and set again.** On loom's machine a wake is the owner's, except
+  one set by a body the runtime runs here (a local wake, in a conversation:
+  `LOOM_BODY_CONVERSATION`): it fetches its own statement and is whom that
+  says, unknown if the runtime can't say. A schedule set again (the page's
+  edit sheet, a body's re-set) is never wider than it was: the owner's edit of
+  one a body set for Loren keeps it Loren's (one from before this change that
+  a body set is unknown, and stays so); remove it and set it anew to make it
+  his. The local-body rule rests on the runtime's environment
+  (`LOOM_BODY_CONVERSATION`, which loom-box gives every body it runs), and a
+  body on loom's machine chooses its children's environment: like everything
+  else on loom's machine, that's the owner's account, and not bound here.
+- **Spending on loom's machine.** `wake in … --approval <id>` run on loom's
+  machine itself calls the approvals bin there with no `--as`: approvals
+  reads the call's principal itself (the owner's own work, or, for a local
+  body, its conversation's, fetched by approvals from the runtime). So an
+  approval asked from a house for someone else is refused there: it's spent
+  from a house acting for them. `wake schedule run` here is narrowed the same
+  way as over the API.
+- **On whose behalf** (t-1943). The owner's standing permissions (his merge
+  rules, say) cover work a body does for him; work it does for someone else (a
+  person who messaged it in Slack or Discord) needs that person's own grant, or
+  it asks. Who a body acts for is its *principal*, and loom's runtime is the
+  root of trust for it. So every wake and schedule records `for`, and every
+  occurrence a schedule arms copies it: set on loom's machine (the owner's own
+  account, and the household's lanes), `owner`; set over the piece API, what
+  the body's principal statement says once the runtime verifies it
+  (`WAKE_PRINCIPAL --verify`, the statement on stdin) and it names the calling
+  agent: `owner`, the person's slug, else `-` (unknown). No statement, one that
+  doesn't verify, or one for another agent is `-`. The house wrapper appends
+  `--principal <statement>` to every clock call from a body that has one; the
+  API door takes it off before anything reads the argv. An agent running a
+  schedule now gets no wider a `for` than the schedule's own. Just before a
+  delivery the clock hands the wake's `for` to the runtime (`WAKE_PRINCIPAL
+  --wake --agent … --place … --for …`); if that fails it's logged and the
+  delivery goes ahead, and the runtime treats the wake as unknown. A wake set
+  before this has no `for`: the owner's if it was set here, else unknown. A wake
+  that goes the old way (a spawned house, a session here) has no runtime record
+  to hand it to, so it's unknown there. The statement itself is never logged.
 - **Relays** between agents moved to loom's runtime (loom
   `docs/specs/agent-runtime.md`, "Agent-to-agent relay"): its `relay` MCP
   tool, or `loom runtime relay` from a house. Pairing is the runtime's
@@ -168,6 +215,7 @@ from a `oneshot` user unit.
 | `WAKE_PREAMBLE_FILE` | the piece's own | The words every wake starts with: `{name} {where} {id} {kind} {created} {note} {lanes} {body}` |
 | `WAKE_DELIVERY` | `deliver` when `WAKE_DELIVER_TOKEN_FILE` is set and a piece offers delivery, else `spawn` | `deliver`: a house wake goes through loom's `deliver`. `spawn`: the clock asks loom-box for the house itself, as before |
 | `WAKE_DELIVER_TOKEN_FILE` | none | A file holding a piece token of this clock's (`loom token create --piece clock/<name> --label …`), to deliver with |
+| `WAKE_PRINCIPAL` | `loom runtime principal` | loom's runtime's principal command (a command line or a JSON list): `--verify` reads a body's principal statement on stdin, `--wake --agent … --place … --id … --for …` hands over whom that delivered wake is for (see "On whose behalf") |
 | `WAKE_LOOM_URL` | `http://127.0.0.1:8787` | loom's address for its HTTP API, as this machine reaches it (an MCP URL's `/mcp` is dropped) |
 
 Read from the environment only: `WAKE_HOUSEHOLD` (default

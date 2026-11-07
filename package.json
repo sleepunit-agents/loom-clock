@@ -122,6 +122,11 @@
         "hint": "a file holding a piece token of this clock's (loom token create --piece clock/<name>)"
       },
       {
+        "name": "WAKE_PRINCIPAL",
+        "label": "loom's runtime's principal command",
+        "hint": "verifies whom a body acts for (--verify) and hands over whom a delivered wake is for (--wake); default loom runtime principal"
+      },
+      {
         "name": "WAKE_LOOM_URL",
         "label": "loom's address, as this machine reaches it",
         "default": "http://127.0.0.1:8787"
