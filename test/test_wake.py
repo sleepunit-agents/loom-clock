@@ -450,7 +450,9 @@ class AgentWakes(unittest.TestCase):
             err, _ = self.set_(["in", "1h", "-p", "x" * 300 + " <!-- house: local -->", "--note", "t-1 r2"])
         self.assertIn("characters at most", err or "")
         refuse = lambda aid, kind, target: "" if aid == "a-12345678" and kind == "local-wake" else f"{aid} was asked by ada in h-1, not by bo in h-2"
-        filed = {a: {"prompt": "push the agent <!-- house: local -->", "note": "t-1 r1", "target": "-"} for a in ("a-12345678", "a-99999999")}
+        words = "push the agent <!-- house: local -->"
+        filed = {a: {"prompt": words, "note": "t-1 r1", "target": "ada:" + wake_cli.hashlib.sha256(words.encode()).hexdigest()[:16]}
+                 for a in ("a-12345678", "a-99999999")}
         with mock.patch.object(wake_cli, "spend_approval", refuse), mock.patch.object(wake_cli, "filed_wakes", return_value=filed):
             # A refusal says the piece's reason, not just no.
             err, _ = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1", "--approval", "a-99999999"])
@@ -1089,7 +1091,13 @@ class Clocks(unittest.TestCase):
         [e] = [e for e in self.spool() if e["kind"] == "parked"]
         wake_cli.unpark(e, "allowed")
         self.assertIn("`wake in 1m --approval a-3a2b3c4d`", e["prompt"])
-        self.assertIn(prompt, e["prompt"])
+        self.assertIn("check the disks", e["prompt"])
+        # The continuation itself runs where any continuation runs: the quote carries no house marker.
+        self.assertNotIn(wake_cli.HOUSE_LOCAL, e["prompt"])
+        self.assertTrue(wake_cli.house_ready(e, e["prompt"]))
+        # A card whose id isn't the one parked on is nobody's.
+        with mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=wake_cli.json.dumps({**card, "id": "a-6a2b3c4d"}), stderr="")):
+            self.assertIsNone(wake_cli.approval_card("a-3a2b3c4d"))
 
     def test_a_resumed_wakes_note_says_the_answer_in_words_once(self):
         # Was "unparked (a-24e194de allowed): DNS health check" on loom's pages.

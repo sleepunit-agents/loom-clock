@@ -548,6 +548,8 @@ def cmd_set(args, when):
                      f"(wake in 1m --approval {args.approval}): the clock uses exactly the words the owner allowed")
         args.prompt = filed["prompt"]
         args.note = args.note or filed["note"]
+        if filed.get("target") != f"{AGENT}:{hashlib.sha256(args.prompt.encode()).hexdigest()[:16]}":
+            sys.exit(f"wake: the words this clock kept for {args.approval} don't match what it filed; set the wake again with -p")
     if bool(args.prompt) == bool(args.prompt_file):
         sys.exit("wake: exactly one of --prompt/-p or --prompt-file/-f required")
     if args.prompt and looks_like_path(args.prompt):
@@ -688,8 +690,9 @@ def filed_wakes():
         return {}
     if not isinstance(d, dict):
         return {}
+    cutoff = (datetime.now() - FILED_KEEP).strftime(TIME_FMT)
     return {k: v for k, v in d.items() if isinstance(v, dict) and isinstance(v.get("prompt"), str) and HOUSE_LOCAL in v["prompt"]
-            and isinstance(v.get("note"), str)}
+            and isinstance(v.get("note"), str) and isinstance(v.get("at"), str) and v["at"] >= cutoff}
 
 
 def remember_filed(aid, target, prompt, note):
@@ -699,8 +702,6 @@ def remember_filed(aid, target, prompt, note):
     with open(LOCK, "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)  # the clock's lock, without rewriting the spool
         d = filed_wakes()
-        cutoff = (datetime.now() - FILED_KEEP).strftime(TIME_FMT)
-        d = {k: v for k, v in d.items() if v.get("at", "") >= cutoff}
         d[aid] = {"target": target, "prompt": prompt, "note": note, "at": datetime.now().strftime(TIME_FMT)}
         tmp = filed_path().with_suffix(".tmp")
         with os.fdopen(os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600), "w") as f:
@@ -717,7 +718,8 @@ def approval_card(aid):
     if caller:
         argv += ["--as", caller]
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+        # Short: over the piece API the whole wake call has 12 seconds, and a park without the card still parks.
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=5,
                            env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
         card = json.loads(r.stdout) if r.returncode == 0 else None
     except (OSError, subprocess.SubprocessError, ValueError):
@@ -732,10 +734,12 @@ def approval_card(aid):
 def spend_words(rid, card):
     """How the continuation spends the owner's yes, exactly as filed, so it never asks again in its own words."""
     filed = filed_wakes().get(rid)
-    if filed or (card or {}).get("kind") == "local-wake":
-        words = f" These are the words the owner allowed:\n\n{filed['prompt']}\n" if filed else ""
+    if filed:
+        # Quoted for the reader without the house marker: the continuation's own prompt mustn't say it needs loom's
+        # machine (house_ready reads the whole prompt), and it needn't retype the words.
+        words = filed["prompt"].replace(HOUSE_LOCAL, "").strip()
         return (f"Pick up where you left off. It's a local wake: set it with exactly `wake in 1m --approval {rid}`, "
-                f"no -p (the clock uses the words it filed for {rid}).{words}")
+                f"no -p (the clock uses the words it filed for {rid}). What the owner allowed it to do: {words}")
     if card:
         return (f"Pick up where you left off, and spend it on exactly the action it allows ({card['kind']} for "
                 f"{card['target']}): `approvals use {rid} --kind {card['kind']} --target {shlex.quote(card['target'])}`, "
@@ -1104,7 +1108,7 @@ def cmd_rearm(args):
 
 # ---------------------------------------------------------------- the bundle
 # loom's household bundle (loom docs/extensions.md, "The bundle: a piece's part"):
-# every agent's clock (its spool, schedules and pause) and loom's lanes, encrypted
+# every agent's clock (its spool, schedules, pause and filed local-wake words) and loom's lanes, encrypted
 # by this piece to the owner's recipients. Logs stay behind. Plaintext only on pipes.
 BUNDLE_FORMAT = "loom-clock/1"
 CLOCK_FILES = ("spool.jsonl", "schedules.json", "paused", "filed.json")

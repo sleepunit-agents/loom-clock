@@ -203,7 +203,7 @@ changing a setting, run `wake rearm` to re-arm the pending wakes with it.
   so a wake set there lands in the one spool, never the house's own copy.
   `WAKE_NO_FORWARD=1` keeps it local.
 - **The bundle.** `bundle export` / `bundle import` is the clock's part of
-  loom's household bundle: every agent's spool, schedules and pause, the
+  loom's household bundle: every agent's spool, schedules, pause and filed local-wake words, the
   lanes and the fire mode, encrypted with `age` to the owner's
   recipients (logs stay behind). A restored clock comes up **paused**, since
   the old machine may still be running the same lanes; resume it when this
