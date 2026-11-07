@@ -48,12 +48,20 @@ inline prompt.
   set for itself through loom's API. A wake set from a house that says it
   needs loom's machine (`<!-- house: local -->`) is refused, and the clock
   files an approval with the prompt as its words: it runs here only once the
-  owner allows exactly that prompt (`--approval <id>`). This needs the
+  owner allows exactly that prompt (`--approval <id>`). The clock keeps the
+  words it filed (`filed.json`, 8 days), so `wake in 1m --approval <id>` with
+  no `-p` sets exactly them, from any of the agent's houses; other words with
+  that id are refused before anything is spent. This needs the
   [approvals piece](https://github.com/sleepunit-agents/loom-approvals).
 - **Parking.** A body blocked on the owner's answer (a secret request `q-…`
   from loom-secrets, an approval `a-…`) parks instead of polling: the clock
   checks the request every 5 minutes with no body running, and wakes the
-  continuation, told the answer, when it comes (or after 24 hours).
+  continuation, told the answer, when it comes (or after 24 hours). Parked on
+  an approval, the clock reads its kind and exact target as filed
+  (`approvals check <id> --json`) and keeps them with the parked wake; told
+  yes, the continuation is handed the exact way to spend it (`approvals use
+  <id> --kind … --target …`, or for a local wake `wake in 1m --approval <id>`),
+  so it never asks the owner again in its own words.
 - **Stuck sessions.** (A body the runtime runs is the runtime's to stop:
   `LOOM_RUNTIME_STUCK_AFTER`. This is for the sessions the clock still starts
   itself: `WAKE_LOCAL_RUN=session`, or the runtime refusing.) A session the clock started here has nobody at its

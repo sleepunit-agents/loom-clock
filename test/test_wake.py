@@ -387,6 +387,10 @@ class FireMode(unittest.TestCase):
         self.assertEqual(r.returncode, 127)
 
 
+def json_keys(path):
+    return set(wake_cli.json.loads(Path(path).read_text()))
+
+
 class AgentWakes(unittest.TestCase):
     """A wake set by an agent (WAKE_ORIGIN, from the piece API): its -f is a
     lane file, read the way argparse reads it, and it only fires into a house."""
@@ -453,6 +457,44 @@ class AgentWakes(unittest.TestCase):
             err, entries = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1", "--approval", "a-12345678"])
         self.assertIsNone(err, err)
         self.assertEqual(entries[0]["local_approval"], "a-12345678")
+
+    def test_an_allowed_local_wake_is_set_again_from_the_words_the_owner_allowed(self):
+        # 2026-11-06: a parked body's continuation couldn't reproduce the prompt byte for byte, so its hash missed and
+        # the owner was asked twice. The clock keeps the words it filed; --approval alone sets exactly those.
+        prompt = "Run bin/units-install on loom's machine  \n<!-- house: local -->"
+        target = "ada:" + wake_cli.hashlib.sha256(prompt.encode()).hexdigest()[:16]
+        spent = []
+        spend = lambda aid, kind, target: spent.append((aid, kind, target)) or ""
+        with tempfile.TemporaryDirectory() as td:
+            def set_(argv):
+                with mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "agent:ada"}), \
+                     mock.patch.object(wake_cli, "AGENT", "ada"), mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
+                     mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+                     mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+                     mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+                     mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+                     mock.patch.object(wake_cli, "file_approval", return_value="a-0000aaaa"), \
+                     mock.patch.object(wake_cli, "spend_approval", spend), \
+                     mock.patch.object(wake_cli.sys, "argv", ["wake", *argv]):
+                    try:
+                        wake_cli.main()
+                    except SystemExit as e:
+                        return str(e.code)
+            err = set_(["in", "1h", "-p", prompt, "--note", "t-1 install"])
+            self.assertIn("wake park --on a-0000aaaa", err or "")
+            # Words that aren't the filed ones are refused before anything is spent, saying how to set it.
+            err = set_(["in", "1m", "-p", prompt.replace("  ", " "), "--note", "t-1 install", "--approval", "a-0000aaaa"])
+            self.assertIn("without -p", err or "")
+            self.assertEqual(spent, [])
+            # An approval this clock filed no wake for can't be set without its words.
+            self.assertIn("-p", set_(["in", "1m", "--approval", "a-9999bbbb", "--note", "x"]) or "")
+            # --approval alone: the filed words, spent for exactly their hash, and the note comes with them.
+            self.assertIsNone(set_(["in", "1m", "--approval", "a-0000aaaa"]))
+            self.assertEqual(spent, [("a-0000aaaa", "local-wake", target)])
+            [e] = [wake_cli.json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
+            self.assertEqual((e["prompt"], e["note"], e["local_approval"]), (prompt, "t-1 install", "a-0000aaaa"))
+            # Another agent's clock has no record of it.
+            self.assertEqual(json_keys(Path(td) / "filed.json"), {"a-0000aaaa"})
 
     def test_an_allowed_local_wake_runs_on_loom_s_machine(self):
         entry = {"id": "w-aaaaaa", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "n",
@@ -995,6 +1037,47 @@ class Clocks(unittest.TestCase):
             l.replace(p["until"], "2000-01-01 00:00:00") for l in lines) + "\n")
         fire("pending")
         self.assertIn("No answer to a-2a2b3c4d", fired[-1])
+
+    def test_a_park_on_an_approval_hands_the_continuation_exactly_what_to_spend_it_on(self):
+        # The continuation runs in a later house, often hours on; it's handed the kind and target as filed, so it
+        # spends the owner's yes instead of asking again in its own words.
+        merge = "github:acme/app#12@" + "a" * 40
+        card = {"id": "a-1a2b3c4d", "state": "pending", "kind": "merge", "target": merge}
+        calls = []
+        def run(argv, **kw):
+            calls.append(argv)
+            return mock.Mock(returncode=0, stdout=wake_cli.json.dumps(card) + "\n", stderr="")
+        with mock.patch.object(wake_cli.subprocess, "run", run), \
+             mock.patch.dict(wake_cli.os.environ, {"WAKE_CALLER": '{"kind": "agent", "agent": "ada", "house": "h-9"}'}):
+            self.assertIsNone(self.cli("park", "--on", "a-1a2b3c4d", "-p", "merge it", "--note", "t-1 merge"))
+        self.assertEqual(calls[0][-5:], ["check", "a-1a2b3c4d", "--json", "--as", '{"kind": "agent", "agent": "ada", "house": "h-9"}'])
+        [e] = [e for e in self.spool() if e["kind"] == "parked"]
+        self.assertEqual(e["approval"], {"kind": "merge", "target": merge})
+        wake_cli.unpark(e, "allowed")
+        self.assertIn(f"approvals use a-1a2b3c4d --kind merge --target '{merge}'", e["prompt"])
+        self.assertIn("merge it", e["prompt"])
+        # Told no: nothing to spend, and no spend line.
+        e = {"on": "a-1a2b3c4d", "prompt": "merge it", "note": "n", "approval": {"kind": "merge", "target": merge}}
+        wake_cli.unpark(e, "denied")
+        self.assertNotIn("approvals use", e["prompt"])
+        # An approval piece that can't say (an older one, another agent's id): parked all the same, the old words.
+        with mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="no")):
+            self.assertIsNone(self.cli("park", "--on", "a-2a2b3c4d", "-p", "go", "--note", "t-2"))
+        [e] = [e for e in self.spool() if e.get("on") == "a-2a2b3c4d"]
+        self.assertNotIn("approval", e)
+        wake_cli.unpark(e, "allowed")
+        self.assertIn("spend it with --approval a-2a2b3c4d", e["prompt"])
+
+    def test_a_park_on_a_local_wake_s_approval_hands_back_the_one_line_that_sets_it(self):
+        prompt = "check the disks <!-- house: local -->"
+        wake_cli.remember_filed("a-3a2b3c4d", "ada:0123456789abcdef", prompt, "t-3 disks")
+        card = {"id": "a-3a2b3c4d", "state": "pending", "kind": "local-wake", "target": "ada:0123456789abcdef"}
+        with mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=wake_cli.json.dumps(card), stderr="")):
+            self.cli("park", "--on", "a-3a2b3c4d", "-p", "set the disk check", "--note", "t-3 park")
+        [e] = [e for e in self.spool() if e["kind"] == "parked"]
+        wake_cli.unpark(e, "allowed")
+        self.assertIn("`wake in 1m --approval a-3a2b3c4d`", e["prompt"])
+        self.assertIn(prompt, e["prompt"])
 
     def test_a_resumed_wakes_note_says_the_answer_in_words_once(self):
         # Was "unparked (a-24e194de allowed): DNS health check" on loom's pages.
