@@ -311,14 +311,34 @@ def verify_principal(statement):
 _PRINCIPAL = {}
 
 
+def fetch_principal(conversation):
+    """A local body's own statement from the runtime (`<cmd> --conversation cv`), or "" when it can't be had."""
+    try:
+        r = subprocess.run([*principal_argv(), "--conversation", conversation], capture_output=True, text=True,
+                           timeout=PRINCIPAL_TIMEOUT_S, stdin=subprocess.DEVNULL,
+                           env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+        v = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, SystemExit):
+        return ""
+    st = v.get("statement") if isinstance(v, dict) and v.get("ok") is True else None
+    return st if isinstance(st, str) and 0 < len(st) <= 1100 and not re.search(r"\s", st) else ""
+
+
 def principal_for():
     """Whom a wake or schedule set by this run is for. On loom's machine (no WAKE_ORIGIN, the owner's own account and
     the household's lanes): the owner. Over the piece API: what the caller's verified statement says, when it is this
     same agent's ("owner", or the person's slug); no statement, one that doesn't verify, or one for another agent: "-"."""
-    if not os.environ.get("WAKE_ORIGIN", "").strip():
-        return "owner"
     statement = os.environ.get("WAKE_PRINCIPAL_STATEMENT", "")
-    agent = caller_agent()
+    if not os.environ.get("WAKE_ORIGIN", "").strip():
+        # On loom's machine. A body the runtime runs here (a local wake: LOOM_BODY_CONVERSATION) acts for whom its
+        # conversation says, never for the owner by being here; anything else here is the owner's own account.
+        conv = os.environ.get("LOOM_BODY_CONVERSATION", "")
+        if not re.fullmatch(r"cv-[0-9a-f]{12}", conv):
+            return "owner"
+        statement = statement or fetch_principal(conv)
+        agent = AGENT
+    else:
+        agent = caller_agent()
     # Once per run: the wake, its approval and that approval's spend all say the same.
     key = (statement, agent)
     if key not in _PRINCIPAL:
@@ -1047,8 +1067,13 @@ def cmd_schedule(args):
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     if origin:
         sc["origin"] = origin
-    # A loom lane is set here too, on loom's machine: the owner's. Over the API, the caller's verified principal.
+    # A loom lane is set here too, on loom's machine: the owner's. Over the API, the caller's verified principal. Set
+    # again (the page's edit sheet, a body's re-set), it's never wider than it was: an owner's edit of a schedule a body
+    # set for Loren keeps it Loren's (remove it and set it anew to make it yours).
     sc["for"] = principal_for()
+    prev = load_schedules().get(args.name)
+    if isinstance(prev, dict) and prev.get("for"):
+        sc["for"] = narrower(entry_for(prev), sc["for"])
     if args.slot:
         if not SLOT_NAME.match(args.slot):
             sys.exit(f"wake: --slot is lowercase letters, digits and dashes, not {args.slot!r}")
@@ -3279,9 +3304,11 @@ def main():
     # command goes to the clock piece instead (WAKE_NO_FORWARD=1 keeps it here).
     if os.environ.get("HOUSE_ID") and not os.environ.get("WAKE_NO_FORWARD"):
         forward("clock", sys.argv[1:])
-    # A `--principal <statement>` typed here (or left on by a wrapper) needs nothing on loom's machine, where a wake is
-    # the owner's: taken off like the API door does. Over the API the statement comes in WAKE_PRINCIPAL_STATEMENT.
-    sys.argv[1:], _ = split_principal(sys.argv[1:])
+    # A `--principal <statement>` typed here is taken off like the API door does. It counts only for a body the
+    # runtime runs here (LOOM_BODY_CONVERSATION, principal_for); anything else here is the owner's own account.
+    sys.argv[1:], typed = split_principal(sys.argv[1:])
+    if typed and not os.environ.get("WAKE_PRINCIPAL_STATEMENT"):
+        os.environ["WAKE_PRINCIPAL_STATEMENT"] = typed
     ap = argparse.ArgumentParser(prog="wake", description=__doc__, allow_abbrev=False,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--agent", default=os.environ.get("WAKE_AGENT") or LOCAL_AGENT,

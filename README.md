@@ -128,6 +128,13 @@ inline prompt.
   The hand-over names the delivery's id, so a word for a wake that's never
   delivered is never another wake's. A run verifies once and uses that answer
   for the wake, its approval and its spend.
+- **Here, and set again.** On loom's machine a wake is the owner's, except
+  one set by a body the runtime runs here (a local wake, in a conversation:
+  `LOOM_BODY_CONVERSATION`): it fetches its own statement and is whom that
+  says, unknown if the runtime can't say. A schedule set again (the page's
+  edit sheet, a body's re-set) is never wider than it was: the owner's edit of
+  one a body set for Loren keeps it Loren's; remove it and set it anew to make
+  it his.
 - **On whose behalf** (t-1943). The owner's standing permissions (his merge
   rules, say) cover work a body does for him; work it does for someone else (a
   person who messaged it in Slack or Discord) needs that person's own grant, or

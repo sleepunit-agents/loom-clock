@@ -2594,6 +2594,38 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         self.assertEqual(filed[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
         self.assertEqual(spent[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
 
+    def test_the_owner_s_own_call_over_the_api_is_the_owner_s(self):
+        # The owner's caller (WAKE_ORIGIN empty, WAKE_CALLER the owner's): his own wake, with nothing to verify.
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_CALLER": json.dumps({"kind": "owner", "who": "jonathan-barket"})}):
+            self.assertEqual(self.set_for(over_api=False), "owner")
+        self.assertEqual(self.calls(), [])
+
+    def test_a_body_the_runtime_runs_here_is_its_conversation_s_not_the_owner_s(self):
+        agent = wake_cli.AGENT
+        cv = {"LOOM_BODY_CONVERSATION": "cv-0123456789ab"}
+        with mock.patch.dict(wake_cli.os.environ, cv):
+            # Its own statement, fetched from the runtime and verified for this agent.
+            self.assertEqual(self.set_for(over_api=False, answer={**self.verified(agent, "loren"), "statement": "st-local"}), "loren")
+            argvs = [c["argv"] for c in self.calls()]
+            self.assertIn(["--conversation", "cv-0123456789ab"], argvs)
+            self.assertIn(["--verify"], argvs)
+            self.assertEqual(self.set_for(over_api=False, answer={**self.verified(agent, "jonathan-barket", True), "statement": "st-local"}), "owner")
+            # The runtime can't say: unknown, never the owner for being here.
+            self.assertEqual(self.set_for(over_api=False, answer={"ok": False}, exit_code=1), "-")
+        # No conversation: the owner's own account.
+        self.assertEqual(self.set_for(over_api=False), "owner")
+
+    def test_setting_a_schedule_again_never_widens_whom_it_is_for(self):
+        self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", "routines/nightly.md",
+                                   statement="s", answer=self.verified("ada", "loren")))
+        # The owner edits its time on the page (loom's machine): still Loren's.
+        self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "23:10", "-f", "routines/nightly.md", over_api=False))
+        self.assertEqual(wake_cli.load_schedules()["nightly"]["for"], "loren")
+        # Removed and set anew by the owner: his.
+        self.assertIsNone(self.cli("schedule", "rm", "nightly", over_api=False))
+        self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "23:10", "-f", "routines/nightly.md", over_api=False))
+        self.assertEqual(wake_cli.load_schedules()["nightly"]["for"], "owner")
+
     def test_a_person_whose_slug_is_owner_is_not_the_owner(self):
         self.assertEqual(self.set_for(statement="stmt-o", answer=self.verified("ada", "owner", False)), "-")
         self.assertEqual(self.set_for(statement="stmt-j", answer=self.verified("ada", "jonathan-barket", True)), "owner")
