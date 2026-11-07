@@ -2577,6 +2577,22 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
     def verified(agent="ada", for_=None, owner=False):
         return {"ok": True, "agent": agent, "conversation": "cv-0123456789ab", "for": for_, "owner": owner}
 
+    def test_an_approval_the_clock_files_or_spends_for_a_body_says_on_whose_behalf(self):
+        # A house's local wake asks the owner, and its continuation spends the yes: both with the body's principal, so
+        # the card names whom it's for and the spend matches it (approvals --on-behalf, t-1943).
+        seen, real_run = [], subprocess.run
+        ok = subprocess.CompletedProcess([], 0, "a-1a2b3c4d: asked the owner\n", "")
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "agent:ada", "WAKE_CALLER": json.dumps(self.ADA),
+                                                   "WAKE_PRINCIPAL_STATEMENT": "stmt-loren",
+                                                   "PRINCIPAL_ANSWER": json.dumps(self.verified("ada", "loren"))}), \
+                mock.patch.object(wake_cli.subprocess, "run", side_effect=lambda argv, **k: seen.append(argv) or
+                                  (real_run(argv, **k) if argv[0] == str(self.fake) else ok)):
+            self.assertEqual(wake_cli.file_approval("local-wake", "ada:abc", "run X", "why"), "a-1a2b3c4d")
+            self.assertEqual(wake_cli.spend_approval("a-1a2b3c4d", "local-wake", "ada:abc"), "")
+        filed, spent = [a for a in seen if a[0] != str(self.fake)]
+        self.assertEqual(filed[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
+        self.assertEqual(spent[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
+
     def test_a_wake_set_on_loom_s_machine_is_the_owner_s(self):
         self.assertEqual(self.set_for(over_api=False), "owner")
         self.assertEqual(self.calls(), [], "nothing to verify on loom's machine")

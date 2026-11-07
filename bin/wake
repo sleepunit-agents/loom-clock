@@ -1399,7 +1399,9 @@ def file_approval(kind, target, what, why):
     argv = [*approvals_argv(), "request", "--kind", kind, "--target", target, "--what", what, "--why", why]
     caller = os.environ.get("WAKE_CALLER", "").strip()
     if caller:
-        argv += ["--as", caller]
+        # And on whose behalf (t-1943): the approval names them on its card and is spent only for them, so filing and
+        # spending say the same (the caller's verified principal; "-" reads as someone loom can't name).
+        argv += ["--as", caller, "--on-behalf", principal_for()]
     env = {k: v for k, v in os.environ.items() if k != "HOUSE_ID"}
     try:
         r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
@@ -1418,7 +1420,9 @@ def spend_approval(aid, kind, target):
     argv = [*approvals_argv(), "use", aid, "--kind", kind, "--target", target]
     caller = os.environ.get("WAKE_CALLER", "").strip()
     if caller:
-        argv += ["--as", caller]
+        # And on whose behalf (t-1943): the approval names them on its card and is spent only for them, so filing and
+        # spending say the same (the caller's verified principal; "-" reads as someone loom can't name).
+        argv += ["--as", caller, "--on-behalf", principal_for()]
     env = {k: v for k, v in os.environ.items() if k != "HOUSE_ID"}
     try:
         r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
