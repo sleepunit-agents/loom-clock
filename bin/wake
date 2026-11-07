@@ -1027,9 +1027,10 @@ def cmd_schedule(args):
         if caller:
             # An agent running an owner-set schedule still only runs it in a house.
             entry["origin"] = caller
-            # And for no one wider than both: a body working for someone else can't run the owner's schedule as the
-            # owner's, nor the owner's body someone else's as his. On loom's machine it stays the schedule's own.
-            entry["for"] = narrower(entry_for(scheds[args.name]), principal_for())
+        # And for no one wider than both: a body working for someone else (from a house, or one the runtime runs on
+        # loom's machine) can't run the owner's schedule as the owner's, nor the owner's body someone else's as his.
+        # The owner himself here (principal_for: owner) leaves it the schedule's own.
+        entry["for"] = narrower(entry_for(scheds[args.name]), principal_for())
         with Spool() as spool:
             if sum(1 for e in spool.entries if e["kind"] == "wake") >= MAX_PENDING:
                 sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")

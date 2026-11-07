@@ -140,9 +140,12 @@ inline prompt.
   body on loom's machine chooses its children's environment: like everything
   else on loom's machine, that's the owner's account, and not bound here.
 - **Spending on loom's machine.** `wake in … --approval <id>` run on loom's
-  machine itself spends as the owner's own work (or a local body's
-  conversation's), so an approval asked from a house for someone else is
-  refused there: it's spent from a house acting for them.
+  machine itself calls the approvals bin there with no `--as`: approvals
+  reads the call's principal itself (the owner's own work, or, for a local
+  body, its conversation's, fetched by approvals from the runtime). So an
+  approval asked from a house for someone else is refused there: it's spent
+  from a house acting for them. `wake schedule run` here is narrowed the same
+  way as over the API.
 - **On whose behalf** (t-1943). The owner's standing permissions (his merge
   rules, say) cover work a body does for him; work it does for someone else (a
   person who messaged it in Slack or Discord) needs that person's own grant, or

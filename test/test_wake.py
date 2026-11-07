@@ -2615,6 +2615,16 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         # A conversation no one can read is a body all the same: unknown, not the owner.
         with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": "conversation-7"}):
             self.assertEqual(self.set_for(over_api=False), "-")
+        # A local body running the owner's schedule now: for whom it works, not the owner.
+        self.assertIsNone(self.cli("schedule", "set", "lane1", "--at", "22:44", "-f", "routines/nightly.md", over_api=False))
+        with mock.patch.dict(wake_cli.os.environ, {**cv, "PRINCIPAL_ANSWER": json.dumps({**self.verified(agent, "loren"), "statement": "st"})}):
+            wake_cli._PRINCIPAL.clear()
+            with mock.patch.object(wake_cli.sys, "argv", ["wake", "schedule", "run", "lane1"]), contextlib.redirect_stdout(io.StringIO()):
+                try:
+                    wake_cli.main()
+                except SystemExit:
+                    pass
+        self.assertEqual(self.spool()[-1]["for"], "loren")
         # No conversation: the owner's own account.
         with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": ""}):
             self.assertEqual(self.set_for(over_api=False), "owner")
