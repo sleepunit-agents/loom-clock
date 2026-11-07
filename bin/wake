@@ -1072,7 +1072,7 @@ def cmd_schedule(args):
     # set for Loren keeps it Loren's (remove it and set it anew to make it yours).
     sc["for"] = principal_for()
     prev = load_schedules().get(args.name)
-    if isinstance(prev, dict) and prev.get("for"):
+    if isinstance(prev, dict):      # one from before t-1943 has no `for`: entry_for reads it by where it was set
         sc["for"] = narrower(entry_for(prev), sc["for"])
     if args.slot:
         if not SLOT_NAME.match(args.slot):

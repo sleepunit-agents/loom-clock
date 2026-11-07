@@ -133,8 +133,16 @@ inline prompt.
   `LOOM_BODY_CONVERSATION`): it fetches its own statement and is whom that
   says, unknown if the runtime can't say. A schedule set again (the page's
   edit sheet, a body's re-set) is never wider than it was: the owner's edit of
-  one a body set for Loren keeps it Loren's; remove it and set it anew to make
-  it his.
+  one a body set for Loren keeps it Loren's (one from before this change that
+  a body set is unknown, and stays so); remove it and set it anew to make it
+  his. The local-body rule rests on the runtime's environment
+  (`LOOM_BODY_CONVERSATION`, which loom-box gives every body it runs), and a
+  body on loom's machine chooses its children's environment: like everything
+  else on loom's machine, that's the owner's account, and not bound here.
+- **Spending on loom's machine.** `wake in … --approval <id>` run on loom's
+  machine itself spends as the owner's own work (or a local body's
+  conversation's), so an approval asked from a house for someone else is
+  refused there: it's spent from a house acting for them.
 - **On whose behalf** (t-1943). The owner's standing permissions (his merge
   rules, say) cover work a body does for him; work it does for someone else (a
   person who messaged it in Slack or Discord) needs that person's own grant, or

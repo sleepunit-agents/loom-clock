@@ -2621,6 +2621,13 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         # The owner edits its time on the page (loom's machine): still Loren's.
         self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "23:10", "-f", "routines/nightly.md", over_api=False))
         self.assertEqual(wake_cli.load_schedules()["nightly"]["for"], "loren")
+        # One from before this change, set from a house (no `for`): the owner's edit keeps it unknown.
+        scheds = wake_cli.load_schedules()
+        scheds["old"] = {**scheds["nightly"], "origin": "agent:ada"}
+        scheds["old"].pop("for")
+        wake_cli.save_schedules(scheds)
+        self.assertIsNone(self.cli("schedule", "set", "old", "--at", "23:10", "-f", "routines/nightly.md", over_api=False))
+        self.assertEqual(wake_cli.load_schedules()["old"]["for"], "-")
         # Removed and set anew by the owner: his.
         self.assertIsNone(self.cli("schedule", "rm", "nightly", over_api=False))
         self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "23:10", "-f", "routines/nightly.md", over_api=False))
