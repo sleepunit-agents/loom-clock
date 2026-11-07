@@ -667,8 +667,9 @@ class Delivery(unittest.TestCase):
         self.assertEqual(len(spool), 1, "retried")
 
     def test_what_delivery_cant_carry_goes_the_old_way(self):
-        # A wake that needs loom's machine, and a lane that keeps a house slot.
-        posts, dispatch, *_ = self.fire({**self.base, "prompt": "ssh buildbox <!-- house: local -->"}, [])
+        # A lane that keeps a house slot; and, with WAKE_LOCAL_RUN=session (the way back), a wake that needs loom's
+        # machine and names no place.
+        posts, dispatch, *_ = self.fire({**self.base, "prompt": "ssh buildbox <!-- house: local -->"}, [], env={"WAKE_LOCAL_RUN": "session"})
         self.assertEqual((posts, dispatch.call_args.args[3]), ([], "local"))
         posts, dispatch, *_ = self.fire(self.base, [], body="# L\n<!-- house: ready -->\n<!-- house-slot: nightly -->\n")
         self.assertEqual((posts, dispatch.call_args.args[3], dispatch.call_args.args[5]), ([], "house", "nightly"))
@@ -688,9 +689,44 @@ class Delivery(unittest.TestCase):
         posts, *_ = self.fire({**self.base, "prompt": "p", "place": "alert:dns"}, [self.ok])
         self.assertEqual(posts[0]["place"], "alert:dns")
         self.assertNotIn("local", posts[0])
-        # A house's wake approved for loom's machine is never delivered local: a session here, as before.
-        posts, dispatch, *_ = self.fire({**self.base, "prompt": "<!-- house: local -->\nx", "place": "alert:x", "origin": "house:art", "local_approval": "a-12345678"}, [])
-        self.assertEqual(posts, [])
+        # With WAKE_LOCAL_RUN=session, a house's wake approved for loom's machine is a session here, as before t-1921.
+        approved = {**self.base, "prompt": "<!-- house: local -->\nx", "origin": "agent:ada", "local_approval": "a-12345678"}
+        posts, dispatch, *_ = self.fire(approved, [], env={"WAKE_LOCAL_RUN": "session"})
+        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "local"))
+        # Else it's the runtime's too, in its own conversation: a house never names a place on loom's machine.
+        posts, dispatch, *_ = self.fire(approved, [self.ok])
+        dispatch.assert_not_called()
+        self.assertEqual((posts[0]["place"], posts[0]["local"], posts[0]["agent"]), ("wake:w-cccccc", True, "ada"))
+
+    def test_every_local_wake_is_the_runtimes(self):
+        # t-1921: no wake starts a harness here itself. A follow-up that needs loom's machine: its own conversation.
+        posts, dispatch, spool, logged, _ = self.fire({**self.base, "prompt": "ssh buildbox <!-- house: local -->"}, [self.ok])
+        dispatch.assert_not_called()
+        (b,) = posts
+        self.assertEqual((b["place"], b["local"], b["venue"], b["kind"], b["from"]), ("wake:w-cccccc", True, "wake", "wake", {"kind": "schedule"}))
+        self.assertNotIn("<!-- house: local -->", b["text"])
+        self.assertIn("on loom's machine (loom's runtime delivered it)", b["text"])
+        self.assertTrue(b["text"].endswith("ssh buildbox"))
+        self.assertEqual(spool, [])
+        self.assertIn("fire | w-cccccc delivered: queued", logged)
+        # A lane that runs here: one conversation for its runs here, never its house runs' (`lane:<name>`).
+        posts, dispatch, *_ = self.fire({**self.base, "kind": "schedule", "schedule": "plan"}, [self.ok], body="# Plan\nthe lane's own words\n")
+        dispatch.assert_not_called()
+        self.assertEqual((posts[0]["place"], posts[0]["local"]), ("local-lane:plan", True))
+        self.assertIn("the lane's own words", posts[0]["text"], "here, the lane's text, as a session had it")
+        # A retry keeps its conversation, and stays local.
+        failed = (200, {"conversation": "cv-0123456789ab", "seq": 1, "body": "failed", "reason": "every model account art may use is out of quota"})
+        posts, _, spool, *_ = self.fire({**self.base, "kind": "schedule", "schedule": "plan"}, [failed], body="# Plan\nx\n")
+        (r,) = spool
+        self.assertEqual(r["deliver_place"], "local-lane:plan")
+        posts2, *_ = self.fire(r, [self.ok], body="# Plan\nx\n")
+        self.assertEqual((posts2[0]["place"], posts2[0]["local"]), ("local-lane:plan", True))
+        # The dead-man wake too.
+        posts, dispatch, *_ = self.fire({**self.base, "kind": "deadman", "prompt": "decide"}, [self.ok], env={"WAKE_FIRE": "local"})
+        dispatch.assert_not_called()
+        self.assertEqual((posts[0]["place"], posts[0]["local"]), ("wake:w-cccccc", True))
+        # Its timer carries the setting, so a fired run reads it as the clock that armed it.
+        self.assertIn("WAKE_LOCAL_RUN", wake_cli.TIMER_ENV)
 
     def test_a_runtime_that_wont_run_it_here_leaves_a_session_here(self):
         e = {**self.base, "prompt": "<!-- house: local -->\ntriage", "place": "alert:host-watch"}
@@ -699,10 +735,23 @@ class Delivery(unittest.TestCase):
         self.assertEqual(dispatch.call_args.args[3], "local")
         self.assertIn("on loom's machine", dispatch.call_args.args[0])
         self.assertIn("fire-spawn", logged)
-        self.assertEqual(alerts, [], "not a refusal to shout about: it ran, the old way")
-        # Without a place, a local wake is never delivered.
-        posts, dispatch, *_ = self.fire({**self.base, "prompt": "<!-- house: local -->\nx"}, [])
-        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "local"))
+        # It ran, the old way; but every wake here is the runtime's now, so it's a setting to fix: said, once a day.
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("WAKE_LOCAL_RUN=session", alerts[0])
+        # Without a place, the same.
+        posts, dispatch, _, logged, alerts = self.fire({**self.base, "prompt": "<!-- house: local -->\nx"}, [(403, {"error": "forbidden: the runtime runs no local bodies for ada"})])
+        self.assertEqual((len(posts), dispatch.call_args.args[3]), (1, "local"))
+        self.assertIn("fire-spawn", logged)
+
+    def test_the_refusal_alert_is_once_a_day(self):
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
+             mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+             mock.patch.object(wake_cli, "alert") as alert:
+            wake_cli.alert_daily("k", "one")
+            wake_cli.alert_daily("k", "two")
+            wake_cli.alert_daily("other", "three")
+            self.assertEqual([c.args[0] for c in alert.call_args_list], ["one", "three"])
+            self.assertIn("alert-quiet | two", (Path(td) / "wake.log").read_text())
 
     def test_place_is_set_on_loom_machine_only_and_checked(self):
         def setp(place, env=None, slot=""):

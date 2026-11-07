@@ -66,8 +66,18 @@
         "default": "claude-sonnet-5"
       },
       {
+        "name": "WAKE_LOCAL_RUN",
+        "label": "How a wake on this machine runs",
+        "kind": "choice",
+        "options": [
+          { "value": "runtime", "label": "Delivered: loom's runtime runs its body here (one path for every wake)" },
+          { "value": "session", "label": "The old way: the clock starts a session here itself" }
+        ],
+        "hint": "unset: runtime. session is the way back; the runtime refusing (no local bodies for the agent) is a session too, said once a day"
+      },
+      {
         "name": "WAKE_SESSION_COMMAND",
-        "label": "The session a local wake starts",
+        "label": "The session a local wake starts the old way",
         "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\"]"
       },
       {
