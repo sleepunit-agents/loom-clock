@@ -32,8 +32,8 @@ piece API an agent manages its own clock, all of it; the owner sees and manages
 every agent's.
 
 One agent is this machine's own (WAKE_LOCAL_AGENT): its lane files are in
-WAKE_REPO, and its wakes may run as sessions here. Fire mode: "local" (default)
-runs the session command (WAKE_SESSION_COMMAND, `claude --bg` by default) here;
+WAKE_REPO, and its wakes may run here. Fire mode: "local" (default) runs them
+here (loom's runtime runs their bodies: WAKE_LOCAL_RUN, below);
 "house" asks loom-box for a house on the agent's primary with the wake as its
 task; "mixed" sends only the wakes whose prompt says it's ready (a line
 `<!-- house: ready -->` in a lane file's first 30 lines, or anywhere in an
@@ -49,13 +49,21 @@ One lane is one conversation (place `lane:<name>`); any other wake is its own
 (`wake:<id>`). "spawn" keeps the old path (`loom box up` with the wake as the
 house's task); unset, it's "deliver" when the clock has a token for it and
 loom has a piece offering delivery, else "spawn". A wake with a house slot
-still goes the old way: delivery keeps no slot. So does a wake that needs
-loom's machine (fire mode "local"), unless it names its conversation
-(`--place alert:host-watch`, set on loom's machine only): then it's delivered
-there with the contract's `local: true` (its `<!-- house: local -->` line
-taken out: the field says it, never the words), and the runtime runs its body
-on loom's machine, if it runs local bodies for this agent; if it refuses (400
-or 403), it's a session here as before.
+still goes the old way: delivery keeps no slot.
+
+A wake that runs here (fire mode "local") is delivered too (t-1921), with the
+contract's `local: true` (its `<!-- house: local -->` line taken out: the
+field says it, never the words): the runtime runs its body on loom's machine,
+so model choice, fallback, permissions and the stuck-session stop live in one
+place. Its conversation is the one it names (`--place alert:host-watch`, set on
+loom's machine only), else `local-lane:<name>` for a lane (a lane's house runs
+are `lane:<name>`, and a conversation's bodies run in one place only), else
+`wake:<id>`. If the runtime won't run it here (400 or 403: no local bodies for
+this agent), it's a session here (WAKE_SESSION_COMMAND), said once a day.
+WAKE_LOCAL_RUN=session is the way back: every local wake a session here again,
+as before t-1921, except one that names its place. The clock's own stuck-session
+stop (`wake reap`) still watches every session it starts; the runtime stops its
+own bodies (LOOM_RUNTIME_STUCK_AFTER).
 
 Timers: transient `systemd-run --user` units named wake-<id> (KillMode=process
 so a background session the wake started survives the service's cgroup cleanup).
@@ -64,7 +72,7 @@ Settings (environment; a managed piece gets them from loom, see README.md):
   WAKE_DATA, WAKE_LOCAL_AGENT, WAKE_REPO, WAKE_LANE_DIRS, WAKE_AGENTS, WAKE_FIRE,
   WAKE_MODEL, WAKE_SESSION_COMMAND, WAKE_STUCK_AFTER, WAKE_TASK_COMMENT, WAKE_ALERT_COMMAND, WAKE_FIRE_GATE,
   WAKE_PREAMBLE_FILE, WAKE_HOUSEHOLD, WAKE_LOOM, WAKE_APPROVALS,
-  WAKE_DELIVERY, WAKE_DELIVER_TOKEN_FILE, WAKE_LOOM_URL
+  WAKE_DELIVERY, WAKE_DELIVER_TOKEN_FILE, WAKE_LOOM_URL, WAKE_LOCAL_RUN
 """
 
 import argparse
@@ -214,7 +222,7 @@ TIMER_ENV = ("PATH", "HOME", "LOOM_HOME", "LOOM_PIECE_NAME", "LOOM_PIECE_HOME", 
              "WAKE_DATA", "WAKE_LOCAL_AGENT", "WAKE_REPO", "WAKE_LANE_DIRS", "WAKE_AGENTS", "WAKE_FIRE", "WAKE_MODEL",
              "WAKE_SESSION_COMMAND", "WAKE_STUCK_AFTER", "WAKE_TASK_COMMENT", "WAKE_ALERT_COMMAND", "WAKE_FIRE_GATE", "WAKE_PREAMBLE_FILE",
              "WAKE_HOUSEHOLD", "WAKE_LOOM", "WAKE_APPROVALS",
-             "WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL")
+             "WAKE_DELIVERY", "WAKE_DELIVER_TOKEN_FILE", "WAKE_LOOM_URL", "WAKE_LOCAL_RUN")
 
 
 def lane_dir():
@@ -1228,7 +1236,13 @@ def house_ready(entry, body):
     return HOUSE_LOCAL not in body
 
 
-# The session a local wake starts: {prompt} and {model} are filled in (a whole argument each).
+def local_run():
+    """How a wake that runs here runs (WAKE_LOCAL_RUN): "runtime" (the default, t-1921): delivered, and loom's runtime
+    runs its body here; "session": the session command here, the old way (and the way back)."""
+    return "session" if setting("WAKE_LOCAL_RUN").strip().lower() == "session" else "runtime"
+
+
+# The session a local wake starts the old way: {prompt} and {model} are filled in (a whole argument each).
 # Safe by default: a session that can stop and ask. An agent that runs unattended and has decided to skip permission
 # prompts sets WAKE_SESSION_COMMAND itself, so that choice is written down where it's made.
 SESSION_DEFAULT = ["claude", "--bg", "{prompt}", "--model", "{model}"]
@@ -1279,6 +1293,23 @@ def alert(msg):
         pass
 
 
+def alert_daily(key, msg):
+    """alert(), at most once a day for one key (a stamp in the agent's clock dir); always logged."""
+    stamp = WAKE_DIR / f"alerted-{key}"
+    try:
+        if time.time() - stamp.stat().st_mtime < 86400:
+            log("alert-quiet", msg)
+            return
+    except OSError:
+        pass
+    try:
+        WAKE_DIR.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(datetime.now().strftime(TIME_FMT) + "\n")
+    except OSError:
+        pass
+    alert(msg)
+
+
 def fire_gate_open():
     """WAKE_FIRE_GATE: a command that says whether this machine should dispatch now (exit 0), for a
     standby that mirrors a primary and must never run the same lanes. No gate: always open."""
@@ -1320,10 +1351,11 @@ def loom_api():
 PLACE = re.compile(r"[a-z][a-z0-9-]{0,31}:[A-Za-z0-9][A-Za-z0-9._@:/-]{0,159}")
 
 
-def wake_place(entry):
+def wake_place(entry, local=False):
     """Where a wake lands in the agent's conversations (conversations.md: one per agent, venue and place). A lane's
     wakes share one, so a lane's runs read as one conversation and its body can resume: `lane:<name>`, by the
-    schedule, else the lane file. Anything else is its own: `wake:<id>`, by the id it was first fired under."""
+    schedule, else the lane file; `local-lane:<name>` for its runs on loom's machine (a conversation's bodies run in
+    one place, and a lane can move). Anything else is its own: `wake:<id>`, by the id it was first fired under."""
     if entry.get("deliver_place"):
         return entry["deliver_place"]
     if entry.get("place"):
@@ -1332,7 +1364,7 @@ def wake_place(entry):
     if not name and (entry.get("lane") or entry.get("prompt_file")):
         name = Path(entry.get("lane") or entry["prompt_file"]).stem
     if name:
-        return f"lane:{name}"[:200]
+        return f"{'local-lane' if local else 'lane'}:{name}"[:200]
     return f"wake:{entry['id']}"
 
 
@@ -1385,7 +1417,7 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         # A local wake says so in the contract's own field (`local: true`), never by the words: its marker is this
         # clock's input syntax only, and goes. The runtime trusts the field from this piece alone.
         text = prompt.replace(HOUSE_LOCAL, "").strip() if local else prompt
-        body = {"id": entry["id"][:DELIVER_ID_MAX], "agent": agent, "venue": "wake", "place": wake_place(entry),
+        body = {"id": entry["id"][:DELIVER_ID_MAX], "agent": agent, "venue": "wake", "place": wake_place(entry, local),
                 "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text[:DELIVER_TEXT_MAX],
                 **({"local": True} if local else {})}
@@ -1396,8 +1428,12 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         return "spawn"
     if local and (status in (400, 403) or (status == 503 and NO_DELIVERY in err)):
         # A wake for loom's machine that the runtime won't run here (no local bodies for this agent): a session here,
-        # as before, so it still runs where it needs to; only its conversation is lost.
+        # as before, so it still runs where it needs to; only its conversation is lost. Said once a day: every wake
+        # here is the runtime's now (t-1921), and one that isn't is a setting to fix, not a way to keep running.
         log("fire-spawn", f"{entry['id']} deliver to {body['place']} refused ({status}: {err}): a session here instead")
+        alert_daily("local-refused", f"wake: loom's runtime won't run wakes on loom's machine ({status}: {err}), so the clock "
+                    f"starts them as sessions itself, as before t-1921. Fix LOOM_RUNTIME_LOCAL_BODIES, or set "
+                    f"WAKE_LOCAL_RUN=session to say so")
         return "spawn"
     # What every retry keeps: the conversation it belongs to.
     entry["deliver_place"], entry["deliver_label"] = body["place"], body["label"]
@@ -1502,11 +1538,11 @@ def cmd_fire(args):
         body = (f"Your lane for this wake is the file `{rel}` in your own repo (your house's "
                 f"checkout). Read it and follow it.")
     # Delivered: a wake for the agent's house that needs no house slot (delivery keeps a conversation, not a slot). A
-    # wake for loom's machine that names its place (--place) is delivered too: the runtime runs its body here, in that
-    # conversation, when it runs local bodies for this agent; else it's a session here, as before.
-    # Only a wake set here (no origin: never a house's, approved or not) is delivered to run on loom's machine.
-    local_place = (mode == "local" and bool(entry.get("place")) and AGENT == LOCAL_AGENT
-                   and not origin and not entry.get("local_approval"))
+    # wake for loom's machine is delivered too (t-1921): the runtime runs its body here, when it runs local bodies for
+    # this agent; else it's a session here, as before. A house's wake the owner allowed here is one of them: its own
+    # `wake:<id>` (it can't name a place). WAKE_LOCAL_RUN=session: only one set here that names its place (t-1830).
+    local_place = mode == "local" and AGENT == LOCAL_AGENT and (
+        local_run() == "runtime" or (bool(entry.get("place")) and not origin and not entry.get("local_approval")))
     dmode = delivery_mode() if (mode == "house" or local_place) and not slot else "spawn"
 
     def prompt_for(where):
