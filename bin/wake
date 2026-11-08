@@ -402,8 +402,8 @@ def stamp_for(entry):
     else:
         entry.pop("for_in", None)
     # Why it's unknown, and anyone the runtime named (t-1975): what the clock reads before it asks the owner to count
-    # an unknown wake as his (vouch_candidates). Nothing here for a wake set on loom's machine by the owner himself.
-    why, people = _LAST_WHY[0] if entry["for"] == "-" and os.environ.get("WAKE_ORIGIN", "").strip() else (None, [])
+    # an unknown wake as his (vouch_candidates, ask-vouch): for every unknown wake, a house's or a local body's.
+    why, people = _LAST_WHY[0] if entry["for"] == "-" else (None, [])
     entry.pop("for_why", None)
     entry.pop("for_people", None)
     if why:
@@ -970,11 +970,11 @@ def spend_words(rid, card):
     return f"Pick up where you left off, and spend it with --approval {rid} on exactly the action it allows."
 
 
-def request_state(rid):
+def request_state(rid, timeout=30):
     """A request's state, read on loom's machine: secrets' q-… or approvals' a-…; 'unknown' if it can't be read."""
     argv = [LOOM, "secrets", "state", rid] if rid.startswith("q-") else [*approvals_argv(), "check", rid]
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
                            env={k: v for k, v in os.environ.items() if k not in ("HOUSE_ID", "WAKE_CALLER")})
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
@@ -1068,9 +1068,19 @@ def body_env():
                 or os.environ.get("LOOM_BODY_CONVERSATION", "").strip() or os.environ.get("LOOM_BODY_KEY"))
 
 
-def vouch_target(ids, agent=None):
+def vouch_target(ids):
     """A vouch-wake approval's target (loom-approvals): <agent>:<ids sorted, each once>. One set, one text."""
-    return f"{agent or AGENT}:{','.join(sorted(set(ids)))}"
+    return f"{AGENT}:{','.join(sorted(set(ids)))}"
+
+
+def vouch_parse(target):
+    """vouch_target read back: (agent, ids), or None unless it's exactly what vouch_target makes (1 to VOUCH_MAX ids)."""
+    agent, _, rest = str(target or "").partition(":")
+    ids = rest.split(",") if rest else []
+    if not AGENT_NAME.match(agent) or not 1 <= len(ids) <= VOUCH_MAX or not all(re.fullmatch(r"w-[0-9a-f]{6}", i) for i in ids) \
+            or ids != sorted(set(ids)):
+        return None
+    return agent, ids
 
 
 def vouch_mark(by_id, ids, how):
@@ -1300,6 +1310,15 @@ def _vouch_pass(ask, apply):
         elif state in ("used", "expired", "withdrawn"):
             log("vouch-card", f"{card['aid']}: {state}")
             card = None
+        elif state == "unknown":
+            # Unreadable (approvals down, or an id another machine's store never had: a restored bundle). Three passes
+            # running and it's let go, so the asking never wedges on it.
+            card["unread"] = card.get("unread", 0) + 1
+            log("vouch-fail", f"{card['aid']}: its state can't be read ({card['unread']} of 3)")
+            if card["unread"] >= 3:
+                card = None
+        if card and state != "unknown":
+            card.pop("unread", None)
     asked = sorted(i for i in {*(st.get("asked") or []), *ask} if i in unknown and i not in denied)
     want = sorted(set(asked) | {i for i in vouch_candidates(entries) if i not in denied})[:VOUCH_MAX]
     # Only a card still waiting is refreshed: an allowed one not yet applied is the owner's answer, kept until it is.
@@ -1348,14 +1367,30 @@ def cmd_ask_vouch(args):
                                           f"already for {entry_for(e)}") + ": only an unknown wake is asked about")
         if e.get("for_people"):
             sys.exit(f"wake: {i} was set while {', '.join(e['for_people'])} steered its body: it stays theirs")
+        if e.get("for_why") in ("steered", "other-agent"):
+            # The runtime's word was that something other than the owner steered it (or it was another agent's statement).
+            sys.exit(f"wake: {i} was set while something loom can't place steered its body: it isn't asked about")
     st = vouch_state()
     if set(ids) & set(st.get("denied") or []):
         sys.exit(f"wake: the owner said no for {' '.join(sorted(set(ids) & set(st['denied'])))} already: not asked again")
+    if os.environ.get("WAKE_ORIGIN", "").strip():
+        # Over the API (12 s for the whole call): kept, and the service's next pass files the card (within RUN_CHECK).
+        with open(WAKE_DIR / "vouch.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            st = vouch_state()
+            st["asked"] = sorted(set(st.get("asked") or []) | set(ids))
+            save_vouch_state(st)
+        log("vouch-ask", f"{AGENT}'s body asked about {' '.join(ids)}")
+        print(f"asked: the clock puts {' '.join(ids)} on the owner's card within {RUN_CHECK // 60} minutes; his Allow does it")
+        return
     card = vouch_pass(ids, apply=False)
-    if not card or not set(ids) <= set(card["ids"]):
+    on = sorted(set(ids) & set((card or {}).get("ids") or []))
+    if not on:
         sys.exit("wake: couldn't ask the owner (the clock's log says why: wake log --grep vouch)")
+    later = sorted(set(ids) - set(on))
     print(f"{card['aid']}: asked the owner on loom's page to count {len(card['ids'])} scheduled "
-          f"job{'s' if len(card['ids']) != 1 else ''} as his work ({' '.join(card['ids'])}); his Allow does it")
+          f"job{'s' if len(card['ids']) != 1 else ''} as his work ({' '.join(card['ids'])}); his Allow does it"
+          + (f"; {' '.join(later)} on the next card, once that's answered" if later else ""))
 
 
 def cmd_log(args):
@@ -3534,13 +3569,10 @@ def ui_act(req, run):
         c = req.get("caller")
         if not (isinstance(c, dict) and c.get("kind") == "owner" and c.get("agents") in (None, "*")):
             return {"ok": False, "message": "Whose work a wake is, is the household owner's to say."}
-        m = re.fullmatch(r"([a-z][a-z0-9-]{0,39}):((?:w-[0-9a-f]{6},){0,11}w-[0-9a-f]{6})", pick("target"))
-        if not re.fullmatch(r"a-[0-9a-f]{8}", pick("id")) or not m or pick("agent") != m.group(1):
+        v = vouch_parse(pick("target"))
+        if not re.fullmatch(r"a-[0-9a-f]{8}", pick("id")) or not v or pick("agent") != v[0] or v[0] not in clock_agents():
             return {"ok": False, "message": "That isn't a vouch for scheduled jobs."}
-        agent = m.group(1)
-        ids = m.group(2).split(",")
-        if ids != sorted(set(ids)) or agent not in clock_agents():
-            return {"ok": False, "message": "That isn't a vouch for scheduled jobs."}
+        agent, ids = v
         code, out, err = run(agent, ["vouch", "--approval", pick("id"), *ids])
         if code != 0:
             return {"ok": False, "message": (err.strip().removeprefix("wake: ") or out.strip() or "That didn't work.")[:300]}

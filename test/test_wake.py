@@ -3109,7 +3109,7 @@ sys.exit(code)
         # A body that knows asks about the old one; a person's stays theirs.
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
-            self.assertIsNone(self.cli("ask-vouch", "w-aaaaa1"))
+            self.assertIsNone(self.cli("ask-vouch", "w-aaaaa1", over_api=False))
         self.assertIn("stays theirs", self.cli("ask-vouch", self.spool()[-1]["id"]))
         (card,) = [a for a in self.approvals()["a"].values() if a["state"] == "pending"]
         self.assertEqual(card["target"], "ada:w-aaaaa1")
@@ -3171,6 +3171,38 @@ sys.exit(code)
 
     def test_the_deny_record_goes_with_the_clock_in_the_bundle(self):
         self.assertIn("vouch.json", wake_cli.CLOCK_FILES)
+        self.assertEqual(wake_cli.vouch_path(), wake_cli.WAKE_DIR / "vouch.json", "the agent's own clock, which the bundle reads")
+
+    def test_a_card_that_can_t_be_read_is_let_go_after_three_passes(self):
+        self.unsigned(1)
+        card = wake_cli.vouch_pass()
+        d = self.approvals()
+        del d["a"][card["aid"]]
+        self.store.write_text(json.dumps(d))
+        with mock.patch.object(wake_cli, "request_state", return_value="unknown"):
+            self.assertIsNotNone(wake_cli.vouch_pass())
+            self.assertIsNotNone(wake_cli.vouch_pass())
+            third = wake_cli.vouch_pass()
+        self.assertNotEqual(third["aid"], card["aid"], "let go, and asked again on a card that can be read")
+
+    def test_a_body_never_asks_about_one_the_runtime_said_was_steered_or_another_agent_s(self):
+        for why in ("steered", "other-agent"):
+            with wake_cli.Spool() as sp:
+                sp.entries = [{**self.base, "id": "w-aaaaa4", "origin": "agent:ada", "for": "-", "for_why": why}]
+            self.assertIn("isn't asked about", self.cli("ask-vouch", "w-aaaaa4"))
+        # A local body's unknown wake keeps why too, so its ask is refused the same.
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": "cv-0123456789ab", "WAKE_PRINCIPAL_STATEMENT": "stmt"}):
+            self.assertEqual(self.set_for(over_api=False, answer={**self.verified("ada"), "people": ["loren"]}), "-")
+        self.assertEqual(self.spool()[-1]["for_people"], ["loren"])
+
+    def test_over_the_api_a_body_s_ask_is_kept_for_the_service_s_pass(self):
+        ids = self.unsigned(1)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(self.cli("ask-vouch", ids[0]))
+        self.assertEqual(self.approvals()["a"], {})
+        self.assertEqual(wake_cli.vouch_state()["asked"], ids)
+        self.assertEqual(wake_cli.vouch_pass()["ids"], ids)
 
 
 if __name__ == "__main__":
