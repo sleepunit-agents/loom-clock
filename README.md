@@ -339,3 +339,13 @@ session and check the session got the preamble, the prompt and the model.
 ## License
 
 AGPL-3.0-or-later, like loom and its other pieces. See [LICENSE](LICENSE).
+
+### Waiting for model quota
+
+A delivered `failed` answer with `code: "quota"` keeps the wake until the runtime’s
+ISO `retryAfter` reset (plus one minute), between 15 minutes and eight days from now.
+Without a usable reset it waits an hour. This does not count as a job failure or
+raise failure-streak alerts. Older runtimes saying “out of quota” get the same wait.
+The `alert:runtime-quota` triage wake is not retried: the runtime already leaves an
+owner notice, and running another model to investigate no available model repeats
+the failure. Other alert wakes remain scheduled for their reset.
