@@ -192,7 +192,8 @@ inline prompt.
   waiting card unanswered and files one with the whole list; one that fires doesn't
   (unless none is left on it: then the card is withdrawn, nothing left to decide).
   **Allow** vouches for exactly its wakes: loom core posts `vouch-approved` here as
-  the household owner right after it, and `wake vouch --approval a-… <ids>` spends the
+  the household owner right after it (fields `id`, `target`, and `agent`, which must be the
+  target's), and runs `wake vouch --approval a-… <ids>` on that agent's clock, which spends the
   approval (allowed, for exactly those ids, once) and only then marks each one still
   pending and unknown `for: owner`, `vouched.approval`; one that fired meanwhile is
   said, and left. The service's next pass applies an Allow loom didn't (never a body's

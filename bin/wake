@@ -3581,7 +3581,8 @@ def ui_act(req, run):
         if not (isinstance(c, dict) and c.get("kind") == "owner" and c.get("agents") in (None, "*")):
             return {"ok": False, "message": "Whose work a wake is, is the household owner's to say."}
         v = vouch_parse(pick("target"))
-        if not re.fullmatch(r"a-[0-9a-f]{8}", pick("id")) or not v or pick("agent") != v[0] or v[0] not in clock_agents():
+        # The agent is the target's; an `agent` field (core sends the approval's) must say the same, if it's there.
+        if not re.fullmatch(r"a-[0-9a-f]{8}", pick("id")) or not v or (pick("agent") and pick("agent") != v[0]) or v[0] not in clock_agents():
             return {"ok": False, "message": "That isn't a vouch for scheduled jobs."}
         agent, ids = v
         code, out, err = run(agent, ["vouch", "--approval", pick("id"), *ids])

@@ -3230,6 +3230,22 @@ sys.exit(code)
         self.assertEqual(wake_cli.vouch_state()["asked"], ids)
         self.assertEqual(wake_cli.vouch_pass()["ids"], ids)
 
+    def test_the_page_action_runs_the_vouch_on_the_target_s_clock(self):
+        seen = []
+        run = lambda agent, argv: seen.append((agent, argv)) or (0, "vouched: w-0000b1; fired: ", "")
+        with mock.patch.object(wake_cli, "clock_agents", return_value=["ada", "bo"]):
+            r = wake_cli.ui_act({"action": "vouch-approved", "caller": self.OWNER,
+                                 "fields": {"id": "a-1a2b3c4d", "target": "bo:w-0000b1"}}, run)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(seen, [("bo", ["vouch", "--approval", "a-1a2b3c4d", "w-0000b1"])])
+        self.assertEqual(r["message"], "Bo's scheduled job counts as your work now.")
+        # An agent field that says otherwise: refused before anything runs.
+        seen.clear()
+        with mock.patch.object(wake_cli, "clock_agents", return_value=["ada", "bo"]):
+            self.assertFalse(wake_cli.ui_act({"action": "vouch-approved", "caller": self.OWNER,
+                                              "fields": {"id": "a-1a2b3c4d", "agent": "ada", "target": "bo:w-0000b1"}}, run)["ok"])
+        self.assertEqual(seen, [])
+
 
 if __name__ == "__main__":
     unittest.main()
