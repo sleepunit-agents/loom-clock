@@ -717,7 +717,9 @@ def schedule_entry(name, sched, at):
         "created": datetime.now().strftime(TIME_FMT),
     }
     # Its principal goes with it, like its origin: an occurrence is for whomever the schedule was set for.
-    for k in ("prompt", "prompt_file", "lane", "origin", "for", "for_in", "slot"):
+    # Why it's unknown, and anyone named, go with it too (t-1975): an occurrence (and a retry of one) is asked about as
+    # its schedule would be, never as a wake with no record.
+    for k in ("prompt", "prompt_file", "lane", "origin", "for", "for_in", "for_why", "for_people", "slot"):
         if sched.get(k):
             entry[k] = sched[k]
     return entry
@@ -1241,11 +1243,16 @@ def vouch_listing(entries, ids):
     return "\n".join(out)[:VOUCH_DETAILS]
 
 
+def clock_as():
+    """Who the clock files, spends and withdraws as, the same every time: the agent, from loom's clock (the card's "from")."""
+    return json.dumps({"kind": "agent", "agent": AGENT, "house": "loom's clock"})
+
+
 def file_owner_approval(kind, target, ask, why, details):
     """File an approval the owner's Allow applies (t-1975) as this clock, for its agent, on the owner's behalf: its id."""
     argv = [*approvals_argv(), "request", "--kind", kind, "--target", target, "--ask", ask, "--why", why,
             "--if-yes", "They fire as your work.", "--if-no", "Nothing changes.", "--details", details,
-            "--as", json.dumps({"kind": "agent", "agent": AGENT, "house": "loom's clock"}), "--on-behalf", "owner"]
+            "--as", clock_as(), "--on-behalf", "owner"]
     r = subprocess.run(argv, capture_output=True, text=True, timeout=8,     # within the API door's and the page's 12 s
                        env={k: v for k, v in os.environ.items() if k not in ("HOUSE_ID", "WAKE_CALLER")})
     m = re.match(r"(a-[0-9a-f]{8}):", r.stdout or "")
@@ -1255,7 +1262,7 @@ def file_owner_approval(kind, target, ask, why, details):
 
 
 def owner_approval_cmd(verb, aid, *extra):
-    argv = [*approvals_argv(), verb, aid, *extra, "--as", json.dumps({"kind": "agent", "agent": AGENT})]
+    argv = [*approvals_argv(), verb, aid, *extra, "--as", clock_as()]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=8,
                            env={k: v for k, v in os.environ.items() if k not in ("HOUSE_ID", "WAKE_CALLER")})

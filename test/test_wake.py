@@ -3021,8 +3021,20 @@ sys.exit(code)
             self.assertEqual(self.fire_for(by[i]), "owner")
         self.assertEqual(by[extra]["for"], "-", "the card covers exactly its listed wakes")
         self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "used")
-        # Spent once: the same Allow again changes nothing more.
-        self.assertFalse(self.act(card["aid"])["ok"])
+        # Spent once: with the same wakes unknown again, the same Allow is refused by the approvals piece, not by the spool.
+        with wake_cli.Spool() as sp:
+            sp.entries = [{**self.base, "id": i, "origin": "agent:ada", "for": "-", "for_why": "none"} for i in ids]
+        r = self.act(card["aid"])
+        self.assertFalse(r["ok"])
+        self.assertIn("couldn't be spent", r["message"])
+        # Every spend the clock made: as itself for ada, on the owner's behalf, for exactly the card's target.
+        spends = [c for c in self.approvals()["calls"] if c[0] == "use"]
+        for c in spends:
+            self.assertEqual(c[c.index("--as") + 1], wake_cli.clock_as())
+            self.assertEqual(c[c.index("--on-behalf") + 1], "owner")
+            self.assertEqual(c[c.index("--target") + 1], self.approvals()["a"][card["aid"]]["target"])
+        filed = [c for c in self.approvals()["calls"] if c[0] == "request"]
+        self.assertTrue(all(c[c.index("--as") + 1] == wake_cli.clock_as() for c in filed))
 
     def test_a_target_can_t_be_widened(self):
         ids = self.unsigned(2)
@@ -3150,6 +3162,11 @@ sys.exit(code)
         self.assertEqual(self.spool()[-1]["for_why"], "steered")
         self.assertNotIn(self.spool()[-1]["id"], wake_cli.vouch_candidates(self.spool()))
 
+    def test_a_schedule_s_occurrences_keep_why_it_s_unknown(self):
+        e = wake_cli.schedule_entry("nightly", {"at": "23:00", "prompt": "x", "origin": "agent:ada", "for": "-",
+                                                "for_why": "steered", "for_people": ["loren"]}, wake_cli.datetime.now())
+        self.assertEqual((e["for_why"], e["for_people"]), ("steered", ["loren"]))
+
     def test_the_target_is_sorted_and_each_wake_once(self):
         self.assertEqual(wake_cli.vouch_target(["w-cccccc", "w-aaaaaa", "w-cccccc", "w-bbbbbb"]), "ada:w-aaaaaa,w-bbbbbb,w-cccccc")
 
@@ -3201,7 +3218,11 @@ sys.exit(code)
         self.assertEqual(self.spool()[-1]["for_people"], ["loren"])
 
     def test_over_the_api_a_body_s_ask_is_kept_for_the_service_s_pass(self):
-        ids = self.unsigned(1)
+        # One the clock would never ask about by itself (from before principals were kept): only the kept ask files it.
+        with wake_cli.Spool() as sp:
+            sp.entries.append({**self.base, "id": "w-aaaaa7", "origin": "agent:ada"})
+        ids = ["w-aaaaa7"]
+        self.assertEqual(wake_cli.vouch_candidates(self.spool()), [])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             self.assertIsNone(self.cli("ask-vouch", ids[0]))
