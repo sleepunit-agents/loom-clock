@@ -2189,7 +2189,10 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
     as_retry(entry)
     if status == 200 and ans.get("body") == "failed":
         # loom keeps that answer a day: the same id would only be told `failed` again. A new delivery, same place.
-        retry(entry, f"delivered{via} but no body took it: {err or 'failed'}", "fire-fail")
+        if ans.get("code") == "quota" or "out of quota" in err:
+            defer_quota(entry, ans.get("retryAfter"), err)
+        else:
+            retry(entry, f"delivered{via} but no body took it: {err or 'failed'}", "fire-fail")
         return None
     if status in (0, 429) or status >= 500:
         entry["delivery"] = body
@@ -2343,6 +2346,34 @@ def cmd_fire(args):
     if m:
         # Handed over isn't started: look at the house again in a while.
         arm_watch(m.group(1), entry, 0)
+
+
+def defer_quota(entry, reset, err):
+    """Quota isn't a failed job: retain it until room returns, without failure alerts about failure alerts."""
+    old_id = entry["id"]
+    if entry.get("deliver_place") == "alert:runtime-quota":
+        # The runtime already recorded a notice for the owner; asking another model to triage no model being
+        # available only creates a second quota failure. Keep its audit record, with no further triage wake.
+        log("quota-notice", f"{old_id} {err}; runtime notice kept, no triage retry")
+        return
+    now = datetime.now().astimezone()
+    try:
+        when = datetime.fromisoformat(reset.replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            raise ValueError("reset needs timezone")
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        when = now + timedelta(hours=1)
+    ceiling = now + timedelta(days=8)
+    when = min(max(min(when, ceiling) + timedelta(minutes=1), now + timedelta(minutes=15)), ceiling)
+    entry["id"] = "w-" + secrets.token_hex(3)
+    entry["at"] = when.astimezone().strftime(TIME_FMT)
+    with Spool() as spool:
+        for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
+            disarm_timer(dm["id"])
+            spool.entries.remove(dm)
+        spool.entries.append(entry)
+        arm_timer(entry)
+    log("quota-wait", f"{old_id} {err}; waiting as {entry['id']} until {entry['at']}")
 
 
 def retry(entry, err, event):

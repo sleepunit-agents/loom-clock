@@ -689,6 +689,41 @@ class Delivery(unittest.TestCase):
         posts, *_ = self.fire({**self.base, "kind": "schedule", "schedule": "knowledge-triage", "prompt": "the lane"}, [self.ok])
         self.assertEqual(posts[0]["place"], "lane:knowledge-triage")
 
+    def test_quota_waits_for_reset_without_counting_failures_or_alerting(self):
+        reset = (wake_cli.datetime.now(wake_cli.timezone.utc) + wake_cli.timedelta(hours=12)).isoformat()
+        failed = (200, {"body": "failed", "code": "quota", "reason": "no room", "retryAfter": reset})
+        entry = {**self.base, "prompt": "work", "fails": 3}
+        posts, dispatch, spool, logged, alerts = self.fire(entry, [failed])
+        dispatch.assert_not_called()
+        (r,) = spool
+        self.assertEqual(r["fails"], 3)
+        self.assertEqual(r["deliver_place"], "wake:w-cccccc")
+        self.assertNotEqual(r["id"], entry["id"])
+        expected = wake_cli.datetime.fromisoformat(reset) + wake_cli.timedelta(minutes=1)
+        self.assertEqual(r["at"], expected.astimezone().strftime(wake_cli.TIME_FMT))
+        self.assertEqual(alerts, [])
+        self.assertIn("quota-wait", logged)
+        posts2, _, spool2, *_ = self.fire(r, [self.ok])
+        self.assertEqual(posts2[0]["place"], posts[0]["place"])
+        self.assertEqual(spool2, [])
+
+    def test_quota_alert_does_not_retry_itself_but_other_alerts_wait(self):
+        failed = (200, {"body": "failed", "reason": "every model account art may use is out of quota"})
+        for place, count in [("alert:runtime-quota", 0), ("alert:disk", 1)]:
+            _, _, spool, logged, alerts = self.fire({**self.base, "place": place, "prompt": "<!-- house: local -->\ntriage"}, [failed])
+            self.assertEqual(len(spool), count)
+            self.assertEqual(alerts, [])
+            self.assertIn("quota-wait" if count else "quota-notice", logged)
+
+    def test_bad_or_past_quota_reset_cannot_make_a_hot_loop(self):
+        for reset in [None, "bad", "2000-01-01T00:00:00Z", "2030-01-01", "9999-12-31T23:59:59Z"]:
+            before = wake_cli.datetime.now()
+            _, _, spool, _, alerts = self.fire({**self.base, "prompt": "work"}, [(200, {"body": "failed", "code": "quota", "retryAfter": reset})])
+            when = wake_cli.datetime.strptime(spool[0]["at"], wake_cli.TIME_FMT)
+            self.assertGreater(when, before + wake_cli.timedelta(minutes=14))
+            self.assertLess(when, before + wake_cli.timedelta(days=8, seconds=5))
+            self.assertEqual(alerts, [])
+
     def test_failed_is_retried_later_as_a_new_delivery_in_the_same_conversation(self):
         failed = (200, {"conversation": "cv-0123456789ab", "seq": 1, "body": "failed", "reason": "no box may host ada"})
         posts, _, spool, logged, _ = self.fire({**self.base, "kind": "schedule", "schedule": "nightly", "prompt": "p"}, [failed])
