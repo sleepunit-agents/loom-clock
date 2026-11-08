@@ -1201,9 +1201,11 @@ def vouch_listing(entries, ids):
         e = by_id[i]
         words, refs = wake_words(what_of(e))
         when = day_time(datetime.strptime(e["at"], TIME_FMT), now)
-        lines.append((words or "A wake with no note", ", ".join([*refs, i]), when))
-    room = max(40, VOUCH_DETAILS // max(1, len(lines)) - 4)
-    out = [short(f"- {w} ({r}): fires {t}", room) for w, r, t in lines]
+        lines.append((i, when, words or "A wake with no note", ", ".join(refs)))
+    # Each line leads with the wake's id and when it fires (approvals refuses a card that leaves an id out); its words
+    # are what's cut to fit.
+    room = max(40, VOUCH_DETAILS // max(1, len(lines)) - 2)
+    out = [short(f"- {i}, fires {t}: {w}" + (f" ({r})" if r else ""), room) for i, t, w, r in lines]
     return "\n".join(out)[:VOUCH_DETAILS]
 
 
@@ -3512,6 +3514,8 @@ def ui_act(req, run):
             return {"ok": False, "message": "That isn't a vouch for scheduled jobs."}
         agent = m.group(1)
         ids = m.group(2).split(",")
+        if ids != sorted(set(ids)) or agent not in clock_agents():
+            return {"ok": False, "message": "That isn't a vouch for scheduled jobs."}
         code, out, err = run(agent, ["vouch", "--approval", pick("id"), *ids])
         if code != 0:
             return {"ok": False, "message": (err.strip().removeprefix("wake: ") or out.strip() or "That didn't work.")[:300]}

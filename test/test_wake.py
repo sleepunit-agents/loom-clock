@@ -3113,6 +3113,22 @@ sys.exit(code)
         # Not about a wake already the owner's, a schedule's occurrence, or one that isn't there.
         self.assertIn("no pending wake", self.cli("ask-vouch", "w-ffffff"))
 
+    def test_another_agent_s_wake_or_a_malformed_id_is_refused_before_anything_is_spent(self):
+        ids = self.unsigned(1)
+        card = wake_cli.vouch_pass()
+        self.answer(card["aid"], "allowed")
+        for target, agent in (("bo:" + ids[0], "bo"), ("ada:" + ids[0], "bo"), ("ada:w-ZZZZZZ", "ada"), ("ada:" + ids[0] + ",*", "ada"),
+                              ("ada:w-ffffff," + ids[0], "ada")):
+            req = {"action": "vouch-approved", "caller": self.OWNER, "fields": {"id": card["aid"], "agent": agent, "target": target}}
+            ran = []
+            r = wake_cli.ui_act(req, lambda agent, argv: ran.append(argv) or (1, "", "no"))
+            self.assertFalse(r["ok"], target)
+            self.assertEqual(ran, [], f"refused before the clock ran anything: {target} for {agent}")
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "allowed")
+        self.assertEqual(self.spool()[-1]["for"], "-")
+        # The card lists every wake on it by id, with when it fires.
+        self.assertIn(ids[0] + ", fires", self.approvals()["a"][card["aid"]]["details"])
+
 
 if __name__ == "__main__":
     unittest.main()
