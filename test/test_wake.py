@@ -2803,6 +2803,103 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         self.assertEqual(at_post[0][0]["argv"][-2:], ["--for", "-"])
         self.assertEqual(wake_cli.entry_for({"for": "../x"}), "-")
 
+    # ─── t-1974: the household's own wakes keep the owner's trust ────────────────
+
+    def fire_for(self, entry):
+        """The `--for` the clock hands the runtime as `entry` fires."""
+        at_post, *_ = self.deliver(entry)
+        return at_post[0][0]["argv"][-1]
+
+    def test_a_lane_wake_fires_with_owner(self):
+        # A household lane (a schedule set on loom's machine): every occurrence is the owner's, and fires as his.
+        self.assertIsNone(self.cli("schedule", "set", "plan-night", "--at", "23:41", "-f", "routines/nightly.md", over_api=False))
+        occ = self.spool()[-1]
+        self.assertEqual((occ["kind"], occ["for"]), ("schedule", "owner"))
+        self.assertEqual(self.fire_for(occ), "owner")
+        # And a wake that lane's own body sets from its owner house, with its statement: the owner's, said where.
+        self.assertEqual(self.set_for(statement="stmt-lane", answer=self.verified("ada", "jonathan-barket", True)), "owner")
+        self.assertEqual(self.spool()[-1]["for_in"], "cv-0123456789ab")
+        self.assertEqual(self.fire_for(self.spool()[-1]), "owner")
+
+    def test_a_wake_set_from_a_loren_conversation_fires_for_loren(self):
+        self.assertEqual(self.set_for(statement="stmt-loren", answer=self.verified("ada", "loren")), "loren")
+        w = self.spool()[-1]
+        self.assertEqual(w["for_in"], "cv-0123456789ab")
+        # The owner can't vouch it into his: it's Loren's work.
+        with mock.patch.object(wake_cli, "owner_at_terminal", return_value=True):
+            self.assertIn("stays theirs", self.cli("vouch", w["id"], over_api=False))
+        self.assertEqual(self.spool()[-1]["for"], "loren")
+        self.assertEqual(self.fire_for(w), "loren")
+
+    def test_an_unsigned_wake_stays_unknown(self):
+        # No statement (a stale wrapper): unknown, said so in the log, and fired as unknown.
+        self.assertEqual(self.set_for(), "-")
+        w = self.spool()[-1]
+        self.assertNotIn("for_in", w)
+        self.assertIn("principal-none | ada called with no principal statement", wake_cli.LOG.read_text())
+        self.assertEqual(self.fire_for(w), "-")
+        # A statement that doesn't verify: the same.
+        self.assertEqual(self.set_for(statement="stmt-forged", answer={"ok": False}, exit_code=1), "-")
+        self.assertNotIn("for_in", self.spool()[-1])
+        # One from before, set from a house: unknown, never promoted by where it fires.
+        self.assertEqual(self.fire_for({**self.base, "origin": "agent:ada"}), "-")
+
+    def test_only_the_owner_at_a_terminal_vouches_for_an_unknown_wake(self):
+        self.assertEqual(self.set_for(), "-")
+        wid = self.spool()[-1]["id"]
+        # Over the API, from a house, or from a body the runtime runs here: refused, whatever a terminal says.
+        self.assertNotIn("vouch", wake_cli.REMOTE_VERBS)
+        with mock.patch.object(wake_cli, "owner_at_terminal", return_value=True):
+            self.assertIn("never a body's", self.cli("vouch", wid))
+            for k, v in (("LOOM_BODY_CONVERSATION", "cv-0123456789ab"), ("LOOM_BODY_KEY", "k")):
+                with mock.patch.dict(wake_cli.os.environ, {k: v}):
+                    self.assertIn("never a body's", self.cli("vouch", wid, over_api=False))
+            with mock.patch.dict(wake_cli.os.environ, {"HOUSE_ID": "h-1"}):     # a house's goes to loom's API, refused there
+                self.assertIsNotNone(self.cli("vouch", wid, over_api=False))
+                wake_cli._PRINCIPAL.clear()
+                self.assertIn("never a body's", self._vouch_error(wid))
+        # No terminal (piped, a background session): refused, and nothing changes.
+        with mock.patch.object(wake_cli.os, "open", side_effect=OSError("no tty")):
+            self.assertIn("at a terminal", self.cli("vouch", wid, over_api=False))
+        self.assertEqual(self.spool()[-1]["for"], "-")
+        # The wrong ids typed: refused.
+        with mock.patch.object(wake_cli, "owner_at_terminal", side_effect=lambda prompt, want: False):
+            self.assertIn("at a terminal", self.cli("vouch", wid, over_api=False))
+        # The owner, typing its id: the owner's from here, stamped as vouched, and it fires as his.
+        typed = []
+        with mock.patch.object(wake_cli, "owner_at_terminal", side_effect=lambda prompt, want: typed.append(want) or True):
+            self.assertIsNone(self.cli("vouch", wid, over_api=False))
+        self.assertEqual(typed, [wid])
+        w = self.spool()[-1]
+        self.assertEqual((w["for"], w["vouched"]["by"], w["vouched"]["was"]), ("owner", "owner", "-"))
+        self.assertIn(f"vouch | {wid}", wake_cli.LOG.read_text())
+        # Already the owner's, a schedule's occurrence, or one that isn't there: nothing to vouch for.
+        with mock.patch.object(wake_cli, "owner_at_terminal", return_value=True):
+            self.assertIn("already for owner", self.cli("vouch", wid, over_api=False))
+            self.assertIn("no pending wake", self.cli("vouch", "w-ffffff", over_api=False))
+        self.assertEqual(self.fire_for(w), "owner")
+
+    def _vouch_error(self, wid):
+        try:
+            wake_cli.cmd_vouch(mock.Mock(ids=[wid]))
+        except SystemExit as e:
+            return str(e.code)
+        return ""
+
+    def test_the_terminal_word_is_read_from_dev_tty_exactly(self):
+        r, w = os.pipe()
+        os.write(w, b"w-aaaaaa w-bbbbbb\n")
+        written = []
+        with mock.patch.object(wake_cli.os, "open", return_value=r), \
+             mock.patch.object(wake_cli.os, "write", side_effect=lambda fd, b: written.append(b) or len(b)):
+            self.assertTrue(wake_cli.owner_at_terminal("? ", "w-aaaaaa w-bbbbbb"))
+        os.close(w)
+        r, w = os.pipe()
+        os.write(w, b"w-aaaaaa\n")
+        with mock.patch.object(wake_cli.os, "open", return_value=r), mock.patch.object(wake_cli.os, "write", return_value=2):
+            self.assertFalse(wake_cli.owner_at_terminal("? ", "w-aaaaaa w-bbbbbb"))
+        os.close(w)
+
 
 if __name__ == "__main__":
     unittest.main()

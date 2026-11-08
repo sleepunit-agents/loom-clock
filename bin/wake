@@ -12,6 +12,7 @@ fires in ~24h so the agent always at least gets to decide.
   wake list
   wake log [--since 24h] [--grep fire]   # the clock's own record (wake.log), newest last
   wake cancel w-abc123
+  wake vouch w-abc123   # (the owner, at a terminal here) an unknown wake is your own work: it fires as yours
   wake pause | wake resume   # hold every wake (each fires once, in order, on resume)
   wake now [--note …]        # a wake in a minute with no lane: look at what deserves attention
   wake rearm        # after boot: recreate transient timers from the spool
@@ -334,6 +335,7 @@ def principal_for():
         # On loom's machine. A body the runtime runs here (a local wake: LOOM_BODY_CONVERSATION) acts for whom its
         # conversation says, never for the owner by being here; anything else here is the owner's own account.
         conv = os.environ.get("LOOM_BODY_CONVERSATION", "").strip()
+        _LAST_IN[0] = None
         if not conv:
             return "owner"
         if not re.fullmatch(r"cv-[0-9a-f]{12}", conv):     # a body, with a conversation no one can read: unknown
@@ -345,16 +347,47 @@ def principal_for():
     # Once per run: the wake, its approval and that approval's spend all say the same.
     key = (statement, agent)
     if key not in _PRINCIPAL:
+        if not statement:
+            # A body with no statement (a stale wrapper, a runtime that couldn't say): unknown, and said so in the
+            # log, so a house whose wrapper never sends one shows up as such, not as quietly unknown wakes (t-1974).
+            log("principal-none", f"{agent or '?'} called with no principal statement: taken as unknown")
         v = verify_principal(statement) if statement else None
         if not v or not agent or v.get("agent") != agent:
             _PRINCIPAL[key] = "-"
+            if v and agent and v.get("agent") != agent:
+                log("principal-none", f"{agent}: a statement for another agent: taken as unknown")
         elif v.get("owner") is True:
             _PRINCIPAL[key] = "owner"
         else:
             f = v.get("for")
             # A person whose slug is "owner" is a person, not the owner: unknown here (the words are the same).
             _PRINCIPAL[key] = f if isinstance(f, str) and PRINCIPAL_SLUG.match(f) and f != "owner" else "-"
+        # Where it was said (t-1974): the conversation the runtime vouched for, kept beside `for` so an audit can say
+        # which body set a wake and whom it worked for, without the statement itself.
+        cv = v.get("conversation") if v and _PRINCIPAL[key] != "-" else None
+        _PRINCIPAL_IN[key] = cv if isinstance(cv, str) and re.fullmatch(r"cv-[0-9a-f]{12}", cv) else None
+    _LAST_IN[0] = _PRINCIPAL_IN[key]
     return _PRINCIPAL[key]
+
+
+_PRINCIPAL_IN = {}
+_LAST_IN = [None]
+
+
+def principal_in():
+    """The conversation the last principal_for() of this run was vouched for in (cv-…), or None."""
+    return _LAST_IN[0]
+
+
+def stamp_for(entry):
+    """`for` (and, when a statement vouched for it, `for_in`: its conversation) on a wake or schedule set by this run."""
+    entry["for"] = principal_for()
+    cv = principal_in() if entry["for"] != "-" else None
+    if cv:
+        entry["for_in"] = cv
+    else:
+        entry.pop("for_in", None)
+    return entry
 
 
 def narrower(a, b):
@@ -661,7 +694,7 @@ def schedule_entry(name, sched, at):
         "created": datetime.now().strftime(TIME_FMT),
     }
     # Its principal goes with it, like its origin: an occurrence is for whomever the schedule was set for.
-    for k in ("prompt", "prompt_file", "lane", "origin", "for", "slot"):
+    for k in ("prompt", "prompt_file", "lane", "origin", "for", "for_in", "slot"):
         if sched.get(k):
             entry[k] = sched[k]
     return entry
@@ -731,7 +764,7 @@ def cmd_set(args, when):
     if origin:
         entry["origin"] = origin
     # On whose behalf: the owner's on loom's machine, else what the body's verified principal says (or unknown).
-    entry["for"] = principal_for()
+    stamp_for(entry)
     place = (getattr(args, "place", "") or "").strip()
     if place:
         # A place is a conversation: what's delivered there feeds the body that has it. Set here, on loom's machine,
@@ -980,6 +1013,69 @@ def cmd_list(_args):
         print(f"{e['id']}  {e['at']}  (in {rel})  [{e['kind']}]  {what}{flag}")
 
 
+def owner_at_terminal(prompt, want):
+    """The owner's typed word, at a terminal on loom's machine (as the runtime's `principal --reset` takes it): the
+    line typed at /dev/tty is exactly `want`. A body has no controlling terminal (a house, `claude --bg`, the API
+    door), so it never gets this far; nothing here can be piped in."""
+    try:
+        fd = os.open("/dev/tty", os.O_RDWR | os.O_NOCTTY)
+    except OSError:
+        return False
+    try:
+        os.write(fd, prompt.encode())
+        line = b""
+        while len(line) < 4096:
+            c = os.read(fd, 1)
+            if not c or c == b"\n":
+                break
+            line += c
+        return bool(want) and line.decode(errors="replace").strip() == want
+    finally:
+        os.close(fd)
+
+
+def cmd_vouch(args):
+    """The owner's word that pending wakes set before their body could say whom it worked for are his (t-1974): each
+    then carries `for: owner`, stamped as vouched. Only the owner's, at a terminal on loom's machine: never over the
+    API, never from a body (one the runtime runs here included), and typed, never piped. Only a wake that is unknown
+    now: one for a person stays theirs, and one already the owner's needs nothing."""
+    if os.environ.get("WAKE_ORIGIN", "").strip() or os.environ.get("HOUSE_ID") or \
+            os.environ.get("LOOM_BODY_CONVERSATION", "").strip() or os.environ.get("LOOM_BODY_KEY"):
+        sys.exit("wake: vouch is the owner's, at a terminal on loom's machine, never a body's")
+    ids = list(dict.fromkeys(args.ids))
+
+    def check(entries):
+        by_id = {e["id"]: e for e in entries}
+        for i in ids:
+            e = by_id.get(i)
+            if not e:
+                sys.exit(f"wake: no pending wake {i}")
+            if e["kind"] != "wake":
+                sys.exit(f"wake: {i} is a {e['kind']}, not a one-off wake: a schedule's occurrences are its own "
+                         "(remove it and set it anew here to make it yours)")
+            if entry_for(e) != "-":
+                sys.exit(f"wake: {i} is already for {entry_for(e)}: only an unknown wake is vouched for "
+                         "(one for a person stays theirs)")
+        return by_id
+    check(read_spool())
+    # Asked outside the spool's lock: a wake that comes due while the owner reads fires as it stands.
+    want = " ".join(ids)
+    one = len(ids) == 1
+    if not owner_at_terminal(f"Vouch that {want} {'is' if one else 'are'} your own work, so {'it fires' if one else 'they fire'} "
+                             f"as yours? Type the id{'' if one else 's'} to confirm: ", want):
+        sys.exit("wake: vouch is the owner's, at a terminal on loom's machine: run it yourself and type the ids")
+    with Spool() as spool:
+        by_id = check(spool.entries)    # again, under the lock: what he typed is for what's pending now
+        now = datetime.now().strftime(TIME_FMT)
+        for i in ids:
+            by_id[i]["for"] = "owner"
+            by_id[i].pop("for_in", None)
+            by_id[i]["vouched"] = {"by": "owner", "at": now, "was": "-"}
+    for i in ids:
+        log("vouch", f"{i}: the owner vouched for it at a terminal here (was unknown): for=owner")
+    print(f"vouched for {want}: {'it fires' if one else 'they fire'} as the owner's")
+
+
 def cmd_log(args):
     """The clock's record, for a body that isn't on loom's machine (reflect, plan
     in a house): lines since a duration ago, optionally only those containing a word."""
@@ -1031,6 +1127,8 @@ def cmd_schedule(args):
         # loom's machine) can't run the owner's schedule as the owner's, nor the owner's body someone else's as his.
         # The owner himself here (principal_for: owner) leaves it the schedule's own.
         entry["for"] = narrower(entry_for(scheds[args.name]), principal_for())
+        if entry["for"] != entry_for(scheds[args.name]):
+            entry.pop("for_in", None)
         with Spool() as spool:
             if sum(1 for e in spool.entries if e["kind"] == "wake") >= MAX_PENDING:
                 sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
@@ -1074,10 +1172,13 @@ def cmd_schedule(args):
     # A loom lane is set here too, on loom's machine: the owner's. Over the API, the caller's verified principal. Set
     # again (the page's edit sheet, a body's re-set), it's never wider than it was: an owner's edit of a schedule a body
     # set for Loren keeps it Loren's (remove it and set it anew to make it yours).
-    sc["for"] = principal_for()
+    stamp_for(sc)
     prev = load_schedules().get(args.name)
     if isinstance(prev, dict):      # one from before t-1943 has no `for`: entry_for reads it by where it was set
+        was = sc["for"]
         sc["for"] = narrower(entry_for(prev), sc["for"])
+        if sc["for"] != was:
+            sc.pop("for_in", None)
     if args.slot:
         if not SLOT_NAME.match(args.slot):
             sys.exit(f"wake: --slot is lowercase letters, digits and dashes, not {args.slot!r}")
@@ -3370,6 +3471,9 @@ def main():
     p.add_argument("--local", action=argparse.BooleanOptionalAction, default=None, help="it needs loom's machine (systemd, files outside the repo); --no-local: a house")
     p.add_argument("--slot", default="", help="a house slot: the lane's bookkeeping between runs (one house at a time)")
     p.set_defaults(fn=cmd_lane)
+    p = sub.add_parser("vouch", help="(the owner, at a terminal here) these unknown wakes are your own work", allow_abbrev=False)
+    p.add_argument("ids", nargs="+")
+    p.set_defaults(fn=cmd_vouch)
     p = sub.add_parser("cancel", help="cancel a pending wake")
     p.add_argument("id")
     p.set_defaults(fn=cmd_cancel)
