@@ -189,7 +189,8 @@ inline prompt.
   its old wakes are the owner's asks with `wake ask-vouch <id>…` (over the API it's
   kept, and the service's next pass files the card, within 10 minutes), never for one
   a person or something unplaced steered (`for_people`, `for_why` steered). One card at a time: a new candidate withdraws the
-  waiting card unanswered and files one with the whole list; one that fires doesn't.
+  waiting card unanswered and files one with the whole list; one that fires doesn't
+  (unless none is left on it: then the card is withdrawn, nothing left to decide).
   **Allow** vouches for exactly its wakes: loom core posts `vouch-approved` here as
   the household owner right after it, and `wake vouch --approval a-… <ids>` spends the
   approval (allowed, for exactly those ids, once) and only then marks each one still

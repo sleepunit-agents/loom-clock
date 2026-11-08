@@ -3137,9 +3137,12 @@ sys.exit(code)
         # none and unverified: no evidence anyone else was behind it. steered (the runtime said unknown), other-agent,
         # a person named, or from before principals were kept: never by itself.
         for why, people, asked in (("none", [], True), ("unverified", [], True), ("steered", [], False), ("other-agent", [], False),
-                                   ("none", ["loren"], False), (None, [], False)):
+                                   ("none", ["loren"], False), (None, [], False), ("none", [], "local")):
             with wake_cli.Spool() as sp:
-                sp.entries = [{**self.base, "id": "w-aaaaa1", "origin": "agent:ada", "for": "-",
+                # "local": set by a body the runtime runs on loom's machine (no house origin): never by itself.
+                origin = {} if asked == "local" else {"origin": "agent:ada"}
+                asked = False if asked == "local" else asked
+                sp.entries = [{**self.base, "id": "w-aaaaa1", **origin, "for": "-",
                                **({"for_why": why} if why else {}), **({"for_people": people} if people else {})}]
             self.assertEqual(wake_cli.vouch_candidates(self.spool()) == ["w-aaaaa1"], asked, (why, people))
         # A statement that verifies as a person whose slug is "owner": unknown, steered, never asked about.
@@ -3155,6 +3158,8 @@ sys.exit(code)
         card = wake_cli.vouch_pass()
         self.answer(card["aid"], "allowed")
         self.cli("ask-vouch", ids[0])
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": "cv-0123456789ab"}):
+            self.cli("ask-vouch", ids[0], over_api=False)     # a body the runtime runs here: kept, never a pass
         self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "allowed")
         self.assertEqual({e["for"] for e in self.spool()}, {"-"})
         wake_cli.vouch_pass()       # the service's own pass applies it

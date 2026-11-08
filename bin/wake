@@ -1316,6 +1316,9 @@ def _vouch_pass(ask, apply):
             card["unread"] = card.get("unread", 0) + 1
             log("vouch-fail", f"{card['aid']}: its state can't be read ({card['unread']} of 3)")
             if card["unread"] >= 3:
+                # Taken back if the piece can still hear it; either way the next card for the same wakes is the same
+                # card while this one waits (approvals returns a waiting card for an identical request).
+                owner_approval_cmd("withdraw", card["aid"])
                 card = None
         if card and state != "unknown":
             card.pop("unread", None)
@@ -1373,8 +1376,9 @@ def cmd_ask_vouch(args):
     st = vouch_state()
     if set(ids) & set(st.get("denied") or []):
         sys.exit(f"wake: the owner said no for {' '.join(sorted(set(ids) & set(st['denied'])))} already: not asked again")
-    if os.environ.get("WAKE_ORIGIN", "").strip():
-        # Over the API (12 s for the whole call): kept, and the service's next pass files the card (within RUN_CHECK).
+    if body_env():
+        # A body's ask (over the API, 12 s for the whole call; or one the runtime runs here): kept, and the service's
+        # next pass files the card (within RUN_CHECK). A body's call never runs the pass, so it never spends anything.
         with open(WAKE_DIR / "vouch.lock", "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             st = vouch_state()
