@@ -181,8 +181,9 @@ inline prompt.
   sorted, at most 12): "Count these 5 scheduled jobs as your work?", each wake listed
   with what it's for and when it fires, in the clock's words. The service files it by
   itself for unknown wakes that look like the owner's: set from a house of the agent's
-  own, with no evidence of anyone else (the body had no word from the runtime, or the
-  runtime named no person: `for_why`, `for_people`). A wake from before principals
+  own, with no evidence of anyone else (the body had no word from the runtime:
+  `for_why` none or unverified). One the runtime called unknown (`steered`), or that named
+  a person (`for_people`), is never asked about by itself. A wake from before principals
   were kept, or one a person steered, it never asks about by itself; a body that knows
   its old wakes are the owner's asks with `wake ask-vouch <id>…` (over the API too),
   never for one a person steered. One card at a time: a new candidate withdraws the
@@ -191,7 +192,9 @@ inline prompt.
   the household owner right after it, and `wake vouch --approval a-… <ids>` spends the
   approval (allowed, for exactly those ids, once) and only then marks each one still
   pending and unknown `for: owner`, `vouched.approval`; one that fired meanwhile is
-  said, and left. The clock's next pass applies an Allow loom didn't. **Deny** changes
+  said, and left. The service's next pass applies an Allow loom didn't (never a body's
+  `ask-vouch` call). At most 12 wakes per card; the rest wait for the next one. The
+  Deny record (`vouch.json`) goes with the clock in the household bundle. **Deny** changes
   nothing, and those wakes are never asked about again. Only the household owner's
   call applies it (an agent's owner, an agent, no caller: refused), a body never runs
   `vouch` (not over the API, and not with a body's environment here), and only the
@@ -275,7 +278,7 @@ changing a setting, run `wake rearm` to re-arm the pending wakes with it.
 - **The piece API.** `api --json` (loom's `POST /api/clock/run`) takes
   `{"argv": [...]}` from the owner or an agent in `WAKE_AGENTS`. An agent
   reaches only its own clock; the owner may name any with `--agent`. Only the
-  clock verbs pass (`at in park list cancel log schedule relay relays lane`);
+  clock verbs pass (`at in park list cancel log schedule relay relays lane ask-vouch`);
   `fire`, `rearm`, `run`, `reap`, `ui` and `bundle` are loom's machine's.
 - **In a house** (`HOUSE_ID` set), `wake` forwards itself to loom's piece API
   with `LOOM_URL` and `LOOM_TOKEN_FILE` (default `/run/secrets/loom-token`),

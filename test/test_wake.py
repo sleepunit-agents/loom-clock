@@ -2916,6 +2916,11 @@ d["calls"].append(argv)
 def opt(k):
     return argv[argv.index(k) + 1] if k in argv else None
 out, code = "", 0
+NEED = {"request": ("--kind", "--target", "--ask", "--why", "--if-yes", "--if-no", "--details", "--as", "--on-behalf"),
+        "use": ("--kind", "--target", "--as", "--on-behalf"), "withdraw": ("--as",)}
+if any(k not in argv for k in NEED.get(argv[0], ())):     # the real piece's flags, every one (loom-approvals' run)
+    sys.stderr.write("usage\\n")
+    sys.exit(2)
 if argv[0] == "request":
     hit = [i for i, a in d["a"].items() if a["kind"] == opt("--kind") and a["target"] == opt("--target") and a["state"] == "pending"]
     if hit:
@@ -2981,7 +2986,6 @@ sys.exit(code)
             out = io.StringIO()
             with mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "", "WAKE_CALLER": ""}), contextlib.redirect_stdout(out):
                 try:
-                    wake_cli.main.__globals__["configure"]   # same process: the patched clock is ada's
                     wake_cli.cmd_vouch(argparse.Namespace(ids=[a for a in argv if a.startswith("w-")], approval=argv[argv.index("--approval") + 1]))
                 except SystemExit as e:
                     return 1, out.getvalue(), str(e.code)
@@ -3128,6 +3132,45 @@ sys.exit(code)
         self.assertEqual(self.spool()[-1]["for"], "-")
         # The card lists every wake on it by id, with when it fires.
         self.assertIn(ids[0] + ", fires", self.approvals()["a"][card["aid"]]["details"])
+
+    def test_only_a_body_with_no_word_from_the_runtime_is_asked_about_by_itself(self):
+        # none and unverified: no evidence anyone else was behind it. steered (the runtime said unknown), other-agent,
+        # a person named, or from before principals were kept: never by itself.
+        for why, people, asked in (("none", [], True), ("unverified", [], True), ("steered", [], False), ("other-agent", [], False),
+                                   ("none", ["loren"], False), (None, [], False)):
+            with wake_cli.Spool() as sp:
+                sp.entries = [{**self.base, "id": "w-aaaaa1", "origin": "agent:ada", "for": "-",
+                               **({"for_why": why} if why else {}), **({"for_people": people} if people else {})}]
+            self.assertEqual(wake_cli.vouch_candidates(self.spool()) == ["w-aaaaa1"], asked, (why, people))
+        # A statement that verifies as a person whose slug is "owner": unknown, steered, never asked about.
+        self.assertEqual(self.set_for(statement="stmt", answer={**self.verified("ada", "owner"), "people": []}), "-")
+        self.assertEqual(self.spool()[-1]["for_why"], "steered")
+        self.assertNotIn(self.spool()[-1]["id"], wake_cli.vouch_candidates(self.spool()))
+
+    def test_the_target_is_sorted_and_each_wake_once(self):
+        self.assertEqual(wake_cli.vouch_target(["w-cccccc", "w-aaaaaa", "w-cccccc", "w-bbbbbb"]), "ada:w-aaaaaa,w-bbbbbb,w-cccccc")
+
+    def test_a_body_s_ask_never_spends_an_allowed_card(self):
+        ids = self.unsigned(2)
+        card = wake_cli.vouch_pass()
+        self.answer(card["aid"], "allowed")
+        self.cli("ask-vouch", ids[0])
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "allowed")
+        self.assertEqual({e["for"] for e in self.spool()}, {"-"})
+        wake_cli.vouch_pass()       # the service's own pass applies it
+        self.assertEqual({e["for"] for e in self.spool()}, {"owner"})
+
+    def test_the_card_never_carries_a_wake_s_prompt_and_its_words_are_plain(self):
+        with wake_cli.Spool() as sp:
+            sp.entries.append({**self.base, "id": "w-aaaaa2", "note": "", "prompt": "token sk-SECRET do x", "origin": "agent:ada"})
+            sp.entries.append({**self.base, "id": "w-aaaaa3", "note": "check \u202eevil\u202c [link](x)", "origin": "agent:ada"})
+        d = wake_cli.vouch_listing(self.spool(), ["w-aaaaa2", "w-aaaaa3"])
+        self.assertNotIn("SECRET", d)
+        self.assertIn("A wake with no note", d)
+        self.assertNotIn("\u202e", d)
+
+    def test_the_deny_record_goes_with_the_clock_in_the_bundle(self):
+        self.assertIn("vouch.json", wake_cli.CLOCK_FILES)
 
 
 if __name__ == "__main__":
