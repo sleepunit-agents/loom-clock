@@ -219,7 +219,23 @@ def clock_agents():
 
 DEFAULT_MODEL = setting("WAKE_MODEL", "claude-sonnet-5")
 DEADMAN_HOURS = 24
-LOOM = setting("WAKE_LOOM", "loom")
+
+
+def find_loom(home=None):
+    """loom's command: WAKE_LOOM when it's set, else `loom` on PATH, else ~/.local/bin/loom, else bare `loom`.
+    A systemd user unit (art-chain-check.service) has no ~/.local/bin on PATH, so a bare `loom` didn't run and a
+    wake it set was delivered as unknown (t-1976)."""
+    named = setting("WAKE_LOOM")
+    if named:
+        return named
+    on_path = shutil.which("loom")
+    if on_path:
+        return on_path
+    local = Path(home or HOME) / ".local" / "bin" / "loom"
+    return str(local) if os.access(local, os.X_OK) else "loom"
+
+
+LOOM = find_loom()
 FIRE_CONF = CLOCKS / "fire"
 # A remote caller's -f must name a lane file in the repo, never a path on
 # loom's machine at large: what -f names becomes a house's task.

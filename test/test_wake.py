@@ -3252,5 +3252,53 @@ sys.exit(code)
         self.assertIn("nothing for you to spend", words)
 
 
+class FindsLoomWithoutPath(unittest.TestCase):
+    """A wake set from a systemd user unit has no ~/.local/bin on PATH, so a bare `loom` didn't run and the wake was
+    delivered as unknown (t-1976). The clock finds loom itself: WAKE_LOOM, else PATH, else ~/.local/bin/loom."""
+
+    def _home_loom(self, td):
+        b = Path(td) / ".local" / "bin"
+        b.mkdir(parents=True)
+        (b / "loom").write_text("#!/bin/sh\nexit 0\n")
+        (b / "loom").chmod(0o755)
+        return b / "loom"
+
+    def test_without_path_it_finds_loom_in_home_local_bin(self):
+        with tempfile.TemporaryDirectory() as td:
+            loom = self._home_loom(td)
+            with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "WAKE_LOOM": ""}):
+                self.assertEqual(wake_cli.find_loom(home=Path(td)), str(loom))
+
+    def test_loom_on_path_wins_over_home(self):
+        with tempfile.TemporaryDirectory() as td, tempfile.TemporaryDirectory() as pd:
+            self._home_loom(td)
+            (Path(pd) / "loom").write_text("#!/bin/sh\n")
+            (Path(pd) / "loom").chmod(0o755)
+            with mock.patch.dict(os.environ, {"PATH": f"{pd}:/usr/bin:/bin", "WAKE_LOOM": ""}):
+                self.assertEqual(wake_cli.find_loom(home=Path(td)), str(Path(pd) / "loom"))
+
+    def test_wake_loom_still_overrides(self):
+        with tempfile.TemporaryDirectory() as td:
+            self._home_loom(td)
+            with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "WAKE_LOOM": "/opt/loom"}):
+                self.assertEqual(wake_cli.find_loom(home=Path(td)), "/opt/loom")
+
+    def test_nowhere_it_stays_bare_loom(self):
+        with tempfile.TemporaryDirectory() as td:
+            with mock.patch.dict(os.environ, {"PATH": "/usr/bin:/bin", "WAKE_LOOM": ""}):
+                self.assertEqual(wake_cli.find_loom(home=Path(td)), "loom")
+
+    def test_the_principal_command_runs_from_a_bare_path(self):
+        """End to end: a fresh module load with PATH=/usr/bin:/bin and loom only in ~/.local/bin."""
+        with tempfile.TemporaryDirectory() as td:
+            loom = self._home_loom(td)
+            env = {**os.environ, "PATH": "/usr/bin:/bin", "HOME": td, "WAKE_LOOM": ""}
+            code = ("import sys; from pathlib import Path; ns={'__file__': sys.argv[1], '__name__': 'wake_t'}; "
+                    "exec(compile(Path(sys.argv[1]).read_text(), sys.argv[1], 'exec'), ns); print(ns['principal_argv']()[0])")
+            r = subprocess.run([sys.executable, "-c", code, str(SCRIPT)], env=env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), str(loom))
+
+
 if __name__ == "__main__":
     unittest.main()
