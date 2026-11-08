@@ -166,6 +166,15 @@ inline prompt.
   before this has no `for`: the owner's if it was set here, else unknown. A wake
   that goes the old way (a spawned house, a session here) has no runtime record
   to hand it to, so it's unknown there. The statement itself is never logged.
+- **Where it was said, and the owner's word** (t-1974). A wake a statement vouched
+  for keeps that statement's conversation beside its `for` (`for_in: cv-…`, never the
+  statement), so an audit can say which body set it. A body with no statement is
+  logged (`principal-none`): a house whose wrapper never sends one shows up in
+  `wake log`, not as quietly unknown wakes. A wake that's unknown stays unknown: no
+  guess makes it the owner's. The owner can say one is his with `wake vouch <id>…`,
+  only at a terminal on loom's machine, typing the ids (as the runtime's `principal
+  --reset`): never over the API or from a body, never piped, and never for a wake
+  that's a person's (it stays theirs). It's stamped `vouched` and logged.
 - **Relays** between agents moved to loom's runtime (loom
   `docs/specs/agent-runtime.md`, "Agent-to-agent relay"): its `relay` MCP
   tool, or `loom runtime relay` from a house. Pairing is the runtime's
