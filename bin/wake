@@ -965,6 +965,10 @@ def spend_words(rid, card):
         return (f"The clock no longer has the words {rid} was filed for, so it can't be set from it. Don't spend it: "
                 f"comment on the task what was waiting, set the wake again with its words (-p) so the owner is asked "
                 f"once more, and park on the new id.")
+    if (card or {}).get("kind") in ("vouch-wake", "principal-reset", "grant"):
+        # The owner's Allow on these is applied by the piece that filed it (approvals refuses a body's spend).
+        return (f"The owner allowed {rid}, and the piece that filed it applies it: there's nothing for you to spend. "
+                "Check it took (wake list, or Permissions), and pick up where you left off.")
     if card:
         return (f"Pick up where you left off, and spend it on exactly the action it allows ({card['kind']} for "
                 f"{card['target']}): `approvals use {rid} --kind {card['kind']} --target {shlex.quote(card['target'])}`, "
@@ -1216,12 +1220,13 @@ def save_vouch_state(d):
 def vouch_candidates(entries):
     """The pending wakes the clock asks about by itself: unknown, set from a house of this agent's (its own token,
     `origin: agent:<it>`), and with no evidence anyone but the owner was behind it: one whose body had no word from the
-    runtime (`for_why` none, or a statement that didn't verify). One the runtime called unknown (`steered`: a relay, a
+    runtime (`for_why` none: it sent no statement). One whose statement didn't verify (`unverified`: which may be a
+    person's, during a runtime outage) or one the runtime called unknown (`steered`: a relay, a
     sender it couldn't name) is evidence something other than the owner steered it. A wake from before principals were
     kept (no `for`) says nothing either way, and one that named a person is that person's: the clock asks about none of
     those by itself (a body that knows may ask about the first two, `wake ask-vouch`; never one a person steered)."""
     return [e["id"] for e in entries if vouchable(e) and e.get("origin") == f"agent:{AGENT}" and "for" in e
-            and e.get("for_why") in ("none", "unverified") and not e.get("for_people")]
+            and e.get("for_why") == "none" and not e.get("for_people")]
 
 
 def vouch_listing(entries, ids):
@@ -1231,15 +1236,17 @@ def vouch_listing(entries, ids):
     lines = []
     for i in ids:
         e = by_id[i]
-        # Its note (or lane), never its prompt (which may carry anything); plain, as the card's other words.
-        what = what_of(e) if (e.get("note") or e.get("schedule") or e.get("prompt_file") or e.get("lane")) else ""
-        words, refs = wake_words(plain(what, 400))
+        # What it will run, in its own words: its note (or lane) as written, then the start of its prompt, plain and
+        # with credentials taken out (redact), so the owner reads what his Allow makes his.
+        note = what_of(e) if (e.get("note") or e.get("schedule") or e.get("prompt_file") or e.get("lane")) else ""
+        prompt = redact(plain(e.get("prompt") or "", 400)) if not (e.get("prompt_file") or e.get("lane")) else ""
+        words = " · ".join(x for x in (plain(note, 200), f"runs: {prompt}" if prompt else "") if x)
         when = day_time(datetime.strptime(e["at"], TIME_FMT), now)
-        lines.append((i, when, words or "A wake with no note", ", ".join(refs)))
+        lines.append((i, when, words or "a wake with nothing to say what it runs"))
     # Each line leads with the wake's id and when it fires (approvals refuses a card that leaves an id out); its words
     # are what's cut to fit.
     room = max(40, VOUCH_DETAILS // max(1, len(lines)) - 2)
-    out = [short(f"- {i}, fires {t}: {w}" + (f" ({r})" if r else ""), room) for i, t, w, r in lines]
+    out = [short(f"- {i}, fires {t}: {w}", room) for i, t, w in lines]
     return "\n".join(out)[:VOUCH_DETAILS]
 
 
@@ -1294,7 +1301,7 @@ def _vouch_pass(ask, apply):
     card = st.get("card")
     state = None
     if card:
-        state = request_state(card["aid"])
+        state = request_state(card["aid"], timeout=4)     # the owner's own ask-vouch call runs this within 12 s
         if state == "allowed" and apply:
             # The owner said yes and loom didn't apply it (or not yet): the service does, the approval being the proof.
             # Only the service: never inside a body's own call (ask-vouch), which mustn't be what spends the owner's yes.
@@ -1335,7 +1342,7 @@ def _vouch_pass(ask, apply):
     if card and state == "pending" and (not set(want) <= set(card["ids"]) or not (set(card["ids"]) & unknown)):
         # Someone new to ask about, or nothing on it left to decide: the old card goes, unanswered.
         why = owner_approval_cmd("withdraw", card["aid"])
-        now_state = request_state(card["aid"]) if why else "withdrawn"
+        now_state = request_state(card["aid"], timeout=4) if why else "withdrawn"
         if now_state != "withdrawn":
             # Not withdrawn: still waiting, or the owner answered meanwhile (taken in on the next pass). Kept as it is.
             log("vouch-fail", f"{card['aid']}: couldn't withdraw it ({why}; it's {now_state}); left as it is")

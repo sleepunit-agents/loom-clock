@@ -181,8 +181,9 @@ inline prompt.
   sorted, at most 12): "Count these 5 scheduled jobs as your work?", each wake listed
   with what it's for and when it fires, in the clock's words. The service files it by
   itself for unknown wakes that look like the owner's: set from a house of the agent's
-  own, with no evidence of anyone else (the body had no word from the runtime:
-  `for_why` none or unverified). One the runtime called unknown (`steered`), or that named
+  own, with no evidence of anyone else (the body sent no statement: `for_why` none).
+  One whose statement didn't verify (`unverified`, which may be a person's during a
+  runtime outage) isn't asked about by itself either. One the runtime called unknown (`steered`), or that named
   a person (`for_people`), is never asked about by itself. A wake from before principals
   were kept, or one a person steered, it never asks about by itself (a card it can't read
   three passes running is let go); a body that knows
@@ -202,7 +203,9 @@ inline prompt.
   nothing, and those wakes are never asked about again. Only the household owner's
   call applies it (an agent's owner, an agent, no caller: refused), a body never runs
   `vouch` (not over the API, and not with a body's environment here), and only the
-  clock spends the approval. State: `vouch.json` beside the spool.
+  clock spends the approval (approvals refuses a body's spend of this kind; a parked
+  body is told there's nothing to spend). Each wake is listed with its note and the start
+  of what it runs (credentials taken out). State: `vouch.json` beside the spool.
 - **Relays** between agents moved to loom's runtime (loom
   `docs/specs/agent-runtime.md`, "Agent-to-agent relay"): its `relay` MCP
   tool, or `loom runtime relay` from a house. Pairing is the runtime's

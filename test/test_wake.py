@@ -3148,7 +3148,7 @@ sys.exit(code)
     def test_only_a_body_with_no_word_from_the_runtime_is_asked_about_by_itself(self):
         # none and unverified: no evidence anyone else was behind it. steered (the runtime said unknown), other-agent,
         # a person named, or from before principals were kept: never by itself.
-        for why, people, asked in (("none", [], True), ("unverified", [], True), ("steered", [], False), ("other-agent", [], False),
+        for why, people, asked in (("none", [], True), ("unverified", [], False), ("steered", [], False), ("other-agent", [], False),
                                    ("none", ["loren"], False), (None, [], False), ("none", [], "local")):
             with wake_cli.Spool() as sp:
                 # "local": set by a body the runtime runs on loom's machine (no house origin): never by itself.
@@ -3184,11 +3184,11 @@ sys.exit(code)
 
     def test_the_card_never_carries_a_wake_s_prompt_and_its_words_are_plain(self):
         with wake_cli.Spool() as sp:
-            sp.entries.append({**self.base, "id": "w-aaaaa2", "note": "", "prompt": "token sk-SECRET do x", "origin": "agent:ada"})
+            sp.entries.append({**self.base, "id": "w-aaaaa2", "note": "", "prompt": "token=SECRETVALUE and sk-SECRETSECRETSECRET do x", "origin": "agent:ada"})
             sp.entries.append({**self.base, "id": "w-aaaaa3", "note": "check \u202eevil\u202c [link](x)", "origin": "agent:ada"})
         d = wake_cli.vouch_listing(self.spool(), ["w-aaaaa2", "w-aaaaa3"])
         self.assertNotIn("SECRET", d)
-        self.assertIn("A wake with no note", d)
+        self.assertIn("runs: token=[redacted]", d, "what it runs, with the credential taken out")
         self.assertNotIn("\u202e", d)
 
     def test_the_deny_record_goes_with_the_clock_in_the_bundle(self):
@@ -3245,6 +3245,11 @@ sys.exit(code)
             self.assertFalse(wake_cli.ui_act({"action": "vouch-approved", "caller": self.OWNER,
                                               "fields": {"id": "a-1a2b3c4d", "agent": "ada", "target": "bo:w-0000b1"}}, run)["ok"])
         self.assertEqual(seen, [])
+
+    def test_a_parked_body_is_never_told_to_spend_an_owner_applied_card(self):
+        words = wake_cli.spend_words("a-1a2b3c4d", {"kind": "vouch-wake", "target": "ada:w-000001"})
+        self.assertNotIn("approvals use", words)
+        self.assertIn("nothing for you to spend", words)
 
 
 if __name__ == "__main__":
