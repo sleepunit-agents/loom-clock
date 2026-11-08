@@ -3167,6 +3167,17 @@ sys.exit(code)
                                                 "for_why": "steered", "for_people": ["loren"]}, wake_cli.datetime.now())
         self.assertEqual((e["for_why"], e["for_people"]), ("steered", ["loren"]))
 
+    def test_a_full_card_of_long_notes_fits_approvals_cap_as_approvals_counts_it(self):
+        import unicodedata
+        with wake_cli.Spool() as sp:
+            sp.entries = [{**self.base, "id": f"w-00000{i:x}", "origin": "agent:ada", "note": "t-1076 wake-chain-density round 8 " + "x " * 200,
+                           "prompt": "check everything " * 50} for i in range(12)]
+        d = wake_cli.vouch_listing(self.spool(), [f"w-00000{i:x}" for i in range(12)])
+        self.assertLessEqual(len(unicodedata.normalize("NFKC", d)), 1000)
+        for i in range(12):
+            self.assertIn(f"- w-00000{i:x}, fires", d)
+
+
     def test_the_target_is_sorted_and_each_wake_once(self):
         self.assertEqual(wake_cli.vouch_target(["w-cccccc", "w-aaaaaa", "w-cccccc", "w-bbbbbb"]), "ada:w-aaaaaa,w-bbbbbb,w-cccccc")
 
