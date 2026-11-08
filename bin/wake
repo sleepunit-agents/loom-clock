@@ -1262,8 +1262,15 @@ def vouch_listing(entries, ids):
     # Each line leads with the wake's id and when it fires (approvals refuses a card that leaves an id out); its words
     # are what's cut to fit.
     room = max(40, VOUCH_DETAILS // max(1, len(lines)) - 2)
-    out = [short(f"- {i}, fires {t}: {w}", room) for i, t, w in lines]
-    return "\n".join(out)[:VOUCH_DETAILS]
+    # Counted as approvals counts it: after NFKC, which turns short()'s "…" into three characters. Each line is cut to its
+    # room in those terms, so the whole fits and every line keeps its id and when it fires.
+    out = [unicodedata.normalize("NFKC", short(f"- {i}, fires {t}: {w}", room - 2)) for i, t, w in lines]
+    text = "\n".join(out)
+    while len(text) > VOUCH_DETAILS:          # never expected; fail safe by cutting words, never an id line
+        longest = max(range(len(out)), key=lambda k: len(out[k]))
+        out[longest] = out[longest][:max(30, len(out[longest]) - (len(text) - VOUCH_DETAILS) - 3)] + "..."
+        text = "\n".join(out)
+    return text
 
 
 def clock_as():
