@@ -175,6 +175,37 @@ inline prompt.
   only at a terminal on loom's machine, typing the ids (as the runtime's `principal
   --reset`): never over the API or from a body, never piped, and never for a wake
   that's a person's (it stays theirs). It's stamped `vouched` and logged.
+- **Asked on loom's page** (t-1975; Jonathan: "It needs to have the site ask me").
+  The terminal is the fallback: the owner is asked on loom's Inbox instead, one card
+  per agent, a `vouch-wake` approval the clock files (target `<agent>:<w-id>,…`,
+  sorted, at most 12): "Count these 5 scheduled jobs as your work?", each wake listed
+  with what it's for and when it fires, in the clock's words. The service files it by
+  itself for unknown wakes that look like the owner's: set from a house of the agent's
+  own, with no evidence of anyone else (the body sent no statement: `for_why` none).
+  One whose statement didn't verify (`unverified`, which may be a person's during a
+  runtime outage) isn't asked about by itself either. One the runtime called unknown (`steered`), or that named
+  a person (`for_people`), is never asked about by itself. A wake from before principals
+  were kept, or one a person steered, it never asks about by itself (a card it can't read
+  three passes running is let go); a body that knows
+  its old wakes are the owner's asks with `wake ask-vouch <id>…` (over the API it's
+  kept, and the service's next pass files the card, within 10 minutes), never for one
+  a person or something unplaced steered (`for_people`, `for_why` steered). One card at a time: a new candidate withdraws the
+  waiting card unanswered and files one with the whole list; one that fires doesn't
+  (unless none is left on it: then the card is withdrawn, nothing left to decide).
+  **Allow** vouches for exactly its wakes: loom core posts `vouch-approved` here as
+  the household owner right after it (fields `id`, `target`, and `agent`, which must be the
+  target's), and runs `wake vouch --approval a-… <ids>` on that agent's clock, which spends the
+  approval (allowed, for exactly those ids, once) and only then marks each one still
+  pending and unknown `for: owner`, `vouched.approval`; one that fired meanwhile is
+  said, and left. The service's next pass applies an Allow loom didn't (never a body's
+  `ask-vouch` call). At most 12 wakes per card; the rest wait for the next one. The
+  Deny record (`vouch.json`) goes with the clock in the household bundle. **Deny** changes
+  nothing, and those wakes are never asked about again. Only the household owner's
+  call applies it (an agent's owner, an agent, no caller: refused), a body never runs
+  `vouch` (not over the API, and not with a body's environment here), and only the
+  clock spends the approval (approvals refuses a body's spend of this kind; a parked
+  body is told there's nothing to spend). Each wake is listed with its note and the start
+  of what it runs (credentials taken out). State: `vouch.json` beside the spool.
 - **Relays** between agents moved to loom's runtime (loom
   `docs/specs/agent-runtime.md`, "Agent-to-agent relay"): its `relay` MCP
   tool, or `loom runtime relay` from a house. Pairing is the runtime's
@@ -254,7 +285,7 @@ changing a setting, run `wake rearm` to re-arm the pending wakes with it.
 - **The piece API.** `api --json` (loom's `POST /api/clock/run`) takes
   `{"argv": [...]}` from the owner or an agent in `WAKE_AGENTS`. An agent
   reaches only its own clock; the owner may name any with `--agent`. Only the
-  clock verbs pass (`at in park list cancel log schedule relay relays lane`);
+  clock verbs pass (`at in park list cancel log schedule relay relays lane ask-vouch`);
   `fire`, `rearm`, `run`, `reap`, `ui` and `bundle` are loom's machine's.
 - **In a house** (`HOUSE_ID` set), `wake` forwards itself to loom's piece API
   with `LOOM_URL` and `LOOM_TOKEN_FILE` (default `/run/secrets/loom-token`),

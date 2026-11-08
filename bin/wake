@@ -84,7 +84,9 @@ can't turn someone else's request into the owner's.
 """
 
 import argparse
+import contextlib
 import fcntl
+import io
 import json
 import hashlib
 import os
@@ -222,7 +224,7 @@ FIRE_CONF = CLOCKS / "fire"
 # A remote caller's -f must name a lane file in the repo, never a path on
 # loom's machine at large: what -f names becomes a house's task.
 PROMPT_ROOTS = tuple(REPO / d for d in LANE_DIRS)
-REMOTE_VERBS = {"at", "in", "park", "list", "cancel", "log", "schedule", "relay", "relays", "lane"}
+REMOTE_VERBS = {"at", "in", "park", "list", "cancel", "log", "schedule", "relay", "relays", "lane", "ask-vouch"}
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 # The environment a timer's `wake fire` needs to find this clock and its tools again: the
 # transient unit starts from the user manager's environment, not ours.
@@ -347,6 +349,7 @@ def principal_for():
     # Once per run: the wake, its approval and that approval's spend all say the same.
     key = (statement, agent)
     if key not in _PRINCIPAL:
+        _PRINCIPAL_WHY[key] = ("none" if not statement else None, [])
         if not statement:
             # A body with no statement (a stale wrapper, a runtime that couldn't say): unknown, and said so in the
             # log, so a house whose wrapper never sends one shows up as such, not as quietly unknown wakes (t-1974).
@@ -354,23 +357,34 @@ def principal_for():
         v = verify_principal(statement) if statement else None
         if not v or not agent or v.get("agent") != agent:
             _PRINCIPAL[key] = "-"
+            if statement:
+                _PRINCIPAL_WHY[key] = ("unverified", [])
             if v and agent and v.get("agent") != agent:
                 log("principal-none", f"{agent}: a statement for another agent: taken as unknown")
+                _PRINCIPAL_WHY[key] = ("other-agent", [])
         elif v.get("owner") is True:
             _PRINCIPAL[key] = "owner"
         else:
             f = v.get("for")
             # A person whose slug is "owner" is a person, not the owner: unknown here (the words are the same).
             _PRINCIPAL[key] = f if isinstance(f, str) and PRINCIPAL_SLUG.match(f) and f != "owner" else "-"
+            if _PRINCIPAL[key] == "-":
+                # Unknown by the runtime's word (t-1975): the people it named (evidence someone other than the owner
+                # steered it) are kept, so the clock never asks the owner to count that wake as his own.
+                people = [x for x in (v.get("people") or []) if isinstance(x, str) and PRINCIPAL_SLUG.match(x)][:20]
+                _PRINCIPAL_WHY[key] = ("steered", people)
         # Where it was said (t-1974): the conversation the runtime vouched for, kept beside `for` so an audit can say
         # which body set a wake and whom it worked for, without the statement itself.
         cv = v.get("conversation") if v and _PRINCIPAL[key] != "-" else None
         _PRINCIPAL_IN[key] = cv if isinstance(cv, str) and re.fullmatch(r"cv-[0-9a-f]{12}", cv) else None
     _LAST_IN[0] = _PRINCIPAL_IN[key]
+    _LAST_WHY[0] = _PRINCIPAL_WHY.get(key, (None, []))
     return _PRINCIPAL[key]
 
 
 _PRINCIPAL_IN = {}
+_PRINCIPAL_WHY = {}
+_LAST_WHY = [(None, [])]
 _LAST_IN = [None]
 
 
@@ -387,6 +401,15 @@ def stamp_for(entry):
         entry["for_in"] = cv
     else:
         entry.pop("for_in", None)
+    # Why it's unknown, and anyone the runtime named (t-1975): what the clock reads before it asks the owner to count
+    # an unknown wake as his (vouch_candidates, ask-vouch): for every unknown wake, a house's or a local body's.
+    why, people = _LAST_WHY[0] if entry["for"] == "-" else (None, [])
+    entry.pop("for_why", None)
+    entry.pop("for_people", None)
+    if why:
+        entry["for_why"] = why
+    if people:
+        entry["for_people"] = people
     return entry
 
 
@@ -694,7 +717,9 @@ def schedule_entry(name, sched, at):
         "created": datetime.now().strftime(TIME_FMT),
     }
     # Its principal goes with it, like its origin: an occurrence is for whomever the schedule was set for.
-    for k in ("prompt", "prompt_file", "lane", "origin", "for", "for_in", "slot"):
+    # Why it's unknown, and anyone named, go with it too (t-1975): an occurrence (and a retry of one) is asked about as
+    # its schedule would be, never as a wake with no record.
+    for k in ("prompt", "prompt_file", "lane", "origin", "for", "for_in", "for_why", "for_people", "slot"):
         if sched.get(k):
             entry[k] = sched[k]
     return entry
@@ -940,6 +965,10 @@ def spend_words(rid, card):
         return (f"The clock no longer has the words {rid} was filed for, so it can't be set from it. Don't spend it: "
                 f"comment on the task what was waiting, set the wake again with its words (-p) so the owner is asked "
                 f"once more, and park on the new id.")
+    if (card or {}).get("kind") in ("vouch-wake", "principal-reset", "grant"):
+        # The owner's Allow on these is applied by the piece that filed it (approvals refuses a body's spend).
+        return (f"The owner allowed {rid}, and the piece that filed it applies it: there's nothing for you to spend. "
+                "Check it took (wake list, or Permissions), and pick up where you left off.")
     if card:
         return (f"Pick up where you left off, and spend it on exactly the action it allows ({card['kind']} for "
                 f"{card['target']}): `approvals use {rid} --kind {card['kind']} --target {shlex.quote(card['target'])}`, "
@@ -947,11 +976,11 @@ def spend_words(rid, card):
     return f"Pick up where you left off, and spend it with --approval {rid} on exactly the action it allows."
 
 
-def request_state(rid):
+def request_state(rid, timeout=30):
     """A request's state, read on loom's machine: secrets' q-… or approvals' a-…; 'unknown' if it can't be read."""
     argv = [LOOM, "secrets", "state", rid] if rid.startswith("q-") else [*approvals_argv(), "check", rid]
     try:
-        r = subprocess.run(argv, capture_output=True, text=True, timeout=30,
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
                            env={k: v for k, v in os.environ.items() if k not in ("HOUSE_ID", "WAKE_CALLER")})
     except (OSError, subprocess.TimeoutExpired):
         return "unknown"
@@ -1034,15 +1063,56 @@ def owner_at_terminal(prompt, want):
         os.close(fd)
 
 
+def vouchable(e):
+    """Whether a pending entry is one an owner's vouch can make his: a one-off wake whose principal is unknown."""
+    return e.get("kind") == "wake" and entry_for(e) == "-"
+
+
+def body_env():
+    """Whether this run is a body's (a house's API call, a house, a body the runtime runs here), never the owner's."""
+    return bool(os.environ.get("WAKE_ORIGIN", "").strip() or os.environ.get("HOUSE_ID")
+                or os.environ.get("LOOM_BODY_CONVERSATION", "").strip() or os.environ.get("LOOM_BODY_KEY"))
+
+
+def vouch_target(ids):
+    """A vouch-wake approval's target (loom-approvals): <agent>:<ids sorted, each once>. One set, one text."""
+    return f"{AGENT}:{','.join(sorted(set(ids)))}"
+
+
+def vouch_parse(target):
+    """vouch_target read back: (agent, ids), or None unless it's exactly what vouch_target makes (1 to VOUCH_MAX ids)."""
+    agent, _, rest = str(target or "").partition(":")
+    ids = rest.split(",") if rest else []
+    if not AGENT_NAME.match(agent) or not 1 <= len(ids) <= VOUCH_MAX or not all(re.fullmatch(r"w-[0-9a-f]{6}", i) for i in ids) \
+            or ids != sorted(set(ids)):
+        return None
+    return agent, ids
+
+
+def vouch_mark(by_id, ids, how):
+    now = datetime.now().strftime(TIME_FMT)
+    for i in ids:
+        by_id[i]["for"] = "owner"
+        by_id[i].pop("for_in", None)
+        by_id[i]["vouched"] = {"by": "owner", "at": now, "was": "-", **how}
+
+
 def cmd_vouch(args):
     """The owner's word that pending wakes set before their body could say whom it worked for are his (t-1974): each
-    then carries `for: owner`, stamped as vouched. Only the owner's, at a terminal on loom's machine: never over the
-    API, never from a body (one the runtime runs here included), and typed, never piped. Only a wake that is unknown
-    now: one for a person stays theirs, and one already the owner's needs nothing."""
-    if os.environ.get("WAKE_ORIGIN", "").strip() or os.environ.get("HOUSE_ID") or \
-            os.environ.get("LOOM_BODY_CONVERSATION", "").strip() or os.environ.get("LOOM_BODY_KEY"):
+    then carries `for: owner`, stamped as vouched. Only the owner's, never a body's (one the runtime runs here
+    included), and never over the API. Two ways (t-1975): his Allow on the card the clock filed (`--approval a-…`,
+    applied by loom right after it, or by the clock's next pass: the approval is the proof, spent once for exactly
+    these ids), or typed at a terminal on loom's machine, the fallback. Only a wake that is unknown now: one for a
+    person stays theirs, and one already the owner's needs nothing."""
+    if body_env():
         sys.exit("wake: vouch is the owner's, at a terminal on loom's machine, never a body's")
     ids = list(dict.fromkeys(args.ids))
+    if args.approval:
+        try:
+            print(vouched_line(*vouch_approved(args.approval, ids)))
+        except (VouchGone, ValueError, RuntimeError) as e:
+            sys.exit(f"wake: {e}")
+        return
 
     def check(entries):
         by_id = {e["id"]: e for e in entries}
@@ -1066,14 +1136,279 @@ def cmd_vouch(args):
         sys.exit("wake: vouch is the owner's, at a terminal on loom's machine: run it yourself and type the ids")
     with Spool() as spool:
         by_id = check(spool.entries)    # again, under the lock: what he typed is for what's pending now
-        now = datetime.now().strftime(TIME_FMT)
-        for i in ids:
-            by_id[i]["for"] = "owner"
-            by_id[i].pop("for_in", None)
-            by_id[i]["vouched"] = {"by": "owner", "at": now, "was": "-"}
+        vouch_mark(by_id, ids, {})
     for i in ids:
         log("vouch", f"{i}: the owner vouched for it at a terminal here (was unknown): for=owner")
     print(f"vouched for {want}: {'it fires' if one else 'they fire'} as the owner's")
+
+
+class VouchGone(Exception):
+    """None of a card's wakes is pending and unknown any more: nothing to apply, and nothing spent."""
+
+
+def vouch_approved(aid, ids):
+    """The owner's Allow on a vouch-wake card, applied: the approval spent (allowed, for exactly these ids, once) and
+    only then each listed wake still pending and unknown made his. One that fired meanwhile stays as it was. Returns
+    (done, gone); raises VouchGone when there's nothing left, ValueError for a malformed call, RuntimeError when the
+    approval couldn't be spent (nothing changed)."""
+    if not re.fullmatch(r"a-[0-9a-f]{8}", aid or "") or not ids or not all(re.fullmatch(r"w-[0-9a-f]{6}", i) for i in ids):
+        raise ValueError("vouch --approval a-… w-… [w-…]: the card's approval and exactly its wakes")
+    target = vouch_target(ids)
+    pending = {e["id"] for e in read_spool() if vouchable(e)}
+    if not set(ids) & pending:
+        # Nothing left to make his: the owner's yes isn't spent on nothing.
+        raise VouchGone("none of those wakes is pending and unknown any more (they fired, or are vouched for already)")
+    why = spend_owner_approval(aid, VOUCH_KIND, target)
+    if why:
+        raise RuntimeError(f"the approval couldn't be spent, so nothing changed: {why}")
+    with Spool() as spool:
+        by_id = {e["id"]: e for e in spool.entries}
+        done = [i for i in ids if i in by_id and vouchable(by_id[i])]
+        vouch_mark(by_id, done, {"approval": aid})
+    for i in done:
+        log("vouch", f"{i}: the owner vouched for it on loom's page ({aid}, was unknown): for=owner")
+    gone = [i for i in ids if i not in done]
+    if gone:
+        log("vouch", f"{aid}: {' '.join(gone)} fired or changed before it was applied: left as they were")
+    # The card itself is the asking pass's to retire (it reads the approval as used), under its own lock.
+    return done, gone
+
+
+VOUCHED = re.compile(r"^vouched: ?((?:w-[0-9a-f]{6} ?)*); fired: ?((?:w-[0-9a-f]{6} ?)*)$")
+
+
+def vouched_line(done, gone):
+    """`vouch --approval`'s one line of output, read back by the page's action (VOUCHED): what was vouched, what fired."""
+    return f"vouched: {' '.join(done)}; fired: {' '.join(gone)}"
+
+
+# ─── Asking the owner on loom's page (t-1975) ──────────────────────────────
+# Jonathan, 2026-11-08: "It needs to have the site ask me." Unknown wakes that look like the owner's reach him as one
+# card on loom's Inbox ("Count these 5 scheduled jobs as your work?", each listed with when it fires), filed by the
+# clock with the approvals piece; his Allow vouches for exactly those (vouch_approved), his Deny leaves them as they
+# are and they're never asked about again. One card per agent at a time: a new candidate refreshes it (the old one is
+# withdrawn, unanswered, and one with the whole list filed); one that fires doesn't (the Allow skips it).
+VOUCH_KIND = "vouch-wake"
+VOUCH_MAX = 12          # loom-approvals' VOUCH_MAX: the most wakes one card lists (the rest wait for the next card)
+VOUCH_DETAILS = 1000    # loom-approvals' DETAILS_MAX: a card's details, refused (never cut) past it
+
+
+def vouch_path():
+    return WAKE_DIR / "vouch.json"
+
+
+def vouch_state():
+    """This clock's asking: the card it has out ({aid, ids}), the ids a body asked about, and the ids the owner denied."""
+    try:
+        d = json.loads(vouch_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    c = d.get("card")
+    ok = isinstance(c, dict) and isinstance(c.get("aid"), str) and isinstance(c.get("ids"), list)
+    return {**d, **({} if ok else {"card": None})}
+
+
+def save_vouch_state(d):
+    WAKE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = vouch_path().with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(d, indent=1) + "\n")
+    tmp.replace(vouch_path())
+
+
+def vouch_candidates(entries):
+    """The pending wakes the clock asks about by itself: unknown, set from a house of this agent's (its own token,
+    `origin: agent:<it>`), and with no evidence anyone but the owner was behind it: one whose body had no word from the
+    runtime (`for_why` none: it sent no statement). One whose statement didn't verify (`unverified`: which may be a
+    person's, during a runtime outage) or one the runtime called unknown (`steered`: a relay, a
+    sender it couldn't name) is evidence something other than the owner steered it. A wake from before principals were
+    kept (no `for`) says nothing either way, and one that named a person is that person's: the clock asks about none of
+    those by itself (a body that knows may ask about the first two, `wake ask-vouch`; never one a person steered)."""
+    return [e["id"] for e in entries if vouchable(e) and e.get("origin") == f"agent:{AGENT}" and "for" in e
+            and e.get("for_why") == "none" and not e.get("for_people")]
+
+
+def vouch_listing(entries, ids):
+    """The card's details, the clock's own words: each wake, what it's for and when it fires, all within the cap."""
+    now = datetime.now()
+    by_id = {e["id"]: e for e in entries}
+    lines = []
+    for i in ids:
+        e = by_id[i]
+        # What it will run, in its own words: its note (or lane) as written, then the start of its prompt, plain and
+        # with credentials taken out (redact), so the owner reads what his Allow makes his.
+        note = what_of(e) if (e.get("note") or e.get("schedule") or e.get("prompt_file") or e.get("lane")) else ""
+        prompt = redact(plain(e.get("prompt") or "", 400)) if not (e.get("prompt_file") or e.get("lane")) else ""
+        words = " · ".join(x for x in (plain(note, 200), f"runs: {prompt}" if prompt else "") if x)
+        when = day_time(datetime.strptime(e["at"], TIME_FMT), now)
+        lines.append((i, when, words or "a wake with nothing to say what it runs"))
+    # Each line leads with the wake's id and when it fires (approvals refuses a card that leaves an id out); its words
+    # are what's cut to fit.
+    room = max(40, VOUCH_DETAILS // max(1, len(lines)) - 2)
+    out = [short(f"- {i}, fires {t}: {w}", room) for i, t, w in lines]
+    return "\n".join(out)[:VOUCH_DETAILS]
+
+
+def clock_as():
+    """Who the clock files, spends and withdraws as, the same every time: the agent, from loom's clock (the card's "from")."""
+    return json.dumps({"kind": "agent", "agent": AGENT, "house": "loom's clock"})
+
+
+def file_owner_approval(kind, target, ask, why, details):
+    """File an approval the owner's Allow applies (t-1975) as this clock, for its agent, on the owner's behalf: its id."""
+    argv = [*approvals_argv(), "request", "--kind", kind, "--target", target, "--ask", ask, "--why", why,
+            "--if-yes", "They fire as your work.", "--if-no", "Nothing changes.", "--details", details,
+            "--as", clock_as(), "--on-behalf", "owner"]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=8,     # within the API door's and the page's 12 s
+                       env={k: v for k, v in os.environ.items() if k not in ("HOUSE_ID", "WAKE_CALLER")})
+    m = re.match(r"(a-[0-9a-f]{8}):", r.stdout or "")
+    if r.returncode != 0 or not m:
+        raise RuntimeError((r.stderr or r.stdout).strip()[-300:] or f"exit {r.returncode}")
+    return m.group(1)
+
+
+def owner_approval_cmd(verb, aid, *extra):
+    argv = [*approvals_argv(), verb, aid, *extra, "--as", clock_as()]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=8,
+                           env={k: v for k, v in os.environ.items() if k not in ("HOUSE_ID", "WAKE_CALLER")})
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"the approvals piece didn't run ({e})"
+    return "" if r.returncode == 0 else ((r.stderr or r.stdout).strip()[-300:] or f"exit {r.returncode}")
+
+
+def spend_owner_approval(aid, kind, target):
+    """Spend an owner-applied approval as this clock (it's the piece that applies it): "" when spent, else why not."""
+    return owner_approval_cmd("use", aid, "--kind", kind, "--target", target, "--on-behalf", "owner")
+
+
+def vouch_pass(ask=(), apply=True):
+    """One look at this clock's asking (the service, every RUN_CHECK; and right after a body asks, `ask` its ids): the
+    card's answer taken in, then one card for whatever is still to ask about, refreshed only when there's someone new
+    on it. One pass at a time per clock (its own lock: the spool's is taken by the vouch it may run)."""
+    WAKE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(WAKE_DIR / "vouch.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _vouch_pass(ask, apply)
+
+
+def _vouch_pass(ask, apply):
+    st = vouch_state()
+    entries = read_spool()
+    unknown = {e["id"] for e in entries if vouchable(e)}
+    denied = set(st.get("denied") or [])
+    card = st.get("card")
+    state = None
+    if card:
+        state = request_state(card["aid"], timeout=4)     # the owner's own ask-vouch call runs this within 12 s
+        if state == "allowed" and apply:
+            # The owner said yes and loom didn't apply it (or not yet): the service does, the approval being the proof.
+            # Only the service: never inside a body's own call (ask-vouch), which mustn't be what spends the owner's yes.
+            try:
+                done, gone = vouch_approved(card["aid"], card["ids"])
+                log("vouch-applied", f"{card['aid']}: {vouched_line(done, gone)}")
+                card = None
+            except VouchGone as e:
+                log("vouch-fail", f"{card['aid']}: {e}")
+                card = None
+            except (ValueError, RuntimeError) as e:
+                # Tried again next pass: the yes stands until it's spent or expires.
+                log("vouch-fail", f"{card['aid']}: {e}")
+            entries = read_spool()      # as it stands now: the ones just vouched for aren't unknown any more
+            unknown = {e["id"] for e in entries if vouchable(e)}
+        elif state == "denied":
+            denied |= set(card["ids"])
+            log("vouch-denied", f"{card['aid']}: the owner said no for {' '.join(card['ids'])}: never asked again")
+            card = None
+        elif state in ("used", "expired", "withdrawn"):
+            log("vouch-card", f"{card['aid']}: {state}")
+            card = None
+        elif state == "unknown":
+            # Unreadable (approvals down, or an id another machine's store never had: a restored bundle). Three passes
+            # running and it's let go, so the asking never wedges on it.
+            card["unread"] = card.get("unread", 0) + 1
+            log("vouch-fail", f"{card['aid']}: its state can't be read ({card['unread']} of 3)")
+            if card["unread"] >= 3:
+                # Taken back if the piece can still hear it; either way the next card for the same wakes is the same
+                # card while this one waits (approvals returns a waiting card for an identical request).
+                owner_approval_cmd("withdraw", card["aid"])
+                card = None
+        if card and state != "unknown":
+            card.pop("unread", None)
+    asked = sorted(i for i in {*(st.get("asked") or []), *ask} if i in unknown and i not in denied)
+    want = sorted(set(asked) | {i for i in vouch_candidates(entries) if i not in denied})[:VOUCH_MAX]
+    # Only a card still waiting is refreshed: an allowed one not yet applied is the owner's answer, kept until it is.
+    if card and state == "pending" and (not set(want) <= set(card["ids"]) or not (set(card["ids"]) & unknown)):
+        # Someone new to ask about, or nothing on it left to decide: the old card goes, unanswered.
+        why = owner_approval_cmd("withdraw", card["aid"])
+        now_state = request_state(card["aid"], timeout=4) if why else "withdrawn"
+        if now_state != "withdrawn":
+            # Not withdrawn: still waiting, or the owner answered meanwhile (taken in on the next pass). Kept as it is.
+            log("vouch-fail", f"{card['aid']}: couldn't withdraw it ({why}; it's {now_state}); left as it is")
+            want = []
+        else:
+            log("vouch-withdrawn", f"{card['aid']}: replaced" if want else f"{card['aid']}: nothing left on it to decide")
+            card = None
+    if not card and want:
+        n = len(want)
+        try:
+            aid = file_owner_approval(
+                VOUCH_KIND, vouch_target(want),
+                "Count this scheduled job as your work?" if n == 1 else f"Count these {n} scheduled jobs as your work?",
+                f"{name_of(AGENT)} set {'it' if n == 1 else 'them'} before loom could say whom each was for, so "
+                f"{'it' if n == 1 else 'each'} would fire as no one's and ask you for anything that needs you.",
+                vouch_listing(entries, want))
+        except (RuntimeError, OSError, subprocess.SubprocessError) as e:
+            log("vouch-fail", f"couldn't ask the owner about {' '.join(want)}: {e}")
+        else:
+            card = {"aid": aid, "ids": want}
+            log("vouch-asked", f"{aid}: {' '.join(want)}")
+    st = {**({"card": card} if card else {}), **({"asked": asked} if asked else {}), **({"denied": sorted(denied)} if denied else {})}
+    save_vouch_state(st)
+    return card
+
+
+def cmd_ask_vouch(args):
+    """A body that knows its own unknown wakes are the owner's work asks him to count them so (t-1975): on loom's page,
+    with the clock's words, one card with the rest. Only this clock's pending one-off wakes that are unknown, and none
+    the runtime said a person steered (that's the person's)."""
+    ids = list(dict.fromkeys(args.ids))
+    by_id = {e["id"]: e for e in read_spool()}
+    for i in ids:
+        e = by_id.get(i)
+        if not e:
+            sys.exit(f"wake: no pending wake {i} on {AGENT}'s clock")
+        if not vouchable(e):
+            sys.exit(f"wake: {i} is " + (f"a {e['kind']}, not a one-off wake" if e.get("kind") != "wake" else
+                                          f"already for {entry_for(e)}") + ": only an unknown wake is asked about")
+        if e.get("for_people"):
+            sys.exit(f"wake: {i} was set while {', '.join(e['for_people'])} steered its body: it stays theirs")
+        if e.get("for_why") in ("steered", "other-agent"):
+            # The runtime's word was that something other than the owner steered it (or it was another agent's statement).
+            sys.exit(f"wake: {i} was set while something loom can't place steered its body: it isn't asked about")
+    st = vouch_state()
+    if set(ids) & set(st.get("denied") or []):
+        sys.exit(f"wake: the owner said no for {' '.join(sorted(set(ids) & set(st['denied'])))} already: not asked again")
+    if body_env():
+        # A body's ask (over the API, 12 s for the whole call; or one the runtime runs here): kept, and the service's
+        # next pass files the card (within RUN_CHECK). A body's call never runs the pass, so it never spends anything.
+        with open(WAKE_DIR / "vouch.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            st = vouch_state()
+            st["asked"] = sorted(set(st.get("asked") or []) | set(ids))
+            save_vouch_state(st)
+        log("vouch-ask", f"{AGENT}'s body asked about {' '.join(ids)}")
+        print(f"asked: the clock puts {' '.join(ids)} on the owner's card within {RUN_CHECK // 60} minutes; his Allow does it")
+        return
+    card = vouch_pass(ids, apply=False)
+    on = sorted(set(ids) & set((card or {}).get("ids") or []))
+    if not on:
+        sys.exit("wake: couldn't ask the owner (the clock's log says why: wake log --grep vouch)")
+    later = sorted(set(ids) - set(on))
+    print(f"{card['aid']}: asked the owner on loom's page to count {len(card['ids'])} scheduled "
+          f"job{'s' if len(card['ids']) != 1 else ''} as his work ({' '.join(card['ids'])}); his Allow does it"
+          + (f"; {' '.join(later)} on the next card, once that's answered" if later else ""))
 
 
 def cmd_log(args):
@@ -1390,7 +1725,7 @@ def cmd_rearm(args):
 # every agent's clock (its spool, schedules, pause and filed local-wake words) and loom's lanes, encrypted
 # by this piece to the owner's recipients. Logs stay behind. Plaintext only on pipes.
 BUNDLE_FORMAT = "loom-clock/1"
-CLOCK_FILES = ("spool.jsonl", "schedules.json", "paused", "filed.json")
+CLOCK_FILES = ("spool.jsonl", "schedules.json", "paused", "filed.json", "vouch.json")
 
 
 def age_bin():
@@ -3245,6 +3580,27 @@ def ui_act(req, run):
         if not AGENT_NAME.match(to):
             return {"ok": False, "message": "Assign it to one of the household's agents."}
         return go(["lane", "assign", pick("name"), "--agent", to], f"{pretty(pick('name'))} is {name_of(to)}'s now.", page="")
+    if action == "vouch-approved":
+        # The owner's Allow on a vouch-wake card (t-1975), applied: loom core posts this as the household owner right
+        # after the Allow, with the approval's id and target (read back from the approvals piece, never the form). Only
+        # the household owner's call; the approval itself is the proof, spent for exactly its wakes by `vouch --approval`.
+        c = req.get("caller")
+        if not (isinstance(c, dict) and c.get("kind") == "owner" and c.get("agents") in (None, "*")):
+            return {"ok": False, "message": "Whose work a wake is, is the household owner's to say."}
+        v = vouch_parse(pick("target"))
+        # The agent is the target's; an `agent` field (core sends the approval's) must say the same, if it's there.
+        if not re.fullmatch(r"a-[0-9a-f]{8}", pick("id")) or not v or (pick("agent") and pick("agent") != v[0]) or v[0] not in clock_agents():
+            return {"ok": False, "message": "That isn't a vouch for scheduled jobs."}
+        agent, ids = v
+        code, out, err = run(agent, ["vouch", "--approval", pick("id"), *ids])
+        if code != 0:
+            return {"ok": False, "message": (err.strip().removeprefix("wake: ") or out.strip() or "That didn't work.")[:300]}
+        m2 = VOUCHED.match(out.strip())
+        if not m2:
+            return {"ok": False, "message": "The clock didn't say what it vouched for: see its log."}
+        n, gone = len(m2.group(1).split()), len(m2.group(2).split())
+        said = f"{name_of(agent)}'s scheduled job counts" if n == 1 else f"{n} of {name_of(agent)}'s scheduled jobs count"
+        return {"ok": True, "page": "", "message": f"{said} as your work now" + (f"; {gone} had fired already." if gone else ".")}
     if action == "now":
         return go(["now"], f"{name} wakes within a minute.")
     if action == "clock":   # the clock's switch: on runs it, off pauses it
@@ -3367,6 +3723,10 @@ def keep_armed():
                     if arm_timer(e) == "armed":
                         log("rearm", f"{e['id']} had no timer")
             ensure_deadman(spool)
+        try:
+            vouch_pass()    # the owner asked on loom's page about unknown wakes that look like his (t-1975)
+        except (Exception, SystemExit) as e:    # never the service's end
+            log("vouch-fail", f"the asking pass failed: {e}")
     configure(LOCAL_AGENT)
 
 
@@ -3471,9 +3831,13 @@ def main():
     p.add_argument("--local", action=argparse.BooleanOptionalAction, default=None, help="it needs loom's machine (systemd, files outside the repo); --no-local: a house")
     p.add_argument("--slot", default="", help="a house slot: the lane's bookkeeping between runs (one house at a time)")
     p.set_defaults(fn=cmd_lane)
-    p = sub.add_parser("vouch", help="(the owner, at a terminal here) these unknown wakes are your own work", allow_abbrev=False)
+    p = sub.add_parser("vouch", help="(the owner) these unknown wakes are your work: typed at a terminal here, or --approval from his Allow", allow_abbrev=False)
     p.add_argument("ids", nargs="+")
+    p.add_argument("--approval", default="", help="(loom, on the owner's Allow) the vouch-wake card's approval: no terminal")
     p.set_defaults(fn=cmd_vouch)
+    p = sub.add_parser("ask-vouch", help="ask the owner on loom's page to count these unknown wakes as his work", allow_abbrev=False)
+    p.add_argument("ids", nargs="+")
+    p.set_defaults(fn=cmd_ask_vouch)
     p = sub.add_parser("cancel", help="cancel a pending wake")
     p.add_argument("id")
     p.set_defaults(fn=cmd_cancel)

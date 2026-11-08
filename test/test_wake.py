@@ -13,6 +13,7 @@ The arm_timer/cmd_rearm tests mock subprocess.run, using the exact stderr text
 systemd 257 gives for a unit-name collision: "Unit <name> was already loaded or
 has a fragment file." — never the older "already exists" wording.
 """
+import argparse
 import contextlib
 import importlib.util
 import io
@@ -2899,6 +2900,356 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         with mock.patch.object(wake_cli.os, "open", return_value=r), mock.patch.object(wake_cli.os, "write", return_value=2):
             self.assertFalse(wake_cli.owner_at_terminal("? ", "w-aaaaaa w-bbbbbb"))
         os.close(w)
+
+
+class OwnerAsksOnThePage(OnWhoseBehalf):
+    """t-1975: unknown wakes that look like the owner's reach him as one card on loom's page (a vouch-wake approval the
+    clock files); his Allow vouches for exactly its wakes, his Deny changes nothing, and nobody else's call applies it.
+    The approvals piece is a stand-in here: its store is a JSON file the test answers in, as the owner would."""
+
+    APPROVALS = """#!/usr/bin/env python3
+import json, os, sys
+path = os.environ["FAKE_APPROVALS"]
+d = json.load(open(path)) if os.path.exists(path) else {"n": 0, "a": {}, "calls": []}
+argv = sys.argv[1:]
+d["calls"].append(argv)
+def opt(k):
+    return argv[argv.index(k) + 1] if k in argv else None
+out, code = "", 0
+NEED = {"request": ("--kind", "--target", "--ask", "--why", "--if-yes", "--if-no", "--details", "--as", "--on-behalf"),
+        "use": ("--kind", "--target", "--as", "--on-behalf"), "withdraw": ("--as",)}
+if any(k not in argv for k in NEED.get(argv[0], ())):     # the real piece's flags, every one (loom-approvals' run)
+    sys.stderr.write("usage\\n")
+    sys.exit(2)
+if argv[0] == "request":
+    hit = [i for i, a in d["a"].items() if a["kind"] == opt("--kind") and a["target"] == opt("--target") and a["state"] == "pending"]
+    if hit:
+        aid = hit[0]
+    else:
+        d["n"] += 1
+        aid = "a-%08x" % d["n"]
+        d["a"][aid] = {"kind": opt("--kind"), "target": opt("--target"), "state": "pending", "details": opt("--details"),
+                       "ask": opt("--ask"), "as": opt("--as"), "on_behalf": opt("--on-behalf")}
+    out = aid + ": asked the owner\\n"
+elif argv[0] == "check":
+    out = d["a"][argv[1]]["state"] + "\\n"
+elif argv[0] == "use":
+    a = d["a"].get(argv[1])
+    if not a or a["state"] != "allowed" or a["kind"] != opt("--kind") or a["target"] != opt("--target"):
+        out, code = "not allowed for that\\n", 1
+    else:
+        a["state"] = "used"
+        out = argv[1] + ": used\\n"
+elif argv[0] == "withdraw":
+    a = d["a"][argv[1]]
+    if a["state"] != "pending":
+        out, code = "an answer stands\\n", 1
+    else:
+        a["state"] = "withdrawn"
+        out = argv[1] + ": withdrawn\\n"
+json.dump(d, open(path, "w"))
+(sys.stdout if code == 0 else sys.stderr).write(out)
+sys.exit(code)
+"""
+    OWNER = {"kind": "owner", "who": "jonathan-barket", "agents": "*"}
+
+    def setUp(self):
+        super().setUp()
+        fake = self.td / "approvals"
+        fake.write_text(self.APPROVALS)
+        fake.chmod(0o755)
+        self.store = self.td / "approvals.json"
+        p = mock.patch.dict(wake_cli.os.environ, {"WAKE_APPROVALS": str(fake), "FAKE_APPROVALS": str(self.store)})
+        p.start()
+        self.addCleanup(p.stop)
+
+    def approvals(self):
+        return json.loads(self.store.read_text()) if self.store.exists() else {"a": {}, "calls": []}
+
+    def answer(self, aid, state):
+        d = self.approvals()
+        d["a"][aid]["state"] = state
+        self.store.write_text(json.dumps(d))
+
+    def unsigned(self, n):
+        """n unknown wakes set from ada's house with no word from the runtime: they look like the owner's."""
+        for _ in range(n):
+            self.assertEqual(self.set_for(), "-")
+        return [e["id"] for e in self.spool()[-n:]]
+
+    def act(self, aid, caller=OWNER, target=None):
+        d = self.approvals()["a"][aid]
+        req = {"action": "vouch-approved", "fields": {"id": aid, "agent": "ada", "target": target or d["target"]}}
+        if caller:
+            req["caller"] = caller
+        def run(agent, argv):
+            out = io.StringIO()
+            with mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "", "WAKE_CALLER": ""}), contextlib.redirect_stdout(out):
+                try:
+                    wake_cli.cmd_vouch(argparse.Namespace(ids=[a for a in argv if a.startswith("w-")], approval=argv[argv.index("--approval") + 1]))
+                except SystemExit as e:
+                    return 1, out.getvalue(), str(e.code)
+            return 0, out.getvalue(), ""
+        return wake_cli.ui_act(req, run)
+
+    def test_unknown_wakes_that_look_like_the_owner_s_become_one_card(self):
+        ids = self.unsigned(3)
+        self.assertEqual({self.spool()[-1]["for_why"]}, {"none"})
+        card = wake_cli.vouch_pass()
+        self.assertEqual(card["ids"], sorted(ids))
+        a = self.approvals()["a"][card["aid"]]
+        self.assertEqual((a["kind"], a["target"], a["on_behalf"]), ("vouch-wake", "ada:" + ",".join(sorted(ids)), "owner"))
+        self.assertEqual(a["ask"], "Count these 3 scheduled jobs as your work?")
+        self.assertEqual(len(a["details"].splitlines()), 3)
+        self.assertIn("fires", a["details"])
+        self.assertLessEqual(len(a["details"]), 1000)
+        # Never repeated: another look files nothing new.
+        self.assertEqual(wake_cli.vouch_pass(), card)
+        self.assertEqual(len(self.approvals()["a"]), 1)
+
+    def test_allow_vouches_for_exactly_its_wakes_and_they_fire_as_the_owner_s(self):
+        ids = self.unsigned(2)
+        card = wake_cli.vouch_pass()
+        extra = self.unsigned(1)[0]     # set after the card: not on it
+        self.answer(card["aid"], "allowed")
+        r = self.act(card["aid"])
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(r["message"], "2 of Ada's scheduled jobs count as your work now.")
+        by = {e["id"]: e for e in self.spool()}
+        for i in ids:
+            self.assertEqual((by[i]["for"], by[i]["vouched"]["approval"]), ("owner", card["aid"]))
+            self.assertEqual(self.fire_for(by[i]), "owner")
+        self.assertEqual(by[extra]["for"], "-", "the card covers exactly its listed wakes")
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "used")
+        # Spent once: with the same wakes unknown again, the same Allow is refused by the approvals piece, not by the spool.
+        with wake_cli.Spool() as sp:
+            sp.entries = [{**self.base, "id": i, "origin": "agent:ada", "for": "-", "for_why": "none"} for i in ids]
+        r = self.act(card["aid"])
+        self.assertFalse(r["ok"])
+        self.assertIn("couldn't be spent", r["message"])
+        # Every spend the clock made: as itself for ada, on the owner's behalf, for exactly the card's target.
+        spends = [c for c in self.approvals()["calls"] if c[0] == "use"]
+        for c in spends:
+            self.assertEqual(c[c.index("--as") + 1], wake_cli.clock_as())
+            self.assertEqual(c[c.index("--on-behalf") + 1], "owner")
+            self.assertEqual(c[c.index("--target") + 1], self.approvals()["a"][card["aid"]]["target"])
+        filed = [c for c in self.approvals()["calls"] if c[0] == "request"]
+        self.assertTrue(all(c[c.index("--as") + 1] == wake_cli.clock_as() for c in filed))
+
+    def test_a_target_can_t_be_widened(self):
+        ids = self.unsigned(2)
+        card = wake_cli.vouch_pass()
+        more = self.unsigned(1)[0]
+        self.answer(card["aid"], "allowed")
+        wider = "ada:" + ",".join(sorted([*ids, more]))
+        r = self.act(card["aid"], target=wider)
+        self.assertFalse(r["ok"])
+        self.assertIn("couldn't be spent", r["message"])
+        self.assertEqual({e["for"] for e in self.spool()}, {"-"})
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "allowed", "the owner's yes is still there for its own wakes")
+
+    def test_deny_changes_nothing_and_is_never_asked_again(self):
+        ids = self.unsigned(2)
+        card = wake_cli.vouch_pass()
+        self.answer(card["aid"], "denied")
+        self.assertFalse(self.act(card["aid"])["ok"])
+        self.assertIsNone(wake_cli.vouch_pass())
+        self.assertEqual({e["for"] for e in self.spool()}, {"-"})
+        self.assertEqual(len(self.approvals()["a"]), 1)
+        self.assertIn("already", self.cli("ask-vouch", ids[0]))
+        # A new one later gets a card of its own, without the denied ones.
+        new = self.unsigned(1)[0]
+        self.assertEqual(wake_cli.vouch_pass()["ids"], [new])
+
+    def test_only_the_household_owner_s_call_applies_it(self):
+        ids = self.unsigned(1)
+        card = wake_cli.vouch_pass()
+        self.answer(card["aid"], "allowed")
+        for caller in (None, {"kind": "owner", "who": "loren", "agents": ["ada"]}, {"kind": "agent", "agent": "ada"}):
+            r = self.act(card["aid"], caller=caller)
+            self.assertFalse(r["ok"], caller)
+        self.assertEqual(self.spool()[-1]["for"], "-")
+        # Nor a body: over the API vouch isn't a verb, and here a body's environment is refused before anything is spent.
+        self.assertIn("runs only on loom's machine", json.dumps(wake_cli.api_answer(
+            {"caller": {"kind": "agent", "agent": "ada"}, "path": "run", "body": {"argv": ["vouch", "--approval", card["aid"], *ids]}},
+            lambda *a: (0, "", ""))))
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": "cv-0123456789ab"}):
+            self.assertIn("never a body's", self.cli("vouch", "--approval", card["aid"], *ids, over_api=False))
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "allowed")
+        self.assertTrue(self.act(card["aid"])["ok"])
+
+    def test_a_new_one_refreshes_the_card_and_one_that_fires_doesn_t(self):
+        first = self.unsigned(2)
+        card = wake_cli.vouch_pass()
+        new = self.unsigned(1)[0]
+        card2 = wake_cli.vouch_pass()
+        self.assertNotEqual(card2["aid"], card["aid"])
+        self.assertEqual(card2["ids"], sorted([*first, new]))
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "withdrawn")
+        # One fires (it leaves the spool): the card stays as it is.
+        with wake_cli.Spool() as sp:
+            sp.entries = [e for e in sp.entries if e["id"] != first[0]]
+        self.assertEqual(wake_cli.vouch_pass(), card2)
+        # Allowed now: the one that fired is said, the rest vouched.
+        self.answer(card2["aid"], "allowed")
+        r = self.act(card2["aid"])
+        self.assertTrue(r["ok"], r)
+        self.assertIn("1 had fired already", r["message"])
+        # All of a card's wakes gone: it's withdrawn, nothing left to decide.
+        more = self.unsigned(1)[0]
+        c3 = wake_cli.vouch_pass()
+        with wake_cli.Spool() as sp:
+            sp.entries = [e for e in sp.entries if e["id"] != more]
+        self.assertIsNone(wake_cli.vouch_pass())
+        self.assertEqual(self.approvals()["a"][c3["aid"]]["state"], "withdrawn")
+
+    def test_the_clock_applies_an_allow_loom_didn_t(self):
+        ids = self.unsigned(1)
+        card = wake_cli.vouch_pass()
+        self.answer(card["aid"], "allowed")
+        self.assertIsNone(wake_cli.vouch_pass())
+        self.assertEqual(self.spool()[-1]["for"], "owner")
+        self.assertIn("vouch-applied", wake_cli.LOG.read_text())
+
+    def test_what_the_clock_won_t_ask_about_by_itself(self):
+        # From before principals were kept, one a person steered, one set on loom's machine: no card.
+        with wake_cli.Spool() as sp:
+            sp.entries.append({**self.base, "id": "w-aaaaa1", "origin": "agent:ada"})
+        self.assertEqual(self.set_for(statement="stmt", answer={**self.verified("ada"), "people": ["loren", "dan"]}), "-")
+        self.assertEqual(self.spool()[-1]["for_people"], ["loren", "dan"])
+        self.assertIsNone(wake_cli.vouch_pass())
+        # A body that knows asks about the old one; a person's stays theirs.
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(self.cli("ask-vouch", "w-aaaaa1", over_api=False))
+        self.assertIn("stays theirs", self.cli("ask-vouch", self.spool()[-1]["id"]))
+        (card,) = [a for a in self.approvals()["a"].values() if a["state"] == "pending"]
+        self.assertEqual(card["target"], "ada:w-aaaaa1")
+        self.assertEqual(card["ask"], "Count this scheduled job as your work?")
+        # Not about a wake already the owner's, a schedule's occurrence, or one that isn't there.
+        self.assertIn("no pending wake", self.cli("ask-vouch", "w-ffffff"))
+
+    def test_another_agent_s_wake_or_a_malformed_id_is_refused_before_anything_is_spent(self):
+        ids = self.unsigned(1)
+        card = wake_cli.vouch_pass()
+        self.answer(card["aid"], "allowed")
+        for target, agent in (("bo:" + ids[0], "bo"), ("ada:" + ids[0], "bo"), ("ada:w-ZZZZZZ", "ada"), ("ada:" + ids[0] + ",*", "ada"),
+                              ("ada:w-ffffff," + ids[0], "ada")):
+            req = {"action": "vouch-approved", "caller": self.OWNER, "fields": {"id": card["aid"], "agent": agent, "target": target}}
+            ran = []
+            r = wake_cli.ui_act(req, lambda agent, argv: ran.append(argv) or (1, "", "no"))
+            self.assertFalse(r["ok"], target)
+            self.assertEqual(ran, [], f"refused before the clock ran anything: {target} for {agent}")
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "allowed")
+        self.assertEqual(self.spool()[-1]["for"], "-")
+        # The card lists every wake on it by id, with when it fires.
+        self.assertIn(ids[0] + ", fires", self.approvals()["a"][card["aid"]]["details"])
+
+    def test_only_a_body_with_no_word_from_the_runtime_is_asked_about_by_itself(self):
+        # none and unverified: no evidence anyone else was behind it. steered (the runtime said unknown), other-agent,
+        # a person named, or from before principals were kept: never by itself.
+        for why, people, asked in (("none", [], True), ("unverified", [], False), ("steered", [], False), ("other-agent", [], False),
+                                   ("none", ["loren"], False), (None, [], False), ("none", [], "local")):
+            with wake_cli.Spool() as sp:
+                # "local": set by a body the runtime runs on loom's machine (no house origin): never by itself.
+                origin = {} if asked == "local" else {"origin": "agent:ada"}
+                asked = False if asked == "local" else asked
+                sp.entries = [{**self.base, "id": "w-aaaaa1", **origin, "for": "-",
+                               **({"for_why": why} if why else {}), **({"for_people": people} if people else {})}]
+            self.assertEqual(wake_cli.vouch_candidates(self.spool()) == ["w-aaaaa1"], asked, (why, people))
+        # A statement that verifies as a person whose slug is "owner": unknown, steered, never asked about.
+        self.assertEqual(self.set_for(statement="stmt", answer={**self.verified("ada", "owner"), "people": []}), "-")
+        self.assertEqual(self.spool()[-1]["for_why"], "steered")
+        self.assertNotIn(self.spool()[-1]["id"], wake_cli.vouch_candidates(self.spool()))
+
+    def test_a_schedule_s_occurrences_keep_why_it_s_unknown(self):
+        e = wake_cli.schedule_entry("nightly", {"at": "23:00", "prompt": "x", "origin": "agent:ada", "for": "-",
+                                                "for_why": "steered", "for_people": ["loren"]}, wake_cli.datetime.now())
+        self.assertEqual((e["for_why"], e["for_people"]), ("steered", ["loren"]))
+
+    def test_the_target_is_sorted_and_each_wake_once(self):
+        self.assertEqual(wake_cli.vouch_target(["w-cccccc", "w-aaaaaa", "w-cccccc", "w-bbbbbb"]), "ada:w-aaaaaa,w-bbbbbb,w-cccccc")
+
+    def test_a_body_s_ask_never_spends_an_allowed_card(self):
+        ids = self.unsigned(2)
+        card = wake_cli.vouch_pass()
+        self.answer(card["aid"], "allowed")
+        self.cli("ask-vouch", ids[0])
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": "cv-0123456789ab"}):
+            self.cli("ask-vouch", ids[0], over_api=False)     # a body the runtime runs here: kept, never a pass
+        self.assertEqual(self.approvals()["a"][card["aid"]]["state"], "allowed")
+        self.assertEqual({e["for"] for e in self.spool()}, {"-"})
+        wake_cli.vouch_pass()       # the service's own pass applies it
+        self.assertEqual({e["for"] for e in self.spool()}, {"owner"})
+
+    def test_the_card_never_carries_a_wake_s_prompt_and_its_words_are_plain(self):
+        with wake_cli.Spool() as sp:
+            sp.entries.append({**self.base, "id": "w-aaaaa2", "note": "", "prompt": "token=SECRETVALUE and sk-SECRETSECRETSECRET do x", "origin": "agent:ada"})
+            sp.entries.append({**self.base, "id": "w-aaaaa3", "note": "check \u202eevil\u202c [link](x)", "origin": "agent:ada"})
+        d = wake_cli.vouch_listing(self.spool(), ["w-aaaaa2", "w-aaaaa3"])
+        self.assertNotIn("SECRET", d)
+        self.assertIn("runs: token=[redacted]", d, "what it runs, with the credential taken out")
+        self.assertNotIn("\u202e", d)
+
+    def test_the_deny_record_goes_with_the_clock_in_the_bundle(self):
+        self.assertIn("vouch.json", wake_cli.CLOCK_FILES)
+        self.assertEqual(wake_cli.vouch_path(), wake_cli.WAKE_DIR / "vouch.json", "the agent's own clock, which the bundle reads")
+
+    def test_a_card_that_can_t_be_read_is_let_go_after_three_passes(self):
+        self.unsigned(1)
+        card = wake_cli.vouch_pass()
+        d = self.approvals()
+        del d["a"][card["aid"]]
+        self.store.write_text(json.dumps(d))
+        with mock.patch.object(wake_cli, "request_state", return_value="unknown"):
+            self.assertIsNotNone(wake_cli.vouch_pass())
+            self.assertIsNotNone(wake_cli.vouch_pass())
+            third = wake_cli.vouch_pass()
+        self.assertNotEqual(third["aid"], card["aid"], "let go, and asked again on a card that can be read")
+
+    def test_a_body_never_asks_about_one_the_runtime_said_was_steered_or_another_agent_s(self):
+        for why in ("steered", "other-agent"):
+            with wake_cli.Spool() as sp:
+                sp.entries = [{**self.base, "id": "w-aaaaa4", "origin": "agent:ada", "for": "-", "for_why": why}]
+            self.assertIn("isn't asked about", self.cli("ask-vouch", "w-aaaaa4"))
+        # A local body's unknown wake keeps why too, so its ask is refused the same.
+        with mock.patch.dict(wake_cli.os.environ, {"LOOM_BODY_CONVERSATION": "cv-0123456789ab", "WAKE_PRINCIPAL_STATEMENT": "stmt"}):
+            self.assertEqual(self.set_for(over_api=False, answer={**self.verified("ada"), "people": ["loren"]}), "-")
+        self.assertEqual(self.spool()[-1]["for_people"], ["loren"])
+
+    def test_over_the_api_a_body_s_ask_is_kept_for_the_service_s_pass(self):
+        # One the clock would never ask about by itself (from before principals were kept): only the kept ask files it.
+        with wake_cli.Spool() as sp:
+            sp.entries.append({**self.base, "id": "w-aaaaa7", "origin": "agent:ada"})
+        ids = ["w-aaaaa7"]
+        self.assertEqual(wake_cli.vouch_candidates(self.spool()), [])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertIsNone(self.cli("ask-vouch", ids[0]))
+        self.assertEqual(self.approvals()["a"], {})
+        self.assertEqual(wake_cli.vouch_state()["asked"], ids)
+        self.assertEqual(wake_cli.vouch_pass()["ids"], ids)
+
+    def test_the_page_action_runs_the_vouch_on_the_target_s_clock(self):
+        seen = []
+        run = lambda agent, argv: seen.append((agent, argv)) or (0, "vouched: w-0000b1; fired: ", "")
+        with mock.patch.object(wake_cli, "clock_agents", return_value=["ada", "bo"]):
+            r = wake_cli.ui_act({"action": "vouch-approved", "caller": self.OWNER,
+                                 "fields": {"id": "a-1a2b3c4d", "target": "bo:w-0000b1"}}, run)
+        self.assertTrue(r["ok"], r)
+        self.assertEqual(seen, [("bo", ["vouch", "--approval", "a-1a2b3c4d", "w-0000b1"])])
+        self.assertEqual(r["message"], "Bo's scheduled job counts as your work now.")
+        # An agent field that says otherwise: refused before anything runs.
+        seen.clear()
+        with mock.patch.object(wake_cli, "clock_agents", return_value=["ada", "bo"]):
+            self.assertFalse(wake_cli.ui_act({"action": "vouch-approved", "caller": self.OWNER,
+                                              "fields": {"id": "a-1a2b3c4d", "agent": "ada", "target": "bo:w-0000b1"}}, run)["ok"])
+        self.assertEqual(seen, [])
+
+    def test_a_parked_body_is_never_told_to_spend_an_owner_applied_card(self):
+        words = wake_cli.spend_words("a-1a2b3c4d", {"kind": "vouch-wake", "target": "ada:w-000001"})
+        self.assertNotIn("approvals use", words)
+        self.assertIn("nothing for you to spend", words)
 
 
 if __name__ == "__main__":
