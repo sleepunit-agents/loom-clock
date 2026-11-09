@@ -61,10 +61,10 @@ loom's machine only), else `local-lane:<name>` for a lane (a lane's house runs
 are `lane:<name>`, and a conversation's bodies run in one place only), else
 `wake:<id>`. A runtime refusal is reported without starting a session outside
 the runtime. Temporary unavailability retries the same delivery.
-WAKE_LOCAL_RUN=session is the way back: every local wake a session here again,
-as before t-1921, except one that names its place. The clock's own stuck-session
-stop (`wake reap`) still watches every session it starts; the runtime stops its
-own bodies (LOOM_RUNTIME_STUCK_AFTER).
+Legacy WAKE_LOCAL_RUN=session also uses this delivery path. WAKE_DELIVERY=spawn
+selects only the compatibility house path; it cannot launch a local harness.
+The clock's stuck-session stop (`wake reap`) still watches sessions recorded
+by older versions; the runtime stops its own bodies (LOOM_RUNTIME_STUCK_AFTER).
 
 Timers: transient `systemd-run --user` units named wake-<id> (KillMode=process
 so a background session the wake started survives the service's cgroup cleanup).
@@ -2039,34 +2039,22 @@ def house_ready(entry, body):
     return HOUSE_LOCAL not in body
 
 
-def local_run():
-    """How a wake that runs here runs (WAKE_LOCAL_RUN): "runtime" (the default, t-1921): delivered, and loom's runtime
-    runs its body here; "session": the session command here, the old way (and the way back)."""
-    return "session" if setting("WAKE_LOCAL_RUN").strip().lower() == "session" else "runtime"
-
-
-# The session a local wake starts the old way: {prompt} and {model} are filled in (a whole argument each).
-# Safe by default: a session that can stop and ask. An agent that runs unattended and has decided to skip permission
-# prompts sets WAKE_SESSION_COMMAND itself, so that choice is written down where it's made.
-SESSION_DEFAULT = ["claude", "--bg", "{prompt}", "--model", "{model}"]
-
-
-def session_argv(prompt, model):
-    return [{"{prompt}": prompt, "{model}": model}.get(a, a) for a in argv_setting("WAKE_SESSION_COMMAND", SESSION_DEFAULT)]
+# Only the reaper uses this legacy setting, to inspect sessions recorded by an
+# older clock. New local work is always delivered through the shared runtime.
+LEGACY_SESSION_DEFAULT = ["claude", "--bg", "{prompt}", "--model", "{model}"]
 
 
 def dispatch(prompt, model, env, mode, agent=None, slot=None):
-    """Start the wake's session; returns the CompletedProcess."""
+    """Allocate a compatibility house; local model work must use delivery."""
+    if mode != "house":
+        return subprocess.CompletedProcess(args=[], returncode=2, stdout="", stderr="local wakes require runtime delivery")
     agent = agent or LOCAL_AGENT
     cwd = REPO if REPO.is_dir() else HOME
     try:
-        if mode == "house":
-            # The house reads its task as JSON: the prompt and the model it runs on.
-            # loom-box puts it on the agent's primary box.
-            task = json.dumps({"prompt": prompt, "model": model})
-            return subprocess.run([LOOM, "box", "up", "--agent", agent, *(["--slot", slot] if slot else []), "--task", "-"],
-                                  input=task, capture_output=True, text=True, cwd=cwd, env=env)
-        return subprocess.run(session_argv(prompt, model), capture_output=True, text=True, cwd=cwd, env=env)
+        # The house's task client enters the same runtime delivery/admission.
+        task = json.dumps({"prompt": prompt, "model": model})
+        return subprocess.run([LOOM, "box", "up", "--agent", agent, *(["--slot", slot] if slot else []), "--task", "-"],
+                              input=task, capture_output=True, text=True, cwd=cwd, env=env)
     except OSError as e:
         # A command that isn't there is a failed dispatch like any other: retried, then said.
         return subprocess.CompletedProcess(args=[], returncode=127, stdout="", stderr=str(e))
@@ -2380,10 +2368,10 @@ def _cmd_fire(args):
     # Delivered: a wake for the agent's house that needs no house slot (delivery keeps a conversation, not a slot). A
     # wake for loom's machine is delivered too (t-1921): the runtime runs its body here, when it runs local bodies for
     # this agent; a refusal never changes launchers. A house's wake the owner allowed here is one of them: its own
-    # `wake:<id>` (it can't name a place). WAKE_LOCAL_RUN=session: only one set here that names its place (t-1830).
-    local_place = mode == "local" and AGENT == LOCAL_AGENT and (
-        local_run() == "runtime" or (bool(entry.get("place")) and not origin and not entry.get("local_approval")))
-    dmode = delivery_mode() if (mode == "house" or local_place) and not slot else "spawn"
+    # `wake:<id>` (it can't name a place). Legacy session settings cannot select
+    # a second launcher, including on timers armed before this update.
+    local_place = mode == "local" and AGENT == LOCAL_AGENT
+    dmode = "deliver" if local_place else delivery_mode() if not slot else "spawn"
 
     def prompt_for(where):
         # The preamble is the agent's (WAKE_PREAMBLE_FILE): it goes in the wake's text, since it carries this
@@ -2430,12 +2418,7 @@ def _cmd_fire(args):
         retry(entry, f"rc={r.returncode} {r.stderr.strip()[:200]}", "fire-fail")
         sys.exit(1)
     out = r.stdout.strip()
-    # One line: `claude --bg` adds a few lines of help after its `backgrounded · <id>`.
     log("fire", f"{entry['id']} {(out.splitlines() or [''])[0][:120]}")
-    if mode != "house":
-        job = SESSION_JOB.search(out)
-        if job:
-            record_session(job.group(1), entry)
     m = HOUSE_ID.match(out) if mode == "house" else None
     if m:
         # Handed over isn't started: look at the house again in a while.
@@ -2622,10 +2605,9 @@ def record_session(job, entry):
 
 
 def claude_bin():
-    """The harness that started the sessions: the session command's program (`claude` by default). A malformed
-    setting is the session command's problem, said when a wake fires; here it's "" (the reaper can't look)."""
+    """The program used by legacy recorded sessions; malformed settings leave their monitor blind."""
     try:
-        argv = argv_setting("WAKE_SESSION_COMMAND", SESSION_DEFAULT)
+        argv = argv_setting("WAKE_SESSION_COMMAND", LEGACY_SESSION_DEFAULT)
     except SystemExit:
         return ""
     return argv[0] if argv else ""
@@ -3244,6 +3226,20 @@ def agent_reports(view, now):
             out[v["agent"]] = {"readings": [{"label": "Next", "value": f"{short(brief_of(nxt), 40)}, {day_time(at, now)}", "detail": until_text(at, now), "page": ""}]}
         else:
             out[v["agent"]] = {"readings": [{"label": "Next", "value": "nothing pending", "tone": "warn", "page": ""}]}
+        jobs = []
+        for e in upcoming(v["entries"]):
+            state = "waiting" if v["paused"] or e.get("held") or e.get("kind") == "parked" else "scheduled"
+            row = {"id": e["id"], "wake": e["id"], "status": state, "text": short(brief_of(e), 300), "page": "agent:" + v["agent"],
+                   "tasks": list(dict.fromkeys(re.findall(r"\bt-\d+\b", e.get("note") or "")))}
+            try:
+                row["at"] = datetime.strptime(e["at"], TIME_FMT).astimezone().isoformat()
+            except (ValueError, KeyError):
+                pass
+            # Provenance is solely a visibility restriction, never posting authority or a work identity.
+            if re.fullmatch(r"cv-[0-9a-f]{12}", e.get("for_in") or ""):
+                row["conversation"] = e["for_in"]
+            jobs.append(row)
+        out[v["agent"]]["jobs"] = jobs
     return out
 
 

@@ -367,25 +367,20 @@ class FireMode(unittest.TestCase):
              mock.patch.dict(wake_cli.os.environ, {"WAKE_FIRE": ""}), \
              mock.patch.object(wake_cli, "FIRE_CONF", Path(td) / "none"), \
              mock.patch.object(wake_cli.subprocess, "run") as run:
-            wake_cli.dispatch("p", "m", {}, wake_cli.fire_mode())
-        self.assertEqual(run.call_args.args[0][:3], ["claude", "--bg", "p"])
+            self.assertEqual(wake_cli.fire_mode(), "local")
+            result = wake_cli.dispatch("p", "m", {}, wake_cli.fire_mode())
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("runtime delivery", result.stderr)
+        run.assert_not_called()
 
-    def test_the_session_command_is_a_setting(self):
-        cmd = json.dumps(["my-runner", "--model={model}", "{prompt}"])
-        with mock.patch.dict(wake_cli.os.environ, {"WAKE_SESSION_COMMAND": cmd}), \
-             mock.patch.object(wake_cli.subprocess, "run") as run:
-            wake_cli.dispatch("the prompt", "m1", {}, "local")
-        # {prompt} and {model} are whole arguments; one inside another word stays as written.
-        self.assertEqual(run.call_args.args[0], ["my-runner", "--model={model}", "the prompt"])
-        with mock.patch.dict(wake_cli.os.environ, {"WAKE_SESSION_COMMAND": "my-runner {prompt} --model {model}"}), \
-             mock.patch.object(wake_cli.subprocess, "run") as run:
-            wake_cli.dispatch("p q", "m1", {}, "local")
-        self.assertEqual(run.call_args.args[0], ["my-runner", "p q", "--model", "m1"])
-
-    def test_a_session_command_that_isnt_there_is_a_failed_dispatch(self):
-        with mock.patch.dict(wake_cli.os.environ, {"WAKE_SESSION_COMMAND": '["/nonexistent/runner", "{prompt}"]'}):
-            r = wake_cli.dispatch("p", "m", {}, "local")
-        self.assertEqual(r.returncode, 127)
+    def test_session_command_settings_cannot_start_a_local_model(self):
+        for command in [json.dumps(["my-runner", "{prompt}"]), "my-runner {prompt}", "[malformed"]:
+            with self.subTest(command=command), mock.patch.dict(wake_cli.os.environ, {"WAKE_SESSION_COMMAND": command}), \
+                 mock.patch.object(wake_cli.subprocess, "run") as run:
+                result = wake_cli.dispatch("the prompt", "m1", {}, "local")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("runtime delivery", result.stderr)
+            run.assert_not_called()
 
 
 def json_keys(path):
@@ -539,6 +534,7 @@ class AgentWakes(unittest.TestCase):
              mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
              mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
              mock.patch.object(wake_cli, "ensure_deadman"), \
+             mock.patch.object(wake_cli, "deliver_wake") as delivered, \
              mock.patch.object(wake_cli, "dispatch") as dispatch, \
              mock.patch.object(wake_cli.subprocess, "run") as prime:
             prime.return_value.returncode = 0
@@ -546,7 +542,8 @@ class AgentWakes(unittest.TestCase):
             dispatch.return_value.stdout = ""
             (Path(td) / "spool.jsonl").write_text(wake_cli.json.dumps(entry) + "\n")
             wake_cli.cmd_fire(mock.Mock(id="w-aaaaaa"))
-        self.assertEqual(dispatch.call_args.args[3], "local")
+        dispatch.assert_not_called()
+        self.assertIs(delivered.call_args.kwargs["local"], True)
 
     def test_an_agents_wake_fires_into_a_house_even_in_local_mode(self):
         entry = {"id": "w-aaaaaa", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "n",
@@ -583,6 +580,7 @@ class MixedMode(unittest.TestCase):
              mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
              mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
              mock.patch.object(wake_cli, "ensure_deadman"), \
+             mock.patch.object(wake_cli, "deliver_wake") as delivered, \
              mock.patch.object(wake_cli, "dispatch") as dispatch, \
              mock.patch.object(wake_cli.subprocess, "run") as prime:
             prime.return_value.returncode = 0
@@ -595,6 +593,11 @@ class MixedMode(unittest.TestCase):
             (Path(td) / "spool.jsonl").write_text(wake_cli.json.dumps(entry) + "\n")
             wake_cli.cmd_fire(mock.Mock(id=entry["id"]))
         self.call = dispatch.call_args
+        if delivered.called:
+            dispatch.assert_not_called()
+            self.local_prompt = delivered.call_args.args[1]
+            self.assertIs(delivered.call_args.kwargs["local"], True)
+            return "local"
         return dispatch.call_args.args[3]
 
     base = {"id": "w-bbbbbb", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "n", "model": "m", "created": "x"}
@@ -619,7 +622,7 @@ class MixedMode(unittest.TestCase):
         self.assertIn("lane.md", prompt)
         # Fired on this machine, the lane's text is still the prompt.
         self.fire(self.base, "# Lane\nlocal lane text\n", mode="local")
-        self.assertIn("local lane text", self.call.args[0])
+        self.assertIn("local lane text", self.local_prompt)
 
     def test_a_lanes_slot_goes_with_its_house(self):
         self.assertEqual(wake_cli.house_slot({"prompt_file": "x"}, "# L\n<!-- house: ready -->\n<!-- house-slot: nightly -->\n"), "nightly")
@@ -946,11 +949,7 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
             self.assertEqual(spool[0]["delivery"], posts[0])
             self.assertNotIn("fire-spawn", logged)
 
-    def test_what_delivery_cant_carry_goes_the_old_way(self):
-        # A lane that keeps a house slot; and, with WAKE_LOCAL_RUN=session (the way back), a wake that needs loom's
-        # machine and names no place.
-        posts, dispatch, *_ = self.fire({**self.base, "prompt": "ssh buildbox <!-- house: local -->"}, [], env={"WAKE_LOCAL_RUN": "session"})
-        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "local"))
+    def test_a_house_slot_uses_the_allocated_house_path(self):
         posts, dispatch, *_ = self.fire(self.base, [], body="# L\n<!-- house: ready -->\n<!-- house-slot: nightly -->\n")
         self.assertEqual((posts, dispatch.call_args.args[3], dispatch.call_args.args[5]), ([], "house", "nightly"))
 
@@ -969,14 +968,12 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
         posts, *_ = self.fire({**self.base, "prompt": "p", "place": "alert:dns"}, [self.ok])
         self.assertEqual(posts[0]["place"], "alert:dns")
         self.assertNotIn("local", posts[0])
-        # With WAKE_LOCAL_RUN=session, a house's wake approved for loom's machine is a session here, as before t-1921.
+        # Legacy local-session settings still deliver an approved local wake.
         approved = {**self.base, "prompt": "<!-- house: local -->\nx", "origin": "agent:ada", "local_approval": "a-12345678"}
-        posts, dispatch, *_ = self.fire(approved, [], env={"WAKE_LOCAL_RUN": "session"})
-        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "local"))
-        # Else it's the runtime's too, in its own conversation: a house never names a place on loom's machine.
-        posts, dispatch, *_ = self.fire(approved, [self.ok])
-        dispatch.assert_not_called()
-        self.assertEqual((posts[0]["place"], posts[0]["local"], posts[0]["agent"]), ("wake:w-cccccc", True, "ada"))
+        for env in ({}, {"WAKE_LOCAL_RUN": "session"}):
+            posts, dispatch, *_ = self.fire(approved, [self.ok], env=env)
+            dispatch.assert_not_called()
+            self.assertEqual((posts[0]["place"], posts[0]["local"], posts[0]["agent"]), ("wake:w-cccccc", True, "ada"))
 
     def test_every_local_wake_is_the_runtimes(self):
         # t-1921: no wake starts a harness here itself. A follow-up that needs loom's machine: its own conversation.
@@ -989,6 +986,36 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
         self.assertTrue(b["text"].endswith("ssh buildbox"))
         self.assertEqual(spool, [])
         self.assertIn("fire | w-cccccc delivered: queued", logged)
+
+    def test_legacy_local_settings_cannot_select_a_second_launcher(self):
+        variants = [
+            ({"prompt": "<!-- house: local -->\nlocal work"}, None),
+            ({"prompt": "<!-- house: local -->\napproved local work", "origin": "agent:ada", "local_approval": "a-12345678"}, None),
+            ({"kind": "deadman", "prompt": "decide"}, None),
+            ({}, "# Lane\n<!-- house: local -->\nlocal lane work"),
+        ]
+        for extra, body in variants:
+            with self.subTest(extra=extra):
+                posts, dispatch, spool, *_ = self.fire({**self.base, **extra}, [self.ok], body=body,
+                    env={"WAKE_LOCAL_RUN": "session", "WAKE_DELIVERY": "spawn", "WAKE_FIRE": "local",
+                         "WAKE_SESSION_COMMAND": '["claude", "--bg", "{prompt}"]'})
+                self.assertFalse(dispatch.called, "legacy settings must not dispatch a local model")
+                self.assertEqual(len(posts), 1)
+                self.assertIs(posts[0]["local"], True)
+                self.assertEqual(posts[0]["id"], self.base["id"])
+                self.assertEqual(spool, [])
+
+    def test_legacy_local_outage_retries_the_exact_runtime_delivery(self):
+        entry = {**self.base, "prompt": "<!-- house: local -->\ncontinue local work", "for": "owner"}
+        env = {"WAKE_LOCAL_RUN": "session", "WAKE_DELIVERY": "spawn"}
+        posts, dispatch, spool, *_ = self.fire(entry, [(0, {"error": "no delivery token"})], env=env)
+        self.assertFalse(dispatch.called, "a delivery outage must retain the runtime path")
+        self.assertEqual(len(spool), 1)
+        self.assertEqual(spool[0]["delivery"], posts[0])
+        again, dispatch, spool, *_ = self.fire(spool[0], [self.ok], env=env)
+        dispatch.assert_not_called()
+        self.assertEqual(again, posts)
+        self.assertEqual(spool, [])
         # A lane that runs here: one conversation for its runs here, never its house runs' (`lane:<name>`).
         posts, dispatch, *_ = self.fire({**self.base, "kind": "schedule", "schedule": "plan"}, [self.ok], body="# Plan\nthe lane's own words\n")
         dispatch.assert_not_called()
@@ -1107,6 +1134,17 @@ MANIFEST = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom
 
 
 class Manifest(unittest.TestCase):
+    def test_complete_jobs_include_waiting_scheduled_and_remove_finished_entries(self):
+        view = [{"agent": "ada", "schedules": {}, "paused": False, "entries": [
+            {"id": "w-123abc", "kind": "wake", "at": "2026-11-10 10:00:00", "note": "t-2006 finish cards", "for_in": "cv-0123456789ab"},
+            {"id": "w-456abc", "kind": "parked", "at": "2026-11-10 11:00:00", "note": "Wait for the answer"}]}]
+        rows = wake_cli.agent_reports(view, wake_cli.datetime(2026, 11, 9))["ada"]["jobs"]
+        self.assertEqual([r["status"] for r in rows], ["scheduled", "waiting"])
+        self.assertEqual(rows[0]["tasks"], ["t-2006"])
+        self.assertEqual(rows[0]["conversation"], "cv-0123456789ab")
+        view[0]["entries"] = []
+        self.assertEqual(wake_cli.agent_reports(view, wake_cli.datetime(2026, 11, 9))["ada"]["jobs"], [])
+
     def test_the_manifest_fits_looms_limits(self):
         # loom's checks (src/cli/pieces-managed.ts): `settings.length > 20`, `str(b.description, 300)`,
         # `str(s.label, 100)`, `str(s.hint, 200)` ("setting X: hint is not a string" when it's longer), and
@@ -1144,7 +1182,9 @@ class Clocks(unittest.TestCase):
             mock.patch.object(wake_cli, "PAUSED", w / "paused"),
             mock.patch.object(wake_cli, "AGENT", "ada"),
             mock.patch.object(wake_cli, "arm_timer", return_value="armed"), mock.patch.object(wake_cli, "disarm_timer"),
-            mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "", "WAKE_DELIVERY": "spawn"}),
+            # These clock/spool tests exercise compatibility house dispatch.
+            # Delivery tests above cover local runtime delivery and its retries.
+            mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "", "WAKE_DELIVERY": "spawn", "WAKE_FIRE": "house"}),
         ]
         for p in self.patches:
             p.start()
@@ -2293,12 +2333,10 @@ class Settings(unittest.TestCase):
             with mock.patch.dict(wake_cli.os.environ, {"WAKE_PREAMBLE_FILE": str(pre), "WAKE_FIRE": "local", "WAKE_LOCAL_RUN": "session"}), \
                  mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
                  mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
-                 mock.patch.object(wake_cli, "ensure_deadman"), mock.patch.object(wake_cli, "dispatch") as dispatch:
-                dispatch.return_value.returncode = 0
-                dispatch.return_value.stdout = ""
+                 mock.patch.object(wake_cli, "ensure_deadman"), mock.patch.object(wake_cli, "deliver_wake") as delivered:
                 (Path(td) / "spool.jsonl").write_text(json.dumps(entry) + "\n")
                 wake_cli.cmd_fire(mock.Mock(id="w-aaaaaa"))
-        self.assertEqual(dispatch.call_args.args[0], "Hello Ada (w-aaaaaa).\n\nthe work")
+        self.assertEqual(delivered.call_args.args[1], "Hello Ada (w-aaaaaa).\n\nthe work")
 
 
 class Service(unittest.TestCase):
@@ -2564,7 +2602,7 @@ class StuckSessions(unittest.TestCase):
         self.assertTrue(any(" | stuck | w-6e5bf6 session=abc12345 alerted=yes stopped=no " in ln
                             for ln in self.read("clock/wake.log")))
 
-    def test_fire_records_the_session_it_started_and_logs_one_line(self):
+    def test_new_local_work_is_not_recorded_as_a_legacy_session(self):
         entry = {"id": "w-aaa111", "kind": "wake", "at": "2026-11-04 18:42:25", "created": "2026-11-04 18:41:25",
                  "note": "t-40 round 12", "prompt": "do it"}
         spool = self.t / "clock" / "spool.jsonl"
@@ -2575,14 +2613,11 @@ class StuckSessions(unittest.TestCase):
              mock.patch.object(wake_cli, "fire_mode", return_value="local"), \
              mock.patch.object(wake_cli, "fire_gate_open", return_value=True), \
              mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+             mock.patch.object(wake_cli, "deliver_wake") as delivered, \
              mock.patch.object(wake_cli, "delivery_mode", return_value="spawn"):
             wake_cli.cmd_fire(wake_cli.argparse.Namespace(id="w-aaa111"))
-        rec = self.records()["abc12345"]
-        self.assertEqual((rec["wake"], rec["note"], rec["state"]), ("w-aaa111", "t-40 round 12", "running"))
-        fire = [ln for ln in self.read("clock/wake.log") if " | fire | " in ln]
-        self.assertEqual(len(fire), 1)
-        self.assertTrue(fire[0].endswith("| fire | w-aaa111 backgrounded · abc12345"))
-        self.assertFalse(any(ln.startswith("  claude") for ln in self.read("clock/wake.log")))
+        self.assertIs(delivered.call_args.kwargs["local"], True)
+        self.assertFalse((self.t / "clock" / "sessions.json").exists())
 
     def test_a_credential_in_the_command_is_never_shown_and_the_alert_has_no_command(self):
         bearer, ghp = "abcDEF1234567890xyzSECRETbearer", "ghp_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
