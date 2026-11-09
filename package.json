@@ -66,15 +66,6 @@
         "default": "claude-sonnet-5"
       },
       {
-        "name": "WAKE_LOCAL_RUN",
-        "label": "How a wake on this machine runs",
-        "kind": "choice",
-        "options": [
-          { "value": "runtime", "label": "Delivered: loom's runtime runs its body here" }
-        ],
-        "hint": "all local wakes use the runtime; legacy session values also deliver through it"
-      },
-      {
         "name": "WAKE_SESSION_COMMAND",
         "label": "The command used by older recorded local sessions",
         "hint": "only the legacy session monitor uses this command's program; new local work uses the runtime's model choice and body policy"
