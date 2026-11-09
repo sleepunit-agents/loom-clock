@@ -73,7 +73,7 @@
           { "value": "runtime", "label": "Delivered: loom's runtime runs its body here (one path for every wake)" },
           { "value": "session", "label": "The old way: the clock starts a session here itself" }
         ],
-        "hint": "unset: runtime. session is the way back; the runtime refusing (no local bodies for the agent) is a session too, said once a day"
+        "hint": "unset: runtime. session explicitly selects the compatibility launcher; a runtime refusal never changes launchers"
       },
       {
         "name": "WAKE_SESSION_COMMAND",
@@ -114,7 +114,7 @@
           { "value": "deliver", "label": "Delivered through loom (the runtime reaches its body)" },
           { "value": "spawn", "label": "The old way: the clock asks for a house itself" }
         ],
-        "hint": "unset: delivered when the clock has a token for it and a piece offers delivery, else the old way"
+        "hint": "unset: delivered through the runtime; missing credentials or runtime availability are retried, never a launcher fallback"
       },
       {
         "name": "WAKE_DELIVER_TOKEN_FILE",

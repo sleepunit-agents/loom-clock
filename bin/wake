@@ -48,8 +48,8 @@ through loom's `POST /api/loom/deliver` (loom docs/specs/agent-runtime.md,
 runtime records the wake in the agent's conversation and reaches its body.
 One lane is one conversation (place `lane:<name>`); any other wake is its own
 (`wake:<id>`). "spawn" keeps the old path (`loom box up` with the wake as the
-house's task); unset, it's "deliver" when the clock has a token for it and
-loom has a piece offering delivery, else "spawn". A wake with a house slot
+house's task); unset, it's "deliver". Missing credentials or an unavailable
+runtime keep the same delivery for retry; they never change launchers. A wake with a house slot
 still goes the old way: delivery keeps no slot.
 
 A wake that runs here (fire mode "local") is delivered too (t-1921), with the
@@ -59,8 +59,8 @@ so model choice, fallback, permissions and the stuck-session stop live in one
 place. Its conversation is the one it names (`--place alert:host-watch`, set on
 loom's machine only), else `local-lane:<name>` for a lane (a lane's house runs
 are `lane:<name>`, and a conversation's bodies run in one place only), else
-`wake:<id>`. If the runtime won't run it here (400 or 403: no local bodies for
-this agent), it's a session here (WAKE_SESSION_COMMAND), said once a day.
+`wake:<id>`. A runtime refusal is reported without starting a session outside
+the runtime. Temporary unavailability retries the same delivery.
 WAKE_LOCAL_RUN=session is the way back: every local wake a session here again,
 as before t-1921, except one that names its place. The clock's own stuck-session
 stop (`wake reap`) still watches every session it starts; the runtime stops its
@@ -2076,12 +2076,9 @@ NO_DELIVERY = "no installed piece offers delivery"
 
 
 def delivery_mode():
-    """"deliver" or "spawn" (WAKE_DELIVERY). Unset: "deliver" when the clock has a token to deliver with (core then
-    says whether a piece offers delivery; with none, that wake falls back to "spawn"), else "spawn"."""
-    m = setting("WAKE_DELIVERY").strip().lower()
-    if m in ("spawn", "deliver"):
-        return m
-    return "auto" if setting("WAKE_DELIVER_TOKEN_FILE") else "spawn"
+    """Delivery is the default, including when its token or runtime needs repair.
+    Only an explicit spawn setting selects the compatibility house path."""
+    return "spawn" if setting("WAKE_DELIVERY").strip().lower() == "spawn" else "deliver"
 
 
 def loom_api():
@@ -2148,8 +2145,8 @@ def as_retry(entry):
 
 
 def deliver_wake(entry, prompt, agent, auto, local=False):
-    """Deliver one wake. Answers "spawn" when it should go the old way after all (auto, and loom has no piece
-    offering delivery), else None, having logged what came of it:
+    """Deliver one wake through the runtime; never select another launcher after a refusal or outage.
+    The auto argument remains for callers of earlier clock versions. Logs what came of it:
       - an answer (fed, resumed, started, queued): logged, done; the runtime has it from here;
       - failed: the turn stands and no body took it: retried later as a new delivery (a new id, the same place);
       - no answer, a 5xx or a 429: retried later with the same id and body, which loom answers once;
@@ -2170,18 +2167,6 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
                         origin=entry.get("for_in") if not entry.get("schedule") and entry.get("kind") != "schedule" else None)
     status, ans = post_delivery(body)
     err = str(ans.get("error") or ans.get("reason") or "")[:200]
-    if auto and status == 503 and NO_DELIVERY in err:
-        log("fire-spawn", f"{entry['id']} {err}: sent the old way")
-        return "spawn"
-    if local and (status in (400, 403) or (status == 503 and NO_DELIVERY in err)):
-        # A wake for loom's machine that the runtime won't run here (no local bodies for this agent): a session here,
-        # as before, so it still runs where it needs to; only its conversation is lost. Said once a day: every wake
-        # here is the runtime's now (t-1921), and one that isn't is a setting to fix, not a way to keep running.
-        log("fire-spawn", f"{entry['id']} deliver to {body['place']} refused ({status}: {err}): a session here instead")
-        alert_daily("local-refused", f"wake: loom's runtime won't run wakes on loom's machine ({status}: {err}), so the clock "
-                    f"starts them as sessions itself, as before t-1921. Fix LOOM_RUNTIME_LOCAL_BODIES, or set "
-                    f"WAKE_LOCAL_RUN=session to say so")
-        return "spawn"
     # What every retry keeps: the conversation it belongs to.
     entry["deliver_place"], entry["deliver_label"] = body["place"], body["label"]
     via = "" if body["id"] == entry["id"] else f" as {body['id']}"
@@ -2204,7 +2189,7 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         return None
     log("fire-refused", f"{entry['id']} deliver{via} REFUSED {status}: {err}; not retried")
     alert(f"wake: loom refused to deliver \"{entry.get('note') or entry['id']}\" ({status}): {err}. Not retried: fix the "
-          f"clock's settings or the wake, or set WAKE_DELIVERY=spawn")
+          f"clock's settings or the wake")
     return None
 
 
@@ -2289,7 +2274,7 @@ def cmd_fire(args):
                 f"checkout). Read it and follow it.")
     # Delivered: a wake for the agent's house that needs no house slot (delivery keeps a conversation, not a slot). A
     # wake for loom's machine is delivered too (t-1921): the runtime runs its body here, when it runs local bodies for
-    # this agent; else it's a session here, as before. A house's wake the owner allowed here is one of them: its own
+    # this agent; a refusal never changes launchers. A house's wake the owner allowed here is one of them: its own
     # `wake:<id>` (it can't name a place). WAKE_LOCAL_RUN=session: only one set here that names its place (t-1830).
     local_place = mode == "local" and AGENT == LOCAL_AGENT and (
         local_run() == "runtime" or (bool(entry.get("place")) and not origin and not entry.get("local_approval")))

@@ -396,6 +396,12 @@ class AgentWakes(unittest.TestCase):
     """A wake set by an agent (WAKE_ORIGIN, from the piece API): its -f is a
     lane file, read the way argparse reads it, and it only fires into a house."""
 
+    def setUp(self):
+        # These exercise the explicitly selected compatibility dispatch path.
+        patch = mock.patch.dict(wake_cli.os.environ, {"WAKE_DELIVERY": "spawn"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def set_(self, argv, origin="agent:ada"):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": origin}), \
@@ -563,6 +569,12 @@ class AgentWakes(unittest.TestCase):
 
 
 class MixedMode(unittest.TestCase):
+    def setUp(self):
+        # These exercise the explicitly selected compatibility dispatch path.
+        patch = mock.patch.dict(wake_cli.os.environ, {"WAKE_DELIVERY": "spawn"})
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def fire(self, entry, body=None, mode="mixed"):
         with tempfile.TemporaryDirectory() as td, \
              mock.patch.dict(wake_cli.os.environ, {"WAKE_FIRE": mode}), \
@@ -766,18 +778,17 @@ class Delivery(unittest.TestCase):
         posts, dispatch, *_ = self.fire({**self.base, "prompt": "p"}, [], env={"WAKE_DELIVERY": "spawn"})
         self.assertEqual(posts, [])
         self.assertEqual(dispatch.call_args.args[3], "house")
-        # Unset, with no token to deliver with: the old way.
-        posts, dispatch, *_ = self.fire({**self.base, "prompt": "p"}, [], env={"WAKE_DELIVER_TOKEN_FILE": ""})
-        self.assertEqual((posts, dispatch.call_args.args[3]), ([], "house"))
-        # Unset, and loom has no piece offering delivery: this wake goes the old way.
-        posts, dispatch, _, logged, _ = self.fire({**self.base, "prompt": "p"}, [(503, {"error": "unavailable: no installed piece offers delivery (the runtime), so nothing can reach a body"})])
-        self.assertEqual((len(posts), dispatch.call_args.args[3]), (1, "house"))
-        self.assertIn("in a fresh house (loom-box)", dispatch.call_args.args[0], "its words say where it really runs")
-        self.assertIn("fire-spawn", logged)
-        # Set to deliver, it never falls back.
-        posts, dispatch, spool, *_ = self.fire({**self.base, "prompt": "p"}, [(503, {"error": "unavailable: no installed piece offers delivery"})], env={"WAKE_DELIVERY": "deliver"})
-        dispatch.assert_not_called()
-        self.assertEqual(len(spool), 1, "retried")
+        # Unset: missing credentials or missing runtime must not change execution paths.
+        with mock.patch.dict(os.environ, {"WAKE_DELIVER_TOKEN_FILE": "", "WAKE_DELIVERY": ""}):
+            self.assertEqual(wake_cli.delivery_mode(), "deliver")
+        for env in ({}, {"WAKE_DELIVERY": "deliver"}, {"WAKE_DELIVER_TOKEN_FILE": ""}):
+            posts, dispatch, spool, logged, _ = self.fire(
+                {**self.base, "prompt": "p"},
+                [(503, {"error": "unavailable: no installed piece offers delivery"})], env=env)
+            dispatch.assert_not_called()
+            self.assertEqual(len(spool), 1, "same runtime delivery is retried")
+            self.assertEqual(spool[0]["delivery"], posts[0])
+            self.assertNotIn("fire-spawn", logged)
 
     def test_what_delivery_cant_carry_goes_the_old_way(self):
         # A lane that keeps a house slot; and, with WAKE_LOCAL_RUN=session (the way back), a wake that needs loom's
@@ -841,20 +852,23 @@ class Delivery(unittest.TestCase):
         # Its timer carries the setting, so a fired run reads it as the clock that armed it.
         self.assertIn("WAKE_LOCAL_RUN", wake_cli.TIMER_ENV)
 
-    def test_a_runtime_that_wont_run_it_here_leaves_a_session_here(self):
-        e = {**self.base, "prompt": "<!-- house: local -->\ntriage", "place": "alert:host-watch"}
-        posts, dispatch, spool, logged, alerts = self.fire(e, [(403, {"error": "forbidden: the runtime runs no local bodies for ada"})])
-        self.assertEqual(len(posts), 1)
-        self.assertEqual(dispatch.call_args.args[3], "local")
-        self.assertIn("on loom's machine", dispatch.call_args.args[0])
-        self.assertIn("fire-spawn", logged)
-        # It ran, the old way; but every wake here is the runtime's now, so it's a setting to fix: said, once a day.
-        self.assertEqual(len(alerts), 1)
-        self.assertIn("WAKE_LOCAL_RUN=session", alerts[0])
-        # Without a place, the same.
-        posts, dispatch, _, logged, alerts = self.fire({**self.base, "prompt": "<!-- house: local -->\nx"}, [(403, {"error": "forbidden: the runtime runs no local bodies for ada"})])
-        self.assertEqual((len(posts), dispatch.call_args.args[3]), (1, "local"))
-        self.assertIn("fire-spawn", logged)
+    def test_local_runtime_refusal_never_starts_another_harness(self):
+        for status in (400, 403, 503):
+            for place in (None, "alert:host-watch"):
+                entry = {**self.base, "prompt": "<!-- house: local -->\ntriage"}
+                if place:
+                    entry["place"] = place
+                posts, dispatch, spool, logged, alerts = self.fire(entry, [(status, {
+                    "error": "no installed piece offers delivery" if status == 503 else "runtime runs no local bodies"})])
+                dispatch.assert_not_called()
+                self.assertEqual(len(posts), 1)
+                self.assertNotIn("fire-spawn", logged)
+                if status == 503:
+                    self.assertEqual(spool[0]["delivery"], posts[0])
+                else:
+                    self.assertEqual(spool, [])
+                    self.assertEqual(len(alerts), 1)
+                    self.assertIn("not retried", alerts[0].lower())
 
     def test_the_refusal_alert_is_once_a_day(self):
         with tempfile.TemporaryDirectory() as td, mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
@@ -974,7 +988,7 @@ class Clocks(unittest.TestCase):
             mock.patch.object(wake_cli, "PAUSED", w / "paused"),
             mock.patch.object(wake_cli, "AGENT", "ada"),
             mock.patch.object(wake_cli, "arm_timer", return_value="armed"), mock.patch.object(wake_cli, "disarm_timer"),
-            mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": ""}),
+            mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "", "WAKE_DELIVERY": "spawn"}),
         ]
         for p in self.patches:
             p.start()
@@ -1439,6 +1453,9 @@ class HouseStartWatch(unittest.TestCase):
     alerted like a dispatch failure. One that started is the lane's business."""
 
     def setUp(self):
+        patch = mock.patch.dict(wake_cli.os.environ, {"WAKE_DELIVERY": "spawn"})
+        patch.start()
+        self.addCleanup(patch.stop)
         self.td = tempfile.TemporaryDirectory()
         self.d = Path(self.td.name)
         self.alerts = []
@@ -2117,7 +2134,7 @@ class Settings(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             pre = Path(td) / "preamble.txt"
             pre.write_text("Hello {name} ({id}).\n\n{body}")
-            with mock.patch.dict(wake_cli.os.environ, {"WAKE_PREAMBLE_FILE": str(pre), "WAKE_FIRE": "local"}), \
+            with mock.patch.dict(wake_cli.os.environ, {"WAKE_PREAMBLE_FILE": str(pre), "WAKE_FIRE": "local", "WAKE_LOCAL_RUN": "session"}), \
                  mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
                  mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
                  mock.patch.object(wake_cli, "ensure_deadman"), mock.patch.object(wake_cli, "dispatch") as dispatch:
