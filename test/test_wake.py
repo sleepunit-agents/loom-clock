@@ -640,6 +640,85 @@ class Delivery(unittest.TestCase):
 
     base = {"id": "w-cccccc", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "t-9 round 2", "model": "m", "created": "x"}
 
+    def test_real_kill_after_http_acceptance_replays_sealed_firing(self):
+        import signal
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        accepted, release = threading.Event(), threading.Event()
+        received = []
+
+        class Receiver(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(self.rfile.read(int(self.headers["Content-Length"])))
+                accepted.set()
+                if len(received) == 1:
+                    release.wait(10)
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(b'{"body":"started"}')
+                except BrokenPipeError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as td, HTTPServer(("127.0.0.1", 0), Receiver) as server:
+            root = Path(td)
+            token = root / "token"
+            token.write_text("clock-test")
+            entry = dict(self.base, prompt="original words", continuation={"handle": "cont-" + "b" * 64, "wake": self.base["id"]})
+            with mock.patch.multiple(wake_cli, WAKE_DIR=root, SPOOL=root / "spool.jsonl", LOCK=root / "spool.lock", LOG=root / "wake.log"), \
+                 mock.patch.object(wake_cli, "arm_timer"), mock.patch.object(wake_cli, "ensure_deadman"), \
+                 mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "fire_mode", return_value="house"), \
+                 mock.patch.object(wake_cli, "paused", return_value=False), \
+                 mock.patch.dict(os.environ, {"WAKE_DELIVER_TOKEN_FILE": str(token), "WAKE_LOOM_URL": f"http://127.0.0.1:{server.server_port}"}):
+                with wake_cli.Spool() as spool:
+                    spool.entries.append(entry)
+
+                def start():
+                    # A new interpreter, with no inherited Python locks or mocked HTTP client.
+                    code = """
+import argparse, sys, types
+from pathlib import Path
+from unittest import mock
+m = types.ModuleType('clock_child')
+m.__file__ = sys.argv[1]
+exec(compile(Path(m.__file__).read_text(), m.__file__, 'exec'), m.__dict__)
+r = Path(sys.argv[2])
+with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.lock', LOG=r/'wake.log'), mock.patch.object(m, 'arm_timer'), mock.patch.object(m, 'ensure_deadman'), mock.patch.object(m, 'hand_over_principal'), mock.patch.object(m, 'fire_mode', return_value='house'), mock.patch.object(m, 'paused', return_value=False):
+    m.cmd_fire(argparse.Namespace(id=sys.argv[3]))
+"""
+                    return subprocess.Popen([sys.executable, "-c", code, str(SCRIPT), str(root), entry["id"]])
+
+                first = start()
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(accepted.wait(10), "first real HTTP request never arrived")
+                    first.kill()
+                    first.wait(timeout=10)
+                    pending = json.loads((root / "spool.jsonl").read_text())
+                    self.assertEqual(pending["delivery"], json.loads(received[0]))
+                    with wake_cli.Spool() as spool:
+                        recovered = spool.entries[0]
+                        recovered["prompt"] = "changed after crash"
+                        self.assertEqual(wake_cli.arm_pending(recovered), wake_cli.arm_timer.return_value)
+                        self.assertNotEqual(recovered["id"], entry["id"])
+                        entry["id"] = recovered["id"]
+                    self.assertEqual(recovered["delivery"], pending["delivery"])
+                    release.set()
+                    second = start()
+                    self.assertEqual(second.wait(timeout=10), 0)
+                    self.assertEqual(len(received), 2)
+                    self.assertEqual(received[0], received[1])
+                    self.assertEqual(json.loads(received[1])["continuation"], entry["continuation"])
+                    self.assertEqual((root / "spool.jsonl").read_text(), "")
+                finally:
+                    release.set()
+                    server.shutdown()
+                    thread.join(5)
+
     def test_setting_a_continuation_persists_opaque_handle_and_rejects_shared_places(self):
         handle = "cont-" + "a" * 64
         args = mock.Mock(prompt="continue", prompt_file=None, note="follow up", model="m", slot="", approval="", place="", park_on="", continuation=handle)

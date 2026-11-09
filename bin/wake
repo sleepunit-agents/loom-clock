@@ -535,8 +535,16 @@ class Spool:
         # recording what actually happened: a retry that was armed and
         # then vanished from the spool.
         tmp = SPOOL.with_suffix(".tmp")
-        tmp.write_text("".join(json.dumps(e) + "\n" for e in self.entries))
+        with tmp.open("w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in self.entries))
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(SPOOL)
+        directory = os.open(WAKE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         fcntl.flock(self._lock, fcntl.LOCK_UN)
         self._lock.close()
         return False
@@ -1739,6 +1747,24 @@ def cmd_cancel(args):
     print(f"cancelled {args.id}")
 
 
+def arm_pending(entry):
+    if not entry.get("_firing"):
+        return arm_timer(entry)
+    # A timer whose service died may still be loaded. Recover under a new timer id,
+    # preserving the sealed delivery id, body and original continuation wake.
+    with (WAKE_DIR / (entry["id"] + ".fire.lock")).open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "firing"
+        old = entry["id"]
+        entry["id"] = "w-" + secrets.token_hex(3)
+        entry["_firing"] = entry["id"]
+        result = arm_timer(entry)
+        log("fire-recover", f"{old} as {entry['id']}; exact delivery retained")
+        return result
+
+
 def cmd_rearm(args):
     # At boot (the piece's `run` service, or a plain `wake rearm`) every clock comes back,
     # not only the local agent's: the timers are transient, and another agent's lanes would stop silently.
@@ -1748,7 +1774,7 @@ def cmd_rearm(args):
             configure(agent)
         with Spool() as spool:
             for e in spool.entries:
-                print(f"{agent} {e['id']}: {arm_timer(e)}")
+                print(f"{agent} {e['id']}: {arm_pending(e)}")
             ensure_deadman(spool)
         log("rearm", f"{len(spool.entries)} entries")
 
@@ -2168,6 +2194,12 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text[:DELIVER_TEXT_MAX],
                 **({"local": True} if local else {}),
                 **({"continuation": dict(entry["continuation"])} if entry.get("continuation") else {})}
+    # Seal the exact wire body before either principal handover or delivery can reach runtime.
+    if entry.get("_firing"):
+        with Spool() as spool:
+            for pending in spool.entries:
+                if pending.get("_firing") == entry["_firing"]:
+                    pending["delivery"] = body
     # Whom it's for, handed to the runtime before the delivery it belongs to (t-1943). Not fatal: without it the
     # runtime treats the wake as unknown. (A wake that goes the old way, a spawned house or a session here, has no
     # runtime record to hand it to: there it's unknown.)
@@ -2202,6 +2234,25 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
 
 
 def cmd_fire(args):
+    # Serialize one firing across processes; the spool lock is released during HTTP.
+    WAKE_DIR.mkdir(parents=True, exist_ok=True)
+    with (WAKE_DIR / (args.id + ".fire.lock")).open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            _cmd_fire(args)
+        except SystemExit:
+            finish_firing(args.id)
+            raise
+        finish_firing(args.id)
+
+
+def finish_firing(wid):
+    with Spool() as spool:
+        spool.entries = [e for e in spool.entries if e.get("_firing") != wid or e.get("held")]
+        ensure_deadman(spool)
+
+
+def _cmd_fire(args):
     # The fire gate (one writer): a standby never dispatches a lane.
     # Keep the entry, push it out an hour, re-check then.
     if not fire_gate_open():
@@ -2209,6 +2260,7 @@ def cmd_fire(args):
             for e in spool.entries:
                 if e["id"] == args.id:
                     # our own unit name is still loaded (we ARE it) — re-arm under a fresh id
+                    e.pop("_firing", None)
                     old_id, e["id"] = e["id"], "w-" + secrets.token_hex(3)
                     e["at"] = (datetime.now() + timedelta(hours=1)).strftime(TIME_FMT)
                     arm_timer(e)
@@ -2226,8 +2278,13 @@ def cmd_fire(args):
             entry["held"] = True
             log("fire-held", f"{entry['id']} paused")
             return
-        spool.entries.remove(entry)
-        ensure_deadman(spool)
+        if entry.get("kind") in ("wake", "schedule", "deadman"):
+            entry["_firing"] = args.id
+            # A detached copy: changes become durable only through Spool's atomic commit.
+            entry = json.loads(json.dumps(entry))
+        else:
+            spool.entries.remove(entry)
+            ensure_deadman(spool)
     if entry.get("kind") == "watch":
         watch_house(entry)
         return
@@ -2247,11 +2304,16 @@ def cmd_fire(args):
         # The schedule's next occurrence first: the chain doesn't depend on this run.
         with Spool() as spool:
             sc = load_schedules().get(entry.get("schedule"))
-            if sc and not any(e.get("schedule") == entry["schedule"] for e in spool.entries):
+            if sc and not any(e.get("schedule") == entry["schedule"] and not e.get("_firing") for e in spool.entries):
                 nxt = schedule_entry(entry["schedule"], sc, next_occurrence(sc, datetime.now() + timedelta(minutes=1)))
                 spool.entries.append(nxt)
                 arm_timer(nxt)
                 log("schedule-next", f"{entry['schedule']}: {nxt['id']} at {nxt['at']}")
+    if entry.get("delivery"):
+        # Recovery uses the sealed wire body, even if the lane file/settings changed or disappeared.
+        agent = origin.split(":", 1)[1] if origin else AGENT
+        deliver_wake(entry, "", agent, False, local=bool(entry["delivery"].get("local")))
+        return
     if "lane" in entry:
         body = (f"Your lane for this wake is the file `{entry['lane']}` in your own repo (your house's "
                 f"checkout). Read it and follow it.")
@@ -2368,6 +2430,9 @@ def defer_quota(entry, reset, err):
         for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
             disarm_timer(dm["id"])
             spool.entries.remove(dm)
+        firing = entry.pop("_firing", None)
+        if firing:
+            spool.entries = [e for e in spool.entries if e.get("_firing") != firing]
         spool.entries.append(entry)
         arm_timer(entry)
     log("quota-wait", f"{old_id} {err}; waiting as {entry['id']} until {entry['at']}")
@@ -2390,6 +2455,9 @@ def retry(entry, err, event):
         for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
             disarm_timer(dm["id"])
             spool.entries.remove(dm)
+        firing = entry.pop("_firing", None)
+        if firing:
+            spool.entries = [e for e in spool.entries if e.get("_firing") != firing]
         spool.entries.append(entry)
         arm_timer(entry)
     log(event, f"{old_id} {err} — retry {fails} as {entry['id']} {entry['at']}")
@@ -3771,7 +3839,7 @@ def keep_armed():
         with Spool() as spool:
             for e in spool.entries:
                 if not e.get("held") and not timer_active(e["id"]):
-                    if arm_timer(e) == "armed":
+                    if arm_pending(e) == "armed":
                         log("rearm", f"{e['id']} had no timer")
             ensure_deadman(spool)
         try:

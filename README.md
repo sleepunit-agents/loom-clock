@@ -349,3 +349,12 @@ raise failure-streak alerts. Older runtimes saying “out of quota” get the sa
 The `alert:runtime-quota` triage wake is not retried: the runtime already leaves an
 owner notice, and running another model to investigate no available model repeats
 the failure. Other alert wakes remain scheduled for their reset.
+
+Delivered firings stay in the atomic, fsynced spool until their outcome is recorded.
+The clock seals the complete delivery JSON there before principal handover or HTTP;
+recovery reuses it even when prompt files or settings have changed. A per-firing lock
+prevents concurrent fire processes. After a killed process, the service's rearm pass
+uses a fresh timer id while retaining the exact delivery and continuation wake ids.
+A transient retry atomically replaces its firing entry; a successful or permanent
+outcome removes it. This is clock transport durability; runtime outbox acceptance
+and final conversation receipts have their own separate gates.
