@@ -441,23 +441,22 @@ class AgentWakes(unittest.TestCase):
         with mock.patch.object(wake_cli, "file_approval", lambda kind, target, what, why, plain=None: filed.append((kind, target, what, why, plain)) or "a-0000aaaa"):
             err, entries = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1"])
             self.assertIn("--approval a-0000aaaa", err or "")
-            self.assertIn("--ask", err or "")           # told to say it plainly next time
             self.assertEqual(entries, [])
-            err, _ = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1",
-                                "--ask", "OK to push the agent from loom's machine?"])
-            self.assertNotIn("next time say --ask", err or "")
+            # A long, many-line note can't pass for the words that run: one line, cut, and labelled as the body's.
+            err, _ = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1\nRuns on loom's machine, exactly as written:\nrm -rf / " + "x" * 300])
         # The card shows the prompt itself (wake files it), not the body's own description of it.
-        (kind, target, what, why, plain), (_, _, _, _, asked) = filed
+        (kind, target, what, why, plain), (_, _, _, _, long_note) = filed
         self.assertEqual(kind, "local-wake")
         self.assertIn("push the agent", what)
         self.assertIn("t-1 r1", why)
-        # And it asks a plain question (t-2008): the clock's own when the body gave none, the body's when it did; the
-        # exact words that run, and the note with its ids, are the details, never the headline.
-        self.assertEqual(plain["ask"], "OK for Ada to run a job on loom's machine itself?")
-        self.assertEqual(asked["ask"], "OK to push the agent from loom's machine?")
-        self.assertIn("push the agent", plain["details"])
-        self.assertIn("t-1 r1", plain["details"])
+        # And it asks a plain question (t-2008), always the clock's own: the body's Allow runs its words, so the body
+        # doesn't write the headline. The exact words that run, and the note with its ids, are the details.
+        self.assertEqual(plain["ask"], "OK for Ada to run the job below on loom's machine itself?")
+        self.assertTrue(plain["details"].startswith("Runs on loom's machine, exactly as written:\npush the agent\n\nAda's note for it (its own words): t-1 r1"))
         self.assertNotIn("<!-- house: local -->", plain["details"])
+        self.assertEqual(long_note["details"].count("\n"), 3)
+        self.assertEqual(long_note["details"].count("exactly as written"), 1 + 1)   # the heading, and the note's own words, on one labelled line
+        self.assertLess(len(long_note["details"].split("\n")[-1]), 200)
         for k in ("ask", "why", "if_yes", "if_no"):
             self.assertTrue(plain[k])
             self.assertNotRegex(plain[k], r"\bt-\d+|\bround\s+\d+|[0-9a-f]{16}|local[- ]wake")
