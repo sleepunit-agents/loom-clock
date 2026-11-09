@@ -24,8 +24,7 @@ wake --agent bo list                     # another agent's clock (the owner's to
 Each wake is a transient systemd user timer (`systemd-run --user`, unit
 `wake-<id>`). When it fires, the clock hands the work to loom's runtime: a
 body on this machine or in the agent's house, delivered through loom (see
-"Delivery"). Explicit compatibility settings can instead select a **session** it starts itself (by default
-`claude --bg <prompt>`) or a **house** from
+"Delivery"). Explicit compatibility settings can select a **house** from
 [loom-box](https://github.com/sleepunit-agents/loom-box) (`loom box up --agent
 <id> --task -`). The prompt it hands over starts with a short preamble (who
 it is, which wake, how to set the next one), then the lane file's text or the
@@ -65,9 +64,10 @@ inline prompt.
   yes, the continuation is handed the exact way to spend it (`approvals use
   <id> --kind … --target …`, or for a local wake `wake in 1m --approval <id>`),
   so it never asks the owner again in its own words.
-- **Stuck sessions.** (A body the runtime runs is the runtime's to stop:
-  `LOOM_RUNTIME_STUCK_AFTER`. This is for the sessions the clock still starts
-  itself: explicit `WAKE_LOCAL_RUN=session`.) A session the clock started here has nobody at its
+- **Legacy stuck sessions.** A body the runtime runs is the runtime's to stop:
+  `LOOM_RUNTIME_STUCK_AFTER`. The clock still monitors sessions recorded by
+  older versions, including their configured command's program. New local work
+  uses the runtime. A session the old clock started here has nobody at its
   terminal, so one that stops on a permission prompt would wait forever. The
   clock keeps a record of the sessions it started (`sessions.json`, by the id
   `claude --bg` prints) and the service looks at them every 2 minutes
@@ -116,9 +116,14 @@ inline prompt.
   (its house runs are `lane:<lane>`: a conversation's bodies run in one place
   only), else `wake:<id>`. If the runtime refuses (400 or 403), the owner
   hears why and no other launcher runs. Temporary unavailability retries
-  the same delivery, preserving its conversation and id. `WAKE_LOCAL_RUN=session` is the way back: a
-  local wake is a session again, delivered only when it names its place.
-  `WAKE_DELIVERY=spawn` puts every wake back on the old way.
+  the same delivery, preserving its conversation and id. Legacy
+  `WAKE_LOCAL_RUN=session` values use that same path, including already armed
+  timers and owner-approved local wakes. `WAKE_DELIVERY=spawn` selects only
+  the compatibility allocated-house task path. It cannot start a local harness.
+  Configure local models, arguments and permissions in the runtime's body
+  policy and `LOOM_RUNTIME_LOCAL_BODIES`; `WAKE_SESSION_COMMAND` no longer
+  starts new work. If local runtime delivery is unavailable, restore it rather
+  than changing launchers; the clock retains the exact delivery for retry.
 - **On whose behalf, the runtime's answer.** `--verify` answers
   `{ok, agent, conversation, for, owner, people, exp}`: `owner` is true or
   false (true: every voice that conversation heard was one of the agent's
@@ -246,8 +251,8 @@ from a `oneshot` user unit.
 | `WAKE_AGENTS` | the local agent | Agents that may manage their own clocks over loom's piece API |
 | `WAKE_FIRE` | `$WAKE_DATA/fire`, else `local` | `local`, `house` or `mixed` |
 | `WAKE_MODEL` | `claude-sonnet-5` | The model a wake runs on unless it names one |
-| `WAKE_LOCAL_RUN` | `runtime` | How a wake that runs here runs: `runtime` (delivered, `local: true`; the runtime runs its body here) or `session` (the clock starts `WAKE_SESSION_COMMAND` itself, as before t-1921: the way back) |
-| `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}"]` | The session a local wake starts the old way (explicit `WAKE_LOCAL_RUN=session`). A JSON list (or a command line); `{prompt}` and `{model}` are whole arguments. The default can stop and ask for permission; an unattended agent that has decided otherwise adds its own flags here |
+| `WAKE_LOCAL_RUN` | `runtime` | Legacy compatibility setting. All local wakes, including `session`, are delivered with `local: true` through the runtime |
+| `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}"]` | Only the legacy session monitor uses the program from this setting to inspect sessions already recorded by older versions. It starts no new work |
 | `WAKE_STUCK_AFTER` | `10` | Minutes a session the clock started may wait on a permission prompt before it's stopped, noted and said (see "Stuck sessions"); `0` or `off`: never |
 | `WAKE_TASK_COMMENT` | `["taskstore", "comment", "{task}", "{text}"]`, when `taskstore` is on `PATH` | How a stopped session is noted on the task its note names (a `t-NNN`); `off`: never |
 | `WAKE_ALERT_COMMAND` | none (the log only) | How the clock reaches the owner when a wake keeps failing or a session was stopped stuck; the message is its last argument |
@@ -263,8 +268,7 @@ Read from the environment only: `WAKE_HOUSEHOLD` (default
 `WAKE_APPROVALS` (default `loom approvals`), and `WAKE_NO_FORWARD=1` (see
 "In a house").
 
-The default session command skips the agent harness's permission prompts,
-since nobody is there to answer them. Set your own if that isn't what you want.
+The runtime's body policy controls local model permissions and arguments.
 
 A managed piece gets its settings from loom. Run directly by the bin loom
 linked (a timer, a body typing `wake`), it finds its piece home from where
@@ -332,9 +336,11 @@ The unit tests run in a sandbox: their clocks, repo and household file are a
 throwaway directory, and `systemd-run`/`systemctl` on their `PATH` refuse, so
 a test can never arm a real timer. `test/smoke.sh` runs the bin in a clean
 environment (`env -i`, a throwaway `HOME`, `LOOM_PIECE_HOME` and repo, with
-stand-ins for systemd and the session): set a wake, list it, schedule a lane,
-draw the page, refuse an agent's `fire` over the API, fire the wake into a
-session and check the session got the preamble, the prompt and the model.
+stand-ins for systemd and an authenticated local HTTP delivery fixture): set a
+wake, list it, schedule a lane, draw the page, refuse an agent's `fire` over the
+API, and fire the wake with both legacy launcher settings enabled. Check the
+runtime receives its id, local placement, preamble and prompt, while the
+deliberately failing legacy launcher remains unused.
 
 ## License
 

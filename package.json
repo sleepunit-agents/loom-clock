@@ -20,7 +20,7 @@
     "name": "clock",
     "role": "clock",
     "label": "Clock",
-    "description": "Wakes an agent: self-set alarms, recurring schedules and the household's lanes assigned to an agent, each delivered through loom (or run in a house or as a session here). Relays between agents are the runtime's.",
+    "description": "Wakes an agent: self-set alarms, recurring schedules and the household's lanes assigned to an agent, through loom's runtime or a runtime-managed house task. Relays between agents are the runtime's.",
     "settings": [
       {
         "name": "WAKE_LOCAL_AGENT",
@@ -70,15 +70,14 @@
         "label": "How a wake on this machine runs",
         "kind": "choice",
         "options": [
-          { "value": "runtime", "label": "Delivered: loom's runtime runs its body here (one path for every wake)" },
-          { "value": "session", "label": "The old way: the clock starts a session here itself" }
+          { "value": "runtime", "label": "Delivered: loom's runtime runs its body here" }
         ],
-        "hint": "unset: runtime. session explicitly selects the compatibility launcher; a runtime refusal never changes launchers"
+        "hint": "all local wakes use the runtime; legacy session values also deliver through it"
       },
       {
         "name": "WAKE_SESSION_COMMAND",
-        "label": "The session a local wake starts the old way",
-        "hint": "a JSON list, {prompt} and {model} filled in; default [\"claude\", \"--bg\", \"{prompt}\", \"--model\", \"{model}\"]"
+        "label": "The command used by older recorded local sessions",
+        "hint": "only the legacy session monitor uses this command's program; new local work uses the runtime's model choice and body policy"
       },
       {
         "name": "WAKE_STUCK_AFTER",
@@ -114,7 +113,7 @@
           { "value": "deliver", "label": "Delivered through loom (the runtime reaches its body)" },
           { "value": "spawn", "label": "The old way: the clock asks for a house itself" }
         ],
-        "hint": "unset: delivered through the runtime; missing credentials or runtime availability are retried, never a launcher fallback"
+        "hint": "unset: delivered through the runtime; spawn selects only the compatibility house task path. Local work always uses delivery"
       },
       {
         "name": "WAKE_DELIVER_TOKEN_FILE",
