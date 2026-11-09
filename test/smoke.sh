@@ -33,7 +33,7 @@ chmod +x "$tmp/bin/"*
 
 run() {
   env -i PATH="$tmp/bin:/usr/local/bin:/usr/bin:/bin" HOME="$tmp/home" LOOM_PIECE_HOME="$tmp/piece" \
-    WAKE_LOCAL_AGENT=ada WAKE_REPO="$tmp/repo" WAKE_SESSION_COMMAND='["session", "{prompt}", "{model}"]' \
+    WAKE_LOCAL_AGENT=ada WAKE_LOCAL_RUN=session WAKE_REPO="$tmp/repo" WAKE_SESSION_COMMAND='["session", "{prompt}", "{model}"]' \
     SMOKE_TIMERS="$tmp/timers" SMOKE_SESSION="$tmp/session" ${SCOPE:+LOOM_SCOPE=$SCOPE} "$here/bin/wake" "$@"
 }
 fail() { echo "smoke: FAIL: $*" >&2; exit 1; }

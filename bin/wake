@@ -804,6 +804,13 @@ def cmd_set(args, when):
         "model": args.model,
         "created": datetime.now().strftime(TIME_FMT),
     }
+    continuation = vars(args).get("continuation", "")
+    if continuation:
+        if not re.fullmatch(r"cont-[0-9a-f]{64}", continuation):
+            sys.exit("wake: --continuation is an opaque runtime capability")
+        if args.slot or getattr(args, "place", ""):
+            sys.exit("wake: a continuation needs its own delivered conversation, without --slot or --place")
+        entry["continuation"] = {"handle": continuation, "wake": entry["id"]}
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     if origin:
         entry["origin"] = origin
@@ -2159,7 +2166,8 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         body = {"id": entry["id"][:DELIVER_ID_MAX], "agent": agent, "venue": "wake", "place": wake_place(entry, local),
                 "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text[:DELIVER_TEXT_MAX],
-                **({"local": True} if local else {})}
+                **({"local": True} if local else {}),
+                **({"continuation": dict(entry["continuation"])} if entry.get("continuation") else {})}
     # Whom it's for, handed to the runtime before the delivery it belongs to (t-1943). Not fatal: without it the
     # runtime treats the wake as unknown. (A wake that goes the old way, a spawned house or a session here, has no
     # runtime record to hand it to: there it's unknown.)
@@ -3830,6 +3838,7 @@ def main():
         p.add_argument("-f", "--prompt-file")
         p.add_argument("--note", default="")
         p.add_argument("--model", default=DEFAULT_MODEL)
+        p.add_argument("--continuation", default="", help="opaque report capability issued by the current source holder")
         p.add_argument("--slot", default="", help="a house slot: its bookkeeping, restored and saved (one house at a time)")
         p.add_argument("--approval", default="", help="the owner's approval id, for a house's wake that must run on loom's machine")
         p.add_argument("--place", default="", help="the conversation it joins (delivery's place, like alert:host-watch): "

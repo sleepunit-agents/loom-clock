@@ -640,6 +640,47 @@ class Delivery(unittest.TestCase):
 
     base = {"id": "w-cccccc", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "t-9 round 2", "model": "m", "created": "x"}
 
+    def test_setting_a_continuation_persists_opaque_handle_and_rejects_shared_places(self):
+        handle = "cont-" + "a" * 64
+        args = mock.Mock(prompt="continue", prompt_file=None, note="follow up", model="m", slot="", approval="", place="", park_on="", continuation=handle)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+             mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+             mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+             mock.patch.object(wake_cli, "arm_timer", return_value="armed"):
+            wake_cli.cmd_set(args, wake_cli.datetime.now())
+            entries = [json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
+            entry = next(e for e in entries if e.get("continuation"))
+            self.assertEqual(entry["continuation"], {"handle": handle, "wake": entry["id"]})
+            args.place = "alert:shared"
+            with self.assertRaises(SystemExit):
+                wake_cli.cmd_set(args, wake_cli.datetime.now())
+            args.place = ""
+            args.continuation = "cv-0123456789ab"
+            with self.assertRaises(SystemExit):
+                wake_cli.cmd_set(args, wake_cli.datetime.now())
+
+    def test_opaque_continuation_survives_retry_without_authority_from_origin(self):
+        grant = {"handle": "cont-" + "a" * 64, "wake": self.base["id"]}
+        entry = {**self.base, "continuation": grant, "for_in": "cv-0123456789ab"}
+        bodies = []
+        def post(body):
+            bodies.append(json.loads(json.dumps(body)))
+            return (503, {"error": "busy"}) if len(bodies) == 1 else (200, {"body": "queued"})
+        with mock.patch.object(wake_cli, "post_delivery", side_effect=post), \
+             mock.patch.object(wake_cli, "hand_over_principal"), \
+             mock.patch.object(wake_cli, "retry", side_effect=lambda e, *a: e.update(id="w-999999")), \
+             mock.patch.object(wake_cli, "log"):
+            wake_cli.deliver_wake(entry, "continue", "art", False)
+            wake_cli.deliver_wake(entry, "changed prompt must not change retry", "art", False)
+        self.assertEqual(bodies[0], bodies[1])
+        self.assertEqual(bodies[0]["continuation"], grant)
+        entry = {**self.base, "for_in": "cv-0123456789ab"}
+        with mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"body": "queued"})) as post, \
+             mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "log"):
+            wake_cli.deliver_wake(entry, "continue", "art", False)
+        self.assertNotIn("continuation", post.call_args.args[0])
+
     def test_delivery_hands_over_parent_conversation_only_for_one_off_continuations(self):
         for extra, expected in [({}, "cv-0123456789ab"), ({"kind": "schedule", "schedule": "nightly"}, None)]:
             entry = {**self.base, "for": "owner", "for_in": "cv-0123456789ab", **extra}
