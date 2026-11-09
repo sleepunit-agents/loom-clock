@@ -3133,6 +3133,20 @@ def agent_reports(view, now):
             out[v["agent"]] = {"readings": [{"label": "Next", "value": f"{short(brief_of(nxt), 40)}, {day_time(at, now)}", "detail": until_text(at, now), "page": ""}]}
         else:
             out[v["agent"]] = {"readings": [{"label": "Next", "value": "nothing pending", "tone": "warn", "page": ""}]}
+        jobs = []
+        for e in upcoming(v["entries"]):
+            state = "waiting" if v["paused"] or e.get("held") or e.get("kind") == "parked" else "scheduled"
+            row = {"id": e["id"], "wake": e["id"], "status": state, "text": short(brief_of(e), 300), "page": "agent:" + v["agent"],
+                   "tasks": list(dict.fromkeys(re.findall(r"\bt-\d+\b", e.get("note") or "")))}
+            try:
+                row["at"] = datetime.strptime(e["at"], TIME_FMT).astimezone().isoformat()
+            except (ValueError, KeyError):
+                pass
+            # Provenance is solely a visibility restriction, never posting authority or a work identity.
+            if re.fullmatch(r"cv-[0-9a-f]{12}", e.get("for_in") or ""):
+                row["conversation"] = e["for_in"]
+            jobs.append(row)
+        out[v["agent"]]["jobs"] = jobs
     return out
 
 

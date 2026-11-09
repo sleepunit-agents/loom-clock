@@ -951,6 +951,17 @@ MANIFEST = json.loads((SCRIPT.parent.parent / "package.json").read_text())["loom
 
 
 class Manifest(unittest.TestCase):
+    def test_complete_jobs_include_waiting_scheduled_and_remove_finished_entries(self):
+        view = [{"agent": "ada", "schedules": {}, "paused": False, "entries": [
+            {"id": "w-123abc", "kind": "wake", "at": "2026-11-10 10:00:00", "note": "t-2006 finish cards", "for_in": "cv-0123456789ab"},
+            {"id": "w-456abc", "kind": "parked", "at": "2026-11-10 11:00:00", "note": "Wait for the answer"}]}]
+        rows = wake_cli.agent_reports(view, wake_cli.datetime(2026, 11, 9))["ada"]["jobs"]
+        self.assertEqual([r["status"] for r in rows], ["scheduled", "waiting"])
+        self.assertEqual(rows[0]["tasks"], ["t-2006"])
+        self.assertEqual(rows[0]["conversation"], "cv-0123456789ab")
+        view[0]["entries"] = []
+        self.assertEqual(wake_cli.agent_reports(view, wake_cli.datetime(2026, 11, 9))["ada"]["jobs"], [])
+
     def test_the_manifest_fits_looms_limits(self):
         # loom's checks (src/cli/pieces-managed.ts): `settings.length > 20`, `str(b.description, 300)`,
         # `str(s.label, 100)`, `str(s.hint, 200)` ("setting X: hint is not a string" when it's longer), and
