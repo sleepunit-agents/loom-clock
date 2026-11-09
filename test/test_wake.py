@@ -438,15 +438,29 @@ class AgentWakes(unittest.TestCase):
         # A house body that sets `<!-- house: local -->` isn't sent to a house silently: it's told at
         # once, and the owner can allow it (approvals).
         filed = []
-        with mock.patch.object(wake_cli, "file_approval", lambda kind, target, what, why: filed.append((kind, target, what, why)) or "a-0000aaaa"):
+        with mock.patch.object(wake_cli, "file_approval", lambda kind, target, what, why, plain=None: filed.append((kind, target, what, why, plain)) or "a-0000aaaa"):
             err, entries = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1"])
-        self.assertIn("--approval a-0000aaaa", err or "")
-        self.assertEqual(entries, [])
+            self.assertIn("--approval a-0000aaaa", err or "")
+            self.assertIn("--ask", err or "")           # told to say it plainly next time
+            self.assertEqual(entries, [])
+            err, _ = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1",
+                                "--ask", "OK to push the agent from loom's machine?"])
+            self.assertNotIn("next time say --ask", err or "")
         # The card shows the prompt itself (wake files it), not the body's own description of it.
-        (kind, target, what, why), = filed
+        (kind, target, what, why, plain), (_, _, _, _, asked) = filed
         self.assertEqual(kind, "local-wake")
         self.assertIn("push the agent", what)
         self.assertIn("t-1 r1", why)
+        # And it asks a plain question (t-2008): the clock's own when the body gave none, the body's when it did; the
+        # exact words that run, and the note with its ids, are the details, never the headline.
+        self.assertEqual(plain["ask"], "OK for Ada to run a job on loom's machine itself?")
+        self.assertEqual(asked["ask"], "OK to push the agent from loom's machine?")
+        self.assertIn("push the agent", plain["details"])
+        self.assertIn("t-1 r1", plain["details"])
+        self.assertNotIn("<!-- house: local -->", plain["details"])
+        for k in ("ask", "why", "if_yes", "if_no"):
+            self.assertTrue(plain[k])
+            self.assertNotRegex(plain[k], r"\bt-\d+|\bround\s+\d+|[0-9a-f]{16}|local[- ]wake")
         # Too long to show whole: refused, never cut.
         with mock.patch.object(wake_cli, "file_approval", lambda *a: self.fail("filed a truncated ask")):
             err, _ = self.set_(["in", "1h", "-p", "x" * 300 + " <!-- house: local -->", "--note", "t-1 r2"])
@@ -2689,6 +2703,18 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
             self.assertEqual(wake_cli.spend_approval("a-1a2b3c4d", "local-wake", "ada:abc"), "")
         filed, spent = [a for a in seen if a[0] != str(self.fake)]
         self.assertEqual(filed[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
+        # With the plain card, the request carries each of its words under its own flag (t-2008).
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "agent:ada", "WAKE_CALLER": json.dumps(self.ADA),
+                                                   "WAKE_PRINCIPAL_STATEMENT": "stmt-loren",
+                                                   "PRINCIPAL_ANSWER": json.dumps(self.verified("ada", "loren"))}), \
+                mock.patch.object(wake_cli.subprocess, "run", side_effect=lambda argv, **k: seen.append(argv) or
+                                  (real_run(argv, **k) if argv[0] == str(self.fake) else ok)):
+            card = wake_cli.local_wake_card("run X", "t-9 note")
+            self.assertEqual(wake_cli.file_approval("local-wake", "ada:abc", "run X", "why", plain=card), "a-1a2b3c4d")
+        argv = [a for a in seen if a[0] != str(self.fake)][-1]
+        for flag, key in (("--ask", "ask"), ("--why", "why"), ("--if-yes", "if_yes"), ("--if-no", "if_no"), ("--details", "details")):
+            self.assertEqual(argv[argv.index(flag) + 1], card[key])
+        self.assertEqual(argv.count("--why"), 1)
         self.assertEqual(spent[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
 
     def test_the_owner_s_own_call_over_the_api_is_the_owner_s(self):

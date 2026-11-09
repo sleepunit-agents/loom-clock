@@ -47,7 +47,11 @@ inline prompt.
   set for itself through loom's API. A wake set from a house that says it
   needs loom's machine (`<!-- house: local -->`) is refused, and the clock
   files an approval with the prompt as its words: it runs here only once the
-  owner allows exactly that prompt (`--approval <id>`). The clock keeps the
+  owner allows exactly that prompt (`--approval <id>`). The card asks a plain
+  question (the body's `--ask "OK to run the permission audit on loom's machine?"`,
+  else the clock's own "OK for Art to run a job on loom's machine itself?"), with the
+  clock's lines for what Allow and Deny do; the exact prompt and the note are its
+  details. The clock keeps the
   words it filed (`filed.json`, 8 days), so `wake in 1m --approval <id>` with
   no `-p` sets exactly them, from any of the agent's houses (or on loom's machine), and spends the
   approval, with the note it was filed with. `--approval` with other words, another
