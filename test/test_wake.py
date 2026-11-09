@@ -628,6 +628,15 @@ class Delivery(unittest.TestCase):
 
     base = {"id": "w-cccccc", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "t-9 round 2", "model": "m", "created": "x"}
 
+    def test_delivery_hands_over_parent_conversation_only_for_one_off_continuations(self):
+        for extra, expected in [({}, "cv-0123456789ab"), ({"kind": "schedule", "schedule": "nightly"}, None)]:
+            entry = {**self.base, "for": "owner", "for_in": "cv-0123456789ab", **extra}
+            with mock.patch.object(wake_cli, "hand_over_principal") as hand, \
+                 mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"conversation": "cv-111111111111", "body": "started"})), \
+                 mock.patch.object(wake_cli, "log"):
+                wake_cli.deliver_wake(entry, "continue", "art", False)
+            self.assertEqual(hand.call_args.kwargs["origin"], expected)
+
     def fire(self, entry, answers, env=None, body=None, entries=None):
         """Fire `entry` with post_delivery answering `answers` in turn: (posts, dispatch mock, spool, log, alerts)."""
         posts, alerts = [], []
