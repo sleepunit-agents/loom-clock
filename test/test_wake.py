@@ -667,7 +667,7 @@ class Delivery(unittest.TestCase):
             root = Path(td)
             token = root / "token"
             token.write_text("clock-test")
-            entry = dict(self.base, prompt="original words", continuation={"handle": "cont-" + "b" * 64, "wake": self.base["id"]})
+            entry = dict(self.base, prompt="original words", continuation={"handle": "cont-" + "b" * 64, "expiresAt": 9999999999999, "wake": self.base["id"]})
             with mock.patch.multiple(wake_cli, WAKE_DIR=root, SPOOL=root / "spool.jsonl", LOCK=root / "spool.lock", LOG=root / "wake.log"), \
                  mock.patch.object(wake_cli, "arm_timer"), mock.patch.object(wake_cli, "ensure_deadman"), \
                  mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "fire_mode", return_value="house"), \
@@ -719,6 +719,41 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
                     server.shutdown()
                     thread.join(5)
 
+    def test_continuation_inspection_requires_runtime_deadline_before_any_commit(self):
+        handle = "cont-" + "a" * 64
+        when = wake_cli.datetime.now() + wake_cli.timedelta(hours=1)
+        deadline = int(when.timestamp() * 1000) + 1
+        good = {"handle": handle, "expiresAt": deadline}
+        with mock.patch.dict(os.environ, {"WAKE_PRINCIPAL_STATEMENT": "signed-issuer"}), \
+             mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(good))) as call:
+            self.assertEqual(wake_cli.inspect_continuation(handle, when), deadline)
+            self.assertEqual(call.call_args.kwargs["input"], "signed-issuer")
+            for bad in [{**good, "expiresAt": deadline - 1}, {**good, "expiresAt": str(deadline)},
+                        {**good, "handle": "other"}, {}]:
+                call.return_value.stdout = json.dumps(bad)
+                with self.assertRaises(SystemExit):
+                    wake_cli.inspect_continuation(handle, when)
+        args = mock.Mock(prompt="continue", prompt_file=None, note="follow up", model="m", slot="", approval="", place="", continuation=handle)
+        with mock.patch.object(wake_cli, "inspect_continuation", side_effect=SystemExit("refused")), \
+             mock.patch.object(wake_cli, "Spool") as spool, mock.patch.object(wake_cli, "arm_timer") as timer:
+            with self.assertRaises(SystemExit):
+                wake_cli.cmd_set(args, when)
+            spool.assert_not_called()
+            timer.assert_not_called()
+
+    def test_continuation_firing_holds_legacy_expired_and_changed_deadlines(self):
+        now = int(wake_cli.datetime.now().timestamp() * 1000)
+        for deadline in [None, now, now - 1, str(now + 999999)]:
+            entry = {**self.base, "continuation": {"handle": "cont-" + "a" * 64, "wake": self.base["id"], "expiresAt": deadline}}
+            with mock.patch.object(wake_cli, "post_delivery") as post, mock.patch.object(wake_cli, "log"):
+                wake_cli.deliver_wake(entry, "continue", "art", False)
+                post.assert_not_called()
+        grant = {"handle": "cont-" + "a" * 64, "wake": self.base["id"], "expiresAt": now + 999999}
+        entry = {**self.base, "continuation": grant, "delivery": {"continuation": {**grant, "expiresAt": now + 999998}}}
+        with mock.patch.object(wake_cli, "post_delivery") as post, mock.patch.object(wake_cli, "log"):
+            wake_cli.deliver_wake(entry, "continue", "art", False)
+            post.assert_not_called()
+
     def test_setting_a_continuation_persists_opaque_handle_and_rejects_shared_places(self):
         handle = "cont-" + "a" * 64
         args = mock.Mock(prompt="continue", prompt_file=None, note="follow up", model="m", slot="", approval="", place="", park_on="", continuation=handle)
@@ -726,11 +761,12 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
              mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
              mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
              mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
-             mock.patch.object(wake_cli, "arm_timer", return_value="armed"):
+             mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+             mock.patch.object(wake_cli, "inspect_continuation", return_value=9999999999999):
             wake_cli.cmd_set(args, wake_cli.datetime.now())
             entries = [json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
             entry = next(e for e in entries if e.get("continuation"))
-            self.assertEqual(entry["continuation"], {"handle": handle, "wake": entry["id"]})
+            self.assertEqual(entry["continuation"], {"handle": handle, "wake": entry["id"], "expiresAt": 9999999999999})
             args.place = "alert:shared"
             with self.assertRaises(SystemExit):
                 wake_cli.cmd_set(args, wake_cli.datetime.now())
@@ -740,7 +776,7 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
                 wake_cli.cmd_set(args, wake_cli.datetime.now())
 
     def test_opaque_continuation_survives_retry_without_authority_from_origin(self):
-        grant = {"handle": "cont-" + "a" * 64, "wake": self.base["id"]}
+        grant = {"handle": "cont-" + "a" * 64, "expiresAt": 9999999999999, "wake": self.base["id"]}
         entry = {**self.base, "continuation": grant, "for_in": "cv-0123456789ab"}
         bodies = []
         def post(body):

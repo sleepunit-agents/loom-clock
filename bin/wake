@@ -762,6 +762,28 @@ def schedule_for_file(path):
     return None
 
 
+def inspect_continuation(handle, when):
+    """Ask the local runtime, with the issuer's signed statement, before any timer/spool write."""
+    statement = os.environ.get("WAKE_PRINCIPAL_STATEMENT", "")
+    if not statement and not os.environ.get("WAKE_ORIGIN"):
+        statement = fetch_principal(os.environ.get("LOOM_BODY_CONVERSATION", ""))
+    if not statement:
+        sys.exit("wake: a continuation needs its authenticated issuer statement")
+    scheduled_at = int(when.timestamp() * 1000)
+    try:
+        r = subprocess.run([*principal_argv(), "--inspect-continuation", handle, "--agent", AGENT,
+                            "--scheduled-at", str(scheduled_at)], input=statement, capture_output=True, text=True,
+                           timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+        answer = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, SystemExit):
+        answer = None
+    deadline = answer.get("expiresAt") if isinstance(answer, dict) else None
+    if (not isinstance(answer, dict) or answer.get("handle") != handle or type(deadline) is not int or
+            deadline <= int(datetime.now().timestamp() * 1000) or scheduled_at >= deadline):
+        sys.exit("wake: runtime refused continuation scheduling or returned no valid deadline")
+    return deadline
+
+
 def cmd_set(args, when):
     if getattr(args, "approval", ""):
         # A local wake the owner allowed is set with the words this clock filed for it, byte for byte, and only those:
@@ -818,7 +840,8 @@ def cmd_set(args, when):
             sys.exit("wake: --continuation is an opaque runtime capability")
         if args.slot or getattr(args, "place", ""):
             sys.exit("wake: a continuation needs its own delivered conversation, without --slot or --place")
-        entry["continuation"] = {"handle": continuation, "wake": entry["id"]}
+        entry["continuation"] = {"handle": continuation, "wake": entry["id"],
+                                 "expiresAt": inspect_continuation(continuation, when)}
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     if origin:
         entry["origin"] = origin
@@ -902,6 +925,8 @@ def cmd_set(args, when):
     with Spool() as spool:
         if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
             sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
+        if entry.get("continuation") and int(datetime.now().timestamp() * 1000) >= entry["continuation"]["expiresAt"]:
+            sys.exit("wake: continuation expired before scheduling committed")
         # A real wake replaces any pending dead-man.
         for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
             disarm_timer(dm["id"])
@@ -2184,6 +2209,13 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
       - failed: the turn stands and no body took it: retried later as a new delivery (a new id, the same place);
       - no answer, a 5xx or a 429: retried later with the same id and body, which loom answers once;
       - any other refusal (400, 403, 409, 413): said loudly, never retried: a retry would be refused the same way."""
+    continuation = entry.get("continuation")
+    if continuation:
+        deadline = continuation.get("expiresAt")
+        if (type(deadline) is not int or deadline <= int(datetime.now().timestamp() * 1000) or
+                (entry.get("delivery") and entry["delivery"].get("continuation") != continuation)):
+            log("fire-refused", f"{entry['id']} continuation expired, legacy, or changed; not delivered")
+            return None
     body = entry.get("delivery")
     if not body:
         # A local wake says so in the contract's own field (`local: true`), never by the words: its marker is this

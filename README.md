@@ -358,3 +358,10 @@ uses a fresh timer id while retaining the exact delivery and continuation wake i
 A transient retry atomically replaces its firing entry; a successful or permanent
 outcome removes it. This is clock transport durability; runtime outbox acceptance
 and final conversation receipts have their own separate gates.
+
+Continuation cutoff staging: `--continuation` obtains the immutable deadline
+from the local runtime using the authenticated issuer statement before scheduling.
+The spool and sealed firing retain that exact deadline; expired, legacy or changed
+firings are refused without delivery. This requires the companion draft core/runtime
+protocol. Production issuance remains held; native host admission and cutoff crash
+reconciliation remain shipping gates. This does not approve any lifetime policy.
