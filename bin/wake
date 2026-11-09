@@ -841,6 +841,9 @@ def cmd_set(args, when):
                 if len(body) > LOCAL_WAKE_MAX:
                     sys.exit(f"wake: a local wake's prompt is {LOCAL_WAKE_MAX} characters at most, so the owner's card shows "
                              "all of it; say plainly what it does on loom's machine")
+                odd = shown_as_run(body)
+                if odd:
+                    sys.exit(f"wake: a local wake's prompt is shown to the owner exactly as it runs, and this one can't be: {odd}")
                 aid = file_approval("local-wake", target, f"run on loom's machine: {body}", f"set from a house, note: {args.note}",
                                     plain=local_wake_card(body, args.note))
                 remember_filed(aid, target, args.prompt, args.note)
@@ -1901,7 +1904,8 @@ def cmd_relay(args):
 def local_wake_card(body, note):
     """The plain card for a house's local wake (t-2008): the owner reads a question and what his Allow and Deny do, and
     the exact words that will run are the details, whole. Every headline word is the clock's own: the body's Allow runs
-    its words on loom's machine, so it doesn't get to say what they are (its note is shown apart, labelled as its own)."""
+    its words on loom's machine, so it doesn't get to say what they are. Its note comes first, on one labelled line, and
+    the words that run come last, to the end of the card, so nothing in them can pass for the note or a heading."""
     who = AGENT[:1].upper() + AGENT[1:]
     said = re.sub(r"\s+", " ", unicodedata.normalize("NFKC", str(note or ""))).strip()
     said = said if len(said) <= 160 else said[:157] + "..."
@@ -1910,8 +1914,19 @@ def local_wake_card(body, note):
         "why": f"{who} works in a container; this job needs loom's machine, so it runs there only with your yes.",
         "if_yes": "It runs once on loom's machine, exactly as written in the details, and no other words.",
         "if_no": f"Nothing runs on loom's machine; {who} is told no and the work stays in its container.",
-        "details": f"Runs on loom's machine, exactly as written:\n{body}" + (f"\n\n{who}'s note for it (its own words): {said}" if said else ""),
+        "details": (f"{who}'s note for it (its own words): {said}\n\n" if said else "")
+                   + f"Runs on loom's machine, exactly as written, everything from here to the end:\n{body}",
     }
+
+
+def shown_as_run(body):
+    """Why `body` wouldn't read on the card exactly as it runs, or "": the card shows words NFKC-normalized with control
+    characters taken out (approvals' --details), so a prompt that changes under either is refused, never shown altered."""
+    if unicodedata.normalize("NFKC", body) != body:
+        return "it has characters the card would show differently (compatibility forms); write them plainly"
+    if any(unicodedata.category(c)[0] == "C" and c != "\n" for c in body):
+        return "it has control or invisible characters (tabs included) the card can't show"
+    return ""
 
 
 def file_approval(kind, target, what, why, plain=None):
