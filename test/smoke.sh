@@ -7,6 +7,7 @@
 #   sh test/smoke.sh
 set -eu
 here=$(cd "$(dirname "$0")/.." && pwd)
+wake_bin=${CLOCK_SMOKE_BIN:-"$here/bin/wake"}
 tmp=$(mktemp -d)
 delivery_pid=
 cleanup() {
@@ -70,10 +71,11 @@ printf 'clock-smoke-token\n' > "$tmp/token"
 
 run() {
   env -i PATH="$tmp/bin:/usr/local/bin:/usr/bin:/bin" HOME="$tmp/home" LOOM_PIECE_HOME="$tmp/piece" \
-    WAKE_LOCAL_AGENT=ada WAKE_REPO="$tmp/repo" WAKE_SESSION_COMMAND='["session", "{prompt}", "{model}"]' \
+    WAKE_LOCAL_AGENT=ada WAKE_DATA="$tmp/piece/data" WAKE_REPO="$tmp/repo" WAKE_FIRE=local \
+    WAKE_ALERT_COMMAND='[]' WAKE_FIRE_GATE='[]' WAKE_SESSION_COMMAND='["session", "{prompt}", "{model}"]' \
     WAKE_LOCAL_RUN=session WAKE_DELIVERY=spawn WAKE_PRINCIPAL=principal \
     WAKE_DELIVER_TOKEN_FILE="$tmp/token" WAKE_LOOM_URL="http://127.0.0.1:$(cat "$tmp/port")" \
-    SMOKE_TIMERS="$tmp/timers" SMOKE_FORBIDDEN_SESSION="$tmp/forbidden-session" ${SCOPE:+LOOM_SCOPE=$SCOPE} "$here/bin/wake" "$@"
+    SMOKE_TIMERS="$tmp/timers" SMOKE_FORBIDDEN_SESSION="$tmp/forbidden-session" ${SCOPE:+LOOM_SCOPE=$SCOPE} "$wake_bin" "$@"
 }
 fail() { echo "smoke: FAIL: $*" >&2; exit 1; }
 
