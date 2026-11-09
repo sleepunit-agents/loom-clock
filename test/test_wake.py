@@ -2889,6 +2889,16 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         # One from before, set from a house: unknown, never promoted by where it fires.
         self.assertEqual(self.fire_for({**self.base, "origin": "agent:ada"}), "-")
 
+    def test_verified_unknown_work_keeps_display_origin_without_owner_authority(self):
+        answer = {**self.verified("ada", None), "people": ["loren"]}
+        self.assertEqual(self.set_for(statement="stmt-unknown", answer=answer), "-")
+        entry = self.spool()[-1]
+        self.assertEqual(entry["for_in"], "cv-0123456789ab")
+        self.assertEqual((entry["for_why"], entry["for_people"]), ("steered", ["loren"]))
+        self.assertEqual(self.fire_for(entry), "-", "a display link never promotes unknown work to owner work")
+        self.assertEqual(self.set_for(statement="stmt-other", answer=self.verified("bo", None)), "-")
+        self.assertNotIn("for_in", self.spool()[-1], "another agent's verified conversation cannot supply this origin")
+
     def test_only_the_owner_at_a_terminal_vouches_for_an_unknown_wake(self):
         self.assertEqual(self.set_for(), "-")
         wid = self.spool()[-1]["id"]

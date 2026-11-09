@@ -391,7 +391,9 @@ def principal_for():
                 _PRINCIPAL_WHY[key] = ("steered", people)
         # Where it was said (t-1974): the conversation the runtime vouched for, kept beside `for` so an audit can say
         # which body set a wake and whom it worked for, without the statement itself.
-        cv = v.get("conversation") if v and _PRINCIPAL[key] != "-" else None
+        # A verified same-agent body can identify its conversation even when its
+        # steering principal is unknown. This is display provenance, not authority.
+        cv = v.get("conversation") if v and agent and v.get("agent") == agent else None
         _PRINCIPAL_IN[key] = cv if isinstance(cv, str) and re.fullmatch(r"cv-[0-9a-f]{12}", cv) else None
     _LAST_IN[0] = _PRINCIPAL_IN[key]
     _LAST_WHY[0] = _PRINCIPAL_WHY.get(key, (None, []))
@@ -412,7 +414,7 @@ def principal_in():
 def stamp_for(entry):
     """`for` (and, when a statement vouched for it, `for_in`: its conversation) on a wake or schedule set by this run."""
     entry["for"] = principal_for()
-    cv = principal_in() if entry["for"] != "-" else None
+    cv = principal_in()
     if cv:
         entry["for_in"] = cv
     else:
