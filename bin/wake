@@ -771,7 +771,10 @@ def inspect_continuation(handle, when):
         sys.exit("wake: a continuation needs its authenticated issuer statement")
     scheduled_at = int(when.timestamp() * 1000)
     try:
-        r = subprocess.run([*principal_argv(), "--inspect-continuation", handle, "--agent", AGENT,
+        # Call the managed binary directly: `loom runtime` would dispatch it
+        # with LOOM_PIECE_NAME=runtime, losing this clock's local context.
+        inspect_argv = argv_setting("WAKE_PRINCIPAL", ["loom-runtime", "principal"])
+        r = subprocess.run([*inspect_argv, "--inspect-continuation", handle, "--agent", AGENT,
                             "--scheduled-at", str(scheduled_at)], input=statement, capture_output=True, text=True,
                            timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
         answer = json.loads(r.stdout) if r.returncode == 0 else None
