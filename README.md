@@ -24,7 +24,7 @@ wake --agent bo list                     # another agent's clock (the owner's to
 Each wake is a transient systemd user timer (`systemd-run --user`, unit
 `wake-<id>`). When it fires, the clock hands the work to loom's runtime: a
 body on this machine or in the agent's house, delivered through loom (see
-"Delivery"), or, the old way, a **session** it starts itself (by default
+"Delivery"). Explicit compatibility settings can instead select a **session** it starts itself (by default
 `claude --bg <prompt>`) or a **house** from
 [loom-box](https://github.com/sleepunit-agents/loom-box) (`loom box up --agent
 <id> --task -`). The prompt it hands over starts with a short preamble (who
@@ -67,7 +67,7 @@ inline prompt.
   so it never asks the owner again in its own words.
 - **Stuck sessions.** (A body the runtime runs is the runtime's to stop:
   `LOOM_RUNTIME_STUCK_AFTER`. This is for the sessions the clock still starts
-  itself: `WAKE_LOCAL_RUN=session`, or the runtime refusing.) A session the clock started here has nobody at its
+  itself: explicit `WAKE_LOCAL_RUN=session`.) A session the clock started here has nobody at its
   terminal, so one that stops on a permission prompt would wait forever. The
   clock keeps a record of the sessions it started (`sessions.json`, by the id
   `claude --bg` prints) and the service looks at them every 2 minutes
@@ -114,9 +114,9 @@ inline prompt.
   and stopping a body stuck on a permission prompt live there, in one place.
   Its conversation is the place it names, else `local-lane:<lane>` for a lane
   (its house runs are `lane:<lane>`: a conversation's bodies run in one place
-  only), else `wake:<id>`. If the runtime refuses (400 or 403: it runs no
-  local bodies for that agent), the wake is a session here as before, and the
-  owner hears of it once a day. `WAKE_LOCAL_RUN=session` is the way back: a
+  only), else `wake:<id>`. If the runtime refuses (400 or 403), the owner
+  hears why and no other launcher runs. Temporary unavailability retries
+  the same delivery, preserving its conversation and id. `WAKE_LOCAL_RUN=session` is the way back: a
   local wake is a session again, delivered only when it names its place.
   `WAKE_DELIVERY=spawn` puts every wake back on the old way.
 - **On whose behalf, the runtime's answer.** `--verify` answers
@@ -247,13 +247,13 @@ from a `oneshot` user unit.
 | `WAKE_FIRE` | `$WAKE_DATA/fire`, else `local` | `local`, `house` or `mixed` |
 | `WAKE_MODEL` | `claude-sonnet-5` | The model a wake runs on unless it names one |
 | `WAKE_LOCAL_RUN` | `runtime` | How a wake that runs here runs: `runtime` (delivered, `local: true`; the runtime runs its body here) or `session` (the clock starts `WAKE_SESSION_COMMAND` itself, as before t-1921: the way back) |
-| `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}"]` | The session a local wake starts the old way (`WAKE_LOCAL_RUN=session`, or the runtime refusing). A JSON list (or a command line); `{prompt}` and `{model}` are whole arguments. The default can stop and ask for permission; an unattended agent that has decided otherwise adds its own flags here |
+| `WAKE_SESSION_COMMAND` | `["claude", "--bg", "{prompt}", "--model", "{model}"]` | The session a local wake starts the old way (explicit `WAKE_LOCAL_RUN=session`). A JSON list (or a command line); `{prompt}` and `{model}` are whole arguments. The default can stop and ask for permission; an unattended agent that has decided otherwise adds its own flags here |
 | `WAKE_STUCK_AFTER` | `10` | Minutes a session the clock started may wait on a permission prompt before it's stopped, noted and said (see "Stuck sessions"); `0` or `off`: never |
 | `WAKE_TASK_COMMENT` | `["taskstore", "comment", "{task}", "{text}"]`, when `taskstore` is on `PATH` | How a stopped session is noted on the task its note names (a `t-NNN`); `off`: never |
 | `WAKE_ALERT_COMMAND` | none (the log only) | How the clock reaches the owner when a wake keeps failing or a session was stopped stuck; the message is its last argument |
 | `WAKE_FIRE_GATE` | none | A command run before any wake: non-zero defers every wake an hour. For a standby that mirrors a primary and must never run the same lanes |
 | `WAKE_PREAMBLE_FILE` | the piece's own | The words every wake starts with: `{name} {where} {id} {kind} {created} {note} {lanes} {body}` |
-| `WAKE_DELIVERY` | `deliver` when `WAKE_DELIVER_TOKEN_FILE` is set and a piece offers delivery, else `spawn` | `deliver`: a house wake goes through loom's `deliver`. `spawn`: the clock asks loom-box for the house itself, as before |
+| `WAKE_DELIVERY` | `deliver` | A wake goes through loom's runtime. Missing credentials and temporary delivery failures retry the same id and body. Explicit `spawn` selects the compatibility house path |
 | `WAKE_DELIVER_TOKEN_FILE` | none | A file holding a piece token of this clock's (`loom token create --piece clock/<name> --label …`), to deliver with |
 | `WAKE_PRINCIPAL` | `loom runtime principal` | loom's runtime's principal command (a command line or a JSON list): `--verify` reads a body's principal statement on stdin, `--wake --agent … --place … --id … --for …` hands over whom that delivered wake is for (see "On whose behalf") |
 | `WAKE_LOOM_URL` | `http://127.0.0.1:8787` | loom's address for its HTTP API, as this machine reaches it (an MCP URL's `/mcp` is dropped) |
