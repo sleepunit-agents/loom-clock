@@ -859,6 +859,20 @@ class Delivery(unittest.TestCase):
 
     base = {"id": "w-cccccc", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "t-9 round 2", "model": "m", "created": "x"}
 
+    def test_unvouched_delivery_is_terminal_and_quiet(self):
+        for state in ("denied", "expired"):
+            with self.subTest(state=state), \
+                 mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"body": "failed", "reason": f"not run: nobody vouched for it (vouch {state})"})), \
+                 mock.patch.object(wake_cli, "hand_over_principal"), \
+                 mock.patch.object(wake_cli, "retry") as retry, \
+                 mock.patch.object(wake_cli, "alert") as alert, \
+                 mock.patch.object(wake_cli, "log") as log:
+                wake_cli.deliver_wake(dict(self.base), "bench", "art", False, local=True)
+                retry.assert_not_called()
+                alert.assert_not_called()
+                self.assertEqual(log.call_args.args[0], "fire")
+                self.assertIn("not run", log.call_args.args[1])
+
     def test_real_kill_after_http_acceptance_replays_sealed_firing(self):
         import signal
         import threading

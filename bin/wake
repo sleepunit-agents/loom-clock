@@ -2382,6 +2382,13 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         why = f" ({str(ans['reason'])[:120]})" if ans.get("reason") else ""
         log("fire", f"{entry['id']} delivered{via}: {ans['body']}{why}, {ans.get('conversation')} seq {ans.get('seq')}")
         return None
+    # The runtime finished an ownership-vouch hold without running it (t-2046). This is a terminal decision,
+    # not a failed launch: a new id would only ask for the same refused work again. Keep the wire's existing
+    # failed+reason vocabulary; core accepts it on older installations too. Match only the runtime's exact reason.
+    if status == 200 and ans.get("body") == "failed" and re.fullmatch(
+            r"not run: nobody vouched for it \(vouch (?:denied|expired)\)", str(ans.get("reason") or "")):
+        log("fire", f"{entry['id']} not run{via}: {ans['reason']}, {ans.get('conversation')} seq {ans.get('seq')}")
+        return None
     entry.pop("delivery", None)
     as_retry(entry)
     if status == 200 and ans.get("body") == "failed" and entry.get("continuation") and not (ans.get("code") == "quota" or "out of quota" in err):
