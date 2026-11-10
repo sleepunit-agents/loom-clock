@@ -181,7 +181,11 @@ inline prompt.
   the body's principal statement says once the runtime verifies it
   (`WAKE_PRINCIPAL --verify`, the statement on stdin) and it names the calling
   agent: `owner`, the person's slug, else `-` (unknown). No statement, one that
-  doesn't verify, or one for another agent is `-`. The house wrapper appends
+  doesn't verify, or one for another agent is `-`. The clock hands the runtime
+  the caller's house too (`--verify --house`, core's word from the house's
+  token, `-` for none), so a statement holds only from the house running its
+  conversation's body: one shown to another conversation's body never speaks
+  for it (t-2137, as approvals does). The house wrapper appends
   `--principal <statement>` to every clock call from a body that has one; the
   API door takes it off before anything reads the argv. An agent running a
   schedule now gets no wider a `for` than the schedule's own. Just before a
