@@ -770,6 +770,15 @@ def schedule_for_file(path):
     return None
 
 
+def continuation_refusal(stderr, handle):
+    """The runtime's last stderr line, short, with the handle (a capability) taken out."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    line = lines[-1] if lines else ""
+    line = line.replace(handle, "cont-…") if handle else line
+    line = re.sub(r"cont-[A-Za-z0-9_-]+", "cont-…", line)
+    return re.sub(r"[^\x20-\x7e…]", "", line)[:200]
+
+
 def inspect_continuation(handle, when):
     """Ask the local runtime, with the issuer's signed statement, before any timer/spool write."""
     statement = os.environ.get("WAKE_PRINCIPAL_STATEMENT", "")
@@ -778,6 +787,7 @@ def inspect_continuation(handle, when):
     if not statement:
         sys.exit("wake: a continuation needs its authenticated issuer statement")
     scheduled_at = int(when.timestamp() * 1000)
+    reason = ""
     try:
         # Call the managed binary directly: `loom runtime` would dispatch it
         # with LOOM_PIECE_NAME=runtime, losing this clock's local context.
@@ -785,13 +795,16 @@ def inspect_continuation(handle, when):
         r = subprocess.run([*inspect_argv, "--inspect-continuation", handle, "--agent", AGENT,
                             "--scheduled-at", str(scheduled_at)], input=statement, capture_output=True, text=True,
                            timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+        reason = continuation_refusal(r.stderr, handle) if r.returncode != 0 else ""
         answer = json.loads(r.stdout) if r.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError, SystemExit):
-        answer = None
+    except (OSError, subprocess.SubprocessError, ValueError, SystemExit) as e:
+        reason, answer = type(e).__name__, None
     deadline = answer.get("expiresAt") if isinstance(answer, dict) else None
     if (not isinstance(answer, dict) or answer.get("handle") != handle or type(deadline) is not int or
             deadline <= int(datetime.now().timestamp() * 1000) or scheduled_at >= deadline):
-        sys.exit("wake: runtime refused continuation scheduling or returned no valid deadline")
+        # The runtime's own words (t-2004: a refusal with no reason can't be told apart from a missing binary).
+        sys.exit("wake: runtime refused continuation scheduling or returned no valid deadline"
+                 + (f" ({reason})" if reason else ""))
     return deadline
 
 

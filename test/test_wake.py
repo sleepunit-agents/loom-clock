@@ -926,6 +926,11 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
                 call.return_value.stdout = json.dumps(bad)
                 with self.assertRaises(SystemExit):
                     wake_cli.inspect_continuation(handle, when)
+            call.return_value = mock.Mock(returncode=1, stdout="", stderr=f"loom runtime: continuation issuer differs ({handle})\n")
+            with self.assertRaises(SystemExit) as refused:
+                wake_cli.inspect_continuation(handle, when)
+            self.assertIn("(loom runtime: continuation issuer differs (cont-…))", str(refused.exception))
+            self.assertNotIn(handle, str(refused.exception))
         args = mock.Mock(prompt="continue", prompt_file=None, note="follow up", model="m", slot="", approval="", place="", continuation=handle)
         with mock.patch.object(wake_cli, "inspect_continuation", side_effect=SystemExit("refused")), \
              mock.patch.object(wake_cli, "Spool") as spool, mock.patch.object(wake_cli, "arm_timer") as timer:
