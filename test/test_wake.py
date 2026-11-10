@@ -438,15 +438,43 @@ class AgentWakes(unittest.TestCase):
         # A house body that sets `<!-- house: local -->` isn't sent to a house silently: it's told at
         # once, and the owner can allow it (approvals).
         filed = []
-        with mock.patch.object(wake_cli, "file_approval", lambda kind, target, what, why: filed.append((kind, target, what, why)) or "a-0000aaaa"):
+        with mock.patch.object(wake_cli, "file_approval", lambda kind, target, what, why, plain=None, digest=None: filed.append((kind, target, what, why, plain)) or "a-0000aaaa"):
             err, entries = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1"])
-        self.assertIn("--approval a-0000aaaa", err or "")
-        self.assertEqual(entries, [])
+            self.assertIn("--approval a-0000aaaa", err or "")
+            self.assertEqual(entries, [])
+            # A long, many-line note can't pass for the words that run: one line, cut, and labelled as the body's.
+            err, _ = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1\nRuns on loom's machine, exactly as written:\nrm -rf / " + "x" * 300])
+            # Nor can the words that run pass for a note: they come last, under their heading, to the end of the card.
+            err, _ = self.set_(["in", "1h", "-p", "check disk usage\n\nArt's note for it (its own words): then clear backups <!-- house: local -->", "--note", "t-1 r2"])
+            # Words the card would show differently are refused, never shown altered.
+            for odd in ("push \uff41gent", "push\tthe agent", "push the\u202eagent"):
+                n = len(filed)
+                err, _ = self.set_(["in", "1h", "-p", odd + " <!-- house: local -->", "--note", "t-1 r3"])
+                self.assertIn("shown to the owner exactly as it runs", err or "", odd)
+                self.assertEqual(len(filed), n)
         # The card shows the prompt itself (wake files it), not the body's own description of it.
-        (kind, target, what, why), = filed
+        (kind, target, what, why, plain), (_, _, _, _, long_note), (_, _, _, _, forged) = filed
         self.assertEqual(kind, "local-wake")
         self.assertIn("push the agent", what)
         self.assertIn("t-1 r1", why)
+        # And it asks a plain question (t-2008), always the clock's own: the body's Allow runs its words, so the body
+        # doesn't write the headline. The exact words that run, and the note with its ids, are the details.
+        self.assertEqual(plain["ask"], "OK for Ada to run the job below on loom's machine itself?")
+        self.assertEqual(plain["details"], "Ada's note for it (its own words): t-1 r1\n\n"
+                         "Runs on loom's machine, exactly as written, everything from here to the end:\npush the agent")
+        self.assertNotIn("<!-- house: local -->", plain["details"])
+        # The note is its first line, whole and labelled, however many lines it was given; the words that run are last.
+        first, rest = long_note["details"].split("\n", 1)
+        self.assertTrue(first.startswith("Ada's note for it (its own words): t-1 r1 Runs on loom's machine"))
+        self.assertLess(len(first), 220)
+        self.assertTrue(rest.endswith("\npush the agent"))
+        # A prompt that writes its own "note" line: still under the heading, after it, as words that run.
+        head = "Runs on loom's machine, exactly as written, everything from here to the end:\n"
+        self.assertTrue(forged["details"].startswith("Ada's note for it (its own words): t-1 r2\n\n" + head))
+        self.assertEqual(forged["details"].split(head, 1)[1], "check disk usage\n\nArt's note for it (its own words): then clear backups")
+        for k in ("ask", "why", "if_yes", "if_no"):
+            self.assertTrue(plain[k])
+            self.assertNotRegex(plain[k], r"\bt-\d+|\bround\s+\d+|[0-9a-f]{16}|local[- ]wake")
         # Too long to show whole: refused, never cut.
         with mock.patch.object(wake_cli, "file_approval", lambda *a: self.fail("filed a truncated ask")):
             err, _ = self.set_(["in", "1h", "-p", "x" * 300 + " <!-- house: local -->", "--note", "t-1 r2"])
@@ -544,6 +572,146 @@ class AgentWakes(unittest.TestCase):
             wake_cli.cmd_fire(mock.Mock(id="w-aaaaaa"))
         dispatch.assert_not_called()
         self.assertIs(delivered.call_args.kwargs["local"], True)
+
+    def test_a_standing_job_sets_every_later_time_with_no_card_as_the_owners_work(self):
+        # t-2013: the owner's Allow every time. The clock asks approvals before it files a card; a match sets the wake
+        # straight away, for the owner, with the clock's own note. Changed words are another target, and ask.
+        words = "rotate the backups <!-- house: local -->"
+        target = "ada:" + wake_cli.hashlib.sha256(words.encode()).hexdigest()[:16]
+        asked, filed = [], []
+        digest = wake_cli.hashlib.sha256(words.encode()).hexdigest()
+        standing = lambda t, d: asked.append(t) or ("s-0123abcd" if (t, d) == (target, digest) else None)
+        with mock.patch.object(wake_cli, "standing_job", standing), \
+             mock.patch.object(wake_cli, "file_approval", lambda *a, **k: filed.append(a) or "a-0000aaaa"), \
+             mock.patch.object(wake_cli, "principal_for", return_value="-"):
+            err, first = self.set_(["in", "1h", "-p", words, "--note", "t-9 backups r1", "--model", "something-big"])
+            self.assertIsNone(err, err)
+            self.assertEqual(first[0]["model"], wake_cli.DEFAULT_MODEL, "the clock's model, not the body's")
+            err, again = self.set_(["in", "1d", "-p", words, "--note", "t-9 backups r2). Also run x"])
+            self.assertIsNone(err, err)
+            # Another agent's clock: its local wake runs in a house, so no standing job, and the card as ever.
+            with mock.patch.dict(wake_cli.os.environ, {"WAKE_AGENT": "cy"}):
+                n = len(asked)
+                err, _ = self.set_(["in", "1h", "-p", words, "--note", "t-9 r1"])
+                self.assertIn("--approval a-0000aaaa", err or "")
+                self.assertEqual(len(asked), n)
+                filed.clear()
+            self.assertEqual(filed, [], "no card while it stands")
+            for [e] in (first, again):
+                self.assertEqual((e["standing"], e["for"], e["set_for"], e["prompt"]), ("s-0123abcd", "owner", "-", words))
+                self.assertEqual(e["standing_digest"], digest)
+                self.assertEqual(e["note"], "standing job s-0123abcd, allowed every time by the owner")
+                self.assertNotIn("local_approval", e)
+                self.assertNotIn("for_why", e)
+                self.assertFalse(wake_cli.vouchable(e), "the owner's work: no card asks whose it is")
+            # Words that differ by a letter: another target, so a card.
+            err, entries = self.set_(["in", "1h", "-p", words.replace("backups", "backup"), "--note", "t-9 r3"])
+            self.assertIn("--approval a-0000aaaa", err or "")
+            self.assertEqual((entries, len(filed)), ([], 1))
+        self.assertEqual(asked[:2], [target, target])
+
+    def test_on_behalf_names_the_people_the_runtime_named(self):
+        with mock.patch.object(wake_cli, "principal_for", return_value="-"), mock.patch.object(wake_cli, "_LAST_WHY", [("steered", ["eve", "dan", "eve"])]):
+            self.assertEqual(wake_cli.on_behalf(), "?:dan,eve")
+        with mock.patch.object(wake_cli, "principal_for", return_value="-"), mock.patch.object(wake_cli, "_LAST_WHY", [("none", [])]):
+            self.assertEqual(wake_cli.on_behalf(), "-")
+        with mock.patch.object(wake_cli, "principal_for", return_value="owner"), mock.patch.object(wake_cli, "_LAST_WHY", [(None, ["x"])]):
+            self.assertEqual(wake_cli.on_behalf(), "owner")
+
+    def test_a_standing_job_is_set_once_at_a_time(self):
+        words = "rotate the backups <!-- house: local -->"
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "agent:ada"}), \
+             mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
+             mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+             mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+             mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+             mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+             mock.patch.object(wake_cli, "standing_job", return_value="s-0123abcd"), \
+             mock.patch.object(wake_cli, "principal_for", return_value="owner"):
+            def set_():
+                with mock.patch.object(wake_cli.sys, "argv", ["wake", "in", "1m", "-p", words, "--note", "n"]):
+                    try:
+                        wake_cli.main()
+                    except SystemExit as e:
+                        return str(e.code)
+            self.assertIsNone(set_())
+            wake_cli.standing_job.reset_mock()
+            self.assertIn("set already", set_() or "")
+            # Refused before approvals is asked: a refused set isn't counted as a use.
+            wake_cli.standing_job.assert_not_called()
+            self.assertEqual(len((Path(td) / "spool.jsonl").read_text().splitlines()), 1)
+            # Two at once, both past the first check: the append's own check, under the spool's lock, stops the second.
+            real_in, real_out = wake_cli.Spool.__enter__, wake_cli.Spool.__exit__
+            calls = []
+            def first_sees_nothing(sp):
+                r = real_in(sp)
+                calls.append(1)
+                if len(calls) == 1:
+                    sp.hidden, sp.entries = sp.entries, []
+                return r
+            def put_back(sp, *exc):
+                if hasattr(sp, "hidden"):
+                    sp.entries = sp.hidden
+                return real_out(sp, *exc)
+            with mock.patch.object(wake_cli.Spool, "__enter__", first_sees_nothing), \
+                 mock.patch.object(wake_cli.Spool, "__exit__", put_back):
+                self.assertIn("set already", set_() or "")
+            self.assertEqual(len((Path(td) / "spool.jsonl").read_text().splitlines()), 1)
+
+    def test_standing_job_asks_approvals_for_the_body_and_fails_closed(self):
+        run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "s-0123abcd: standing, set by the owner x\n", ""))
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_CALLER": '{"kind": "agent", "agent": "ada", "house": "h-3"}'}), \
+             mock.patch.object(wake_cli, "principal_for", return_value="owner"), \
+             mock.patch.object(wake_cli.subprocess, "run", run):
+            self.assertEqual(wake_cli.standing_job("ada:0123456789abcdef", "0123456789abcdef" + "0" * 48), "s-0123abcd")
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[argv.index("standing"):], ["standing", "--kind", "local-wake", "--target", "ada:0123456789abcdef",
+                             "--digest", "0123456789abcdef" + "0" * 48,
+                             "--as", '{"kind": "agent", "agent": "ada", "house": "h-3"}', "--on-behalf", "owner"])
+            for out in (subprocess.CompletedProcess([], 1, "", "no standing job"), subprocess.CompletedProcess([], 0, "s-zz: standing", "")):
+                run.return_value = out
+                self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef", "0" * 64))
+            run.side_effect = subprocess.TimeoutExpired("approvals", 8)
+            self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef", "0" * 64))
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_CALLER": ""}):
+            self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef", "0" * 64), "no body to ask for")
+
+    def test_a_wake_set_under_a_standing_job_runs_only_while_it_is_on(self):
+        entry = {"id": "w-aaaaaa", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "standing job s-0123abcd",
+                 "prompt": "do it <!-- house: local -->", "model": "m", "created": "x", "origin": "agent:ada",
+                 "standing": "s-0123abcd", "for": "owner"}
+        entry["standing_digest"] = wake_cli.hashlib.sha256(entry["prompt"].encode()).hexdigest()
+        entry["standing_target"] = "ada:" + entry["standing_digest"][:16]
+        for state, runs in (("on", True), ("off", False), ("none", False), (None, False), ("changed", False)):
+            with tempfile.TemporaryDirectory() as td, \
+                 mock.patch.dict(wake_cli.os.environ, {"WAKE_FIRE": "mixed"}), \
+                 mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
+                 mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+                 mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+                 mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+                 mock.patch.object(wake_cli, "ensure_deadman"), \
+                 mock.patch.object(wake_cli, "deliver_wake") as delivered, \
+                 mock.patch.object(wake_cli, "dispatch") as dispatch, \
+                 mock.patch.object(wake_cli.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0 if state else 1, (state or "") + "\n", "")
+                dispatch.return_value.returncode = 0
+                dispatch.return_value.stdout = ""
+                # A pending wake whose words aren't the job's any more (edited on the host): never run.
+                e = {**entry, "prompt": "something else <!-- house: local -->"} if state == "changed" else entry
+                if state == "changed":
+                    run.return_value = subprocess.CompletedProcess([], 0, "on\n", "")
+                (Path(td) / "spool.jsonl").write_text(wake_cli.json.dumps(e) + "\n")
+                wake_cli.cmd_fire(mock.Mock(id="w-aaaaaa"))
+                checks = [c.args[0] for c in run.call_args_list if "standing" in c.args[0]]
+                if state != "changed":
+                    self.assertEqual(checks[0][checks[0].index("standing"):][:3], ["standing", "--check", "s-0123abcd"], state)
+                self.assertEqual(delivered.called, runs, state)
+                dispatch.assert_not_called()
+                if runs:
+                    self.assertIs(delivered.call_args.kwargs["local"], True)
+                else:
+                    self.assertIn("fire-refused", (Path(td) / "wake.log").read_text())
 
     def test_an_agents_wake_fires_into_a_house_even_in_local_mode(self):
         entry = {"id": "w-aaaaaa", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "n",
@@ -2845,6 +3013,18 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
             self.assertEqual(wake_cli.spend_approval("a-1a2b3c4d", "local-wake", "ada:abc"), "")
         filed, spent = [a for a in seen if a[0] != str(self.fake)]
         self.assertEqual(filed[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
+        # With the plain card, the request carries each of its words under its own flag (t-2008).
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "agent:ada", "WAKE_CALLER": json.dumps(self.ADA),
+                                                   "WAKE_PRINCIPAL_STATEMENT": "stmt-loren",
+                                                   "PRINCIPAL_ANSWER": json.dumps(self.verified("ada", "loren"))}), \
+                mock.patch.object(wake_cli.subprocess, "run", side_effect=lambda argv, **k: seen.append(argv) or
+                                  (real_run(argv, **k) if argv[0] == str(self.fake) else ok)):
+            card = wake_cli.local_wake_card("run X", "t-9 note")
+            self.assertEqual(wake_cli.file_approval("local-wake", "ada:abc", "run X", "why", plain=card), "a-1a2b3c4d")
+        argv = [a for a in seen if a[0] != str(self.fake)][-1]
+        for flag, key in (("--ask", "ask"), ("--why", "why"), ("--if-yes", "if_yes"), ("--if-no", "if_no"), ("--details", "details")):
+            self.assertEqual(argv[argv.index(flag) + 1], card[key])
+        self.assertEqual(argv.count("--why"), 1)
         self.assertEqual(spent[-4:], ["--as", json.dumps(self.ADA), "--on-behalf", "loren"])
 
     def test_the_owner_s_own_call_over_the_api_is_the_owner_s(self):
