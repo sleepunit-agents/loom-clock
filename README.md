@@ -111,7 +111,10 @@ inline prompt.
   verified statement's, matched to the conversation the runtime last answered
   for that place, kept in `places.json`): a lane re-arming itself. From any
   other conversation it's its own, so a body never feeds words to another
-  conversation's body by naming its lane. The agent's preamble
+  conversation's body by naming its lane; `schedule run` from a house is said
+  from the caller's conversation. A lane only ever set from a house, which the
+  clock never delivered as a lane, runs fresh each time (it reads its digests):
+  no house seeds a lane's conversation. The agent's preamble
   (`WAKE_PREAMBLE_FILE`) goes in the wake's text, as it carries the wake's own
   id, note and time; the model is the runtime's choice. The answer (`fed`,
   `resumed`, `started`, `queued`, or `failed`) is in the wake log. `failed`

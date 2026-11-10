@@ -1137,16 +1137,26 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
             wake_cli.remember_place("lane:x", "not-a-cv")
             self.assertEqual(wake_cli.known_places(), {"lane:reflect": "cv-0123456789ab"})
             self.assertEqual(wake_cli.wake_place(sched), "lane:reflect", "set on loom's machine: the lane's own")
-            self.assertEqual(wake_cli.wake_place({**sched, "origin": "h-7", "for_in": "cv-0123456789ab"}), "lane:reflect",
+            self.assertEqual(wake_cli.wake_place({**sched, "origin": "agent:ada", "for_in": "cv-0123456789ab"}), "lane:reflect",
                              "from the lane's own conversation: joins it")
             for other in ({"for_in": "cv-00000000000f"}, {}):
-                self.assertEqual(wake_cli.wake_place({**sched, "origin": "h-7", **other}), f"wake:{sched['id']}",
+                self.assertEqual(wake_cli.wake_place({**sched, "origin": "agent:ada", **other}), f"wake:{sched['id']}",
                                  "from another conversation, or unproven: its own")
-            self.assertEqual(wake_cli.wake_place({**sched, "schedule": "fresh", "origin": "h-7", "for_in": "cv-0123456789ab"}),
+            self.assertEqual(wake_cli.wake_place({**sched, "schedule": "fresh", "origin": "agent:ada", "for_in": "cv-0123456789ab"}),
                              f"wake:{sched['id']}", "a lane the clock never delivered: no house seeds it")
+            # Kept from before (a retry's place, a sealed body): held to the same rule.
+            stale = {**sched, "origin": "agent:ada", "for_in": "cv-00000000000f", "deliver_place": "lane:reflect"}
+            self.assertEqual(wake_cli.wake_place(stale), f"wake:{sched['id']}")
+            self.assertEqual(wake_cli.wake_place({**stale, "for_in": "cv-0123456789ab"}), "lane:reflect")
         # The runtime's answer is what's kept: a delivered lane wake records its conversation.
         posts, *_ = self.fire(sched, [lane])
         self.assertEqual(posts[0]["place"], "lane:reflect")
+        # A body sealed before, at a lane this house's wake may not join: built again as its own conversation.
+        sealed = {**sched, "origin": "agent:ada", "for_in": "cv-00000000000f", "deliver_place": "lane:reflect",
+                  "delivery": {"id": sched["id"], "agent": "ada", "venue": "wake", "place": "lane:reflect", "label": "x",
+                               "from": {"kind": "schedule"}, "kind": "wake", "at": "2026-11-10T00:00:00.000Z", "text": "old"}}
+        posts, *_ = self.fire(sealed, [lane])
+        self.assertEqual(posts[0]["place"], f"wake:{sched['id']}")
 
     def test_quota_waits_for_reset_without_counting_failures_or_alerting(self):
         reset = (wake_cli.datetime.now(wake_cli.timezone.utc) + wake_cli.timedelta(hours=12)).isoformat()
@@ -3352,6 +3362,18 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         self.assertEqual(self.spool()[-1]["for"], "owner")
         self.assertIsNone(self.cli("schedule", "run", "weekly", over_api=False))
         self.assertEqual(self.spool()[-1]["for"], "owner")
+
+    def test_a_schedule_run_from_a_house_is_said_from_the_caller_s_conversation(self):
+        # t-2117: a schedule set from the lane's conversation keeps that for_in; run from a house in another
+        # conversation, the occurrence carries the caller's, so it never joins the lane's conversation from there.
+        self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", "routines/nightly.md",
+                                   statement="s", answer=self.verified("ada", owner=True)))
+        self.assertEqual(wake_cli.load_schedules()["nightly"]["for_in"], "cv-0123456789ab")
+        other = {**self.verified("ada", owner=True), "conversation": "cv-00000000000f"}
+        self.assertIsNone(self.cli("schedule", "run", "nightly", statement="s2", answer=other))
+        self.assertEqual(self.spool()[-1]["for_in"], "cv-00000000000f")
+        self.assertIsNone(self.cli("schedule", "run", "nightly", statement="s3", answer={"ok": False}))
+        self.assertNotIn("for_in", self.spool()[-1], "unproven: no conversation at all")
 
     def deliver(self, entry, exit_code=0, principal=None):
         """Fire `entry` into a delivery: (hand-over calls seen when the POST went, the posts, the log)."""
