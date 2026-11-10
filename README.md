@@ -153,6 +153,12 @@ inline prompt.
   The hand-over names the delivery's id, so a word for a wake that's never
   delivered is never another wake's. A run verifies once and uses that answer
   for the wake, its approval and its spend.
+- **Whose to change.** Over the piece API a body replaces, removes or
+  cancels only a schedule or wake its own conversation set (`for_in`, the
+  runtime's word from its own house, t-2137). The owner's own (set on loom's
+  machine or on his page), another conversation's, or one from before
+  `for_in` was kept is his to change, on loom's page (t-2131). On loom's
+  machine, as before, anything.
 - **Here, and set again.** On loom's machine a wake is the owner's, except
   one set by a body the runtime runs here (a local wake, in a conversation:
   `LOOM_BODY_CONVERSATION`): it fetches its own statement and is whom that

@@ -3339,6 +3339,32 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         # A local body on loom's machine (no API caller): no --house.
         self.assertIsNone(wake_cli.caller_house())
 
+    def test_a_house_changes_only_what_its_own_conversation_set(self):
+        # t-2131: over the API, a schedule or wake is replaced, removed or cancelled only by the conversation that set
+        # it (the runtime's word, from its own house); the owner's own (set here, or on his page) never.
+        here = dict(over_api=False)
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        other = dict(statement="stmt-b", answer={**self.verified("ada", "jonathan-barket", True), "conversation": "cv-bbbbbbbbbbbb"})
+        self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "22:44", "-p", "the owner's", **here))
+        owners = [e["id"] for e in self.spool() if e.get("schedule") == "nightly"][0]
+        for argv in (("schedule", "set", "nightly", "--at", "03:00", "-p", "mine now"), ("schedule", "rm", "nightly"), ("cancel", owners)):
+            err = self.cli(*argv, **mine)
+            self.assertIn("wasn't set from this conversation", err or "", argv)
+        self.assertEqual(wake_cli.load_schedules()["nightly"]["prompt"], "the owner's")
+        self.assertIn(owners, [e["id"] for e in self.spool()])
+        # One a house set: its own conversation changes it; another conversation, or no statement, doesn't.
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:00", "-p", "a", **mine))
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:30", "-p", "b", **mine))
+        self.assertIn("wasn't set from this conversation", self.cli("schedule", "rm", "mine", **other) or "")
+        self.assertIn("wasn't set from this conversation", self.cli("schedule", "rm", "mine") or "")
+        self.assertIsNone(self.cli("in", "1h", "-p", "later", "--note", "t-1 r1", **mine))
+        w = self.spool()[-1]["id"]
+        self.assertIn("wasn't set from this conversation", self.cli("cancel", w, **other) or "")
+        self.assertIsNone(self.cli("cancel", w, **mine))
+        self.assertIsNone(self.cli("schedule", "rm", "mine", **mine))
+        # The owner here changes anything, as ever.
+        self.assertIsNone(self.cli("schedule", "rm", "nightly", **here))
+
     def test_a_park_is_for_whom_its_body_works_too(self):
         with mock.patch.object(wake_cli, "approval_card", return_value=None):
             self.assertIsNone(self.cli("park", "--on", "a-0000aaaa", "-p", "next", "--note", "t-1 r2",
