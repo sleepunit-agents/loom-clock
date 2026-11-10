@@ -797,7 +797,7 @@ def inspect_continuation(handle, when):
 
 def cmd_set(args, when):
     # First, before anything is looked up, asked or spent: a continuation's replay uses its sealed body and skips a
-    # standing job's or an approval's fire-time checks, so it is never a local wake (loom's machine) nor approved one.
+    # standing job's or an approval's fire-time checks, so it never rides one (a `house: local` prompt or --approval).
     if vars(args).get("continuation", "") and (getattr(args, "approval", "") or HOUSE_LOCAL in (getattr(args, "prompt", "") or "")):
         sys.exit("wake: a continuation can't ride a standing job, an approval or a local wake")
     if getattr(args, "approval", ""):
