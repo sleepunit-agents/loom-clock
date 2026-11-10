@@ -1125,6 +1125,29 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
         posts, *_ = self.fire({**self.base, "kind": "schedule", "schedule": "knowledge-triage", "prompt": "the lane"}, [self.ok])
         self.assertEqual(posts[0]["place"], "lane:knowledge-triage")
 
+    def test_a_house_names_a_lane_but_joins_its_conversation_only_from_it(self):
+        # t-2117: a lane's place is its name, which a body picks (-f, a schedule's name). One set from a house joins
+        # that lane's conversation only when its verified statement was for that same conversation (a lane re-arming
+        # itself); from any other conversation, or with no statement, it's its own conversation.
+        lane = (200, {"conversation": "cv-0123456789ab", "seq": 1, "body": "queued"})
+        sched = {**self.base, "kind": "schedule", "schedule": "reflect", "prompt": "the lane"}
+        with tempfile.TemporaryDirectory() as td, mock.patch.object(wake_cli, "WAKE_DIR", Path(td)):
+            wake_cli.remember_place("lane:reflect", "cv-0123456789ab")
+            wake_cli.remember_place("wake:w-1", "cv-0123456789ab")
+            wake_cli.remember_place("lane:x", "not-a-cv")
+            self.assertEqual(wake_cli.known_places(), {"lane:reflect": "cv-0123456789ab"})
+            self.assertEqual(wake_cli.wake_place(sched), "lane:reflect", "set on loom's machine: the lane's own")
+            self.assertEqual(wake_cli.wake_place({**sched, "origin": "h-7", "for_in": "cv-0123456789ab"}), "lane:reflect",
+                             "from the lane's own conversation: joins it")
+            for other in ({"for_in": "cv-00000000000f"}, {}):
+                self.assertEqual(wake_cli.wake_place({**sched, "origin": "h-7", **other}), f"wake:{sched['id']}",
+                                 "from another conversation, or unproven: its own")
+            self.assertEqual(wake_cli.wake_place({**sched, "schedule": "fresh", "origin": "h-7", "for_in": "cv-0123456789ab"}),
+                             f"wake:{sched['id']}", "a lane the clock never delivered: no house seeds it")
+        # The runtime's answer is what's kept: a delivered lane wake records its conversation.
+        posts, *_ = self.fire(sched, [lane])
+        self.assertEqual(posts[0]["place"], "lane:reflect")
+
     def test_quota_waits_for_reset_without_counting_failures_or_alerting(self):
         reset = (wake_cli.datetime.now(wake_cli.timezone.utc) + wake_cli.timedelta(hours=12)).isoformat()
         failed = (200, {"body": "failed", "code": "quota", "reason": "no room", "retryAfter": reset})

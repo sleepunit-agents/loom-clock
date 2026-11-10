@@ -2282,6 +2282,39 @@ def loom_api():
 
 
 PLACE = re.compile(r"[a-z][a-z0-9-]{0,31}:[A-Za-z0-9][A-Za-z0-9._@:/-]{0,159}")
+CV = re.compile(r"cv-[0-9a-f]{12}")
+
+
+def places_path():
+    return WAKE_DIR / "places.json"
+
+
+def known_places():
+    """The conversation each lane place was last delivered into, as the runtime answered this clock: {place: cv}."""
+    try:
+        d = json.loads(places_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str) and CV.fullmatch(v)} if isinstance(d, dict) else {}
+
+
+def remember_place(place, cv):
+    """Keep the conversation a lane place's delivery went to (the runtime's answer to this clock's own post)."""
+    if not (isinstance(place, str) and place.startswith("lane:") and isinstance(cv, str) and CV.fullmatch(cv)):
+        return
+    try:
+        WAKE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(WAKE_DIR / "places.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            d = known_places()
+            if d.get(place) == cv:
+                return
+            d[place] = cv
+            tmp = places_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(d, sort_keys=True))
+            os.replace(tmp, places_path())
+    except OSError as e:
+        log("places-fail", f"couldn't keep {place}'s conversation: {e.strerror}")
 
 
 def wake_place(entry, local=False):
@@ -2297,7 +2330,13 @@ def wake_place(entry, local=False):
     if not name and (entry.get("lane") or entry.get("prompt_file")):
         name = Path(entry.get("lane") or entry["prompt_file"]).stem
     if name:
-        return f"{'local-lane' if local else 'lane'}:{name}"[:200]
+        place = f"{'local-lane' if local else 'lane'}:{name}"[:200]
+        # One set from a house (t-2117) names its lane or schedule itself, so it joins that lane's conversation only
+        # when it was set from that same conversation (the one its verified statement was for: a lane's run re-arming
+        # itself). From any other, it's its own: a body never feeds its words to another conversation's body.
+        if entry.get("origin") and not local and (not entry.get("for_in") or known_places().get(place) != entry["for_in"]):
+            return f"wake:{entry['id']}"
+        return place
     return f"wake:{entry['id']}"
 
 
@@ -2377,6 +2416,8 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
     err = str(ans.get("error") or ans.get("reason") or "")[:200]
     # What every retry keeps: the conversation it belongs to.
     entry["deliver_place"], entry["deliver_label"] = body["place"], body["label"]
+    if status == 200 and isinstance(ans, dict):
+        remember_place(body["place"], ans.get("conversation"))
     via = "" if body["id"] == entry["id"] else f" as {body['id']}"
     if status == 200 and ans.get("body") in BODY_STATES:
         why = f" ({str(ans['reason'])[:120]})" if ans.get("reason") else ""

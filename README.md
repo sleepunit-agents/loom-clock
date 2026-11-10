@@ -106,7 +106,12 @@ inline prompt.
   declares `"venues": {"wake": {}}`), and loom's runtime records the wake in
   the agent's conversation and reaches its body. A lane's wakes share one
   conversation (place `lane:<schedule or lane file>`), so its body can
-  resume; any other wake is its own (`wake:<id>`). The agent's preamble
+  resume; any other wake is its own (`wake:<id>`). One set from a house
+  (t-2117) joins a lane's conversation only from that same conversation (its
+  verified statement's, matched to the conversation the runtime last answered
+  for that place, kept in `places.json`): a lane re-arming itself. From any
+  other conversation it's its own, so a body never feeds words to another
+  conversation's body by naming its lane. The agent's preamble
   (`WAKE_PREAMBLE_FILE`) goes in the wake's text, as it carries the wake's own
   id, note and time; the model is the runtime's choice. The answer (`fed`,
   `resumed`, `started`, `queued`, or `failed`) is in the wake log. `failed`
