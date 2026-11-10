@@ -683,7 +683,10 @@ class AgentWakes(unittest.TestCase):
                  "standing": "s-0123abcd", "for": "owner"}
         entry["standing_digest"] = wake_cli.hashlib.sha256(entry["prompt"].encode()).hexdigest()
         entry["standing_target"] = "ada:" + entry["standing_digest"][:16]
-        for state, runs in (("on", True), ("off", False), ("none", False), (None, False), ("changed", False)):
+        # Also as a retry after a 5xx kept its delivery body (fresh read of loom-clock#24): still checked.
+        kept = {"id": "w-bbbbbb", "agent": "ada", "venue": "wake", "place": "wake:w-bbbbbb", "label": "x", "from": {"kind": "schedule"},
+                "kind": "wake", "at": "2026-01-01T00:00:00.000Z", "text": "do it", "local": True}
+        for state, runs, retried in [(st, r, rt) for st, r in (("on", True), ("off", False), ("none", False), (None, False), ("changed", False)) for rt in (False, True)]:
             with tempfile.TemporaryDirectory() as td, \
                  mock.patch.dict(wake_cli.os.environ, {"WAKE_FIRE": "mixed"}), \
                  mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
@@ -699,14 +702,16 @@ class AgentWakes(unittest.TestCase):
                 dispatch.return_value.stdout = ""
                 # A pending wake whose words aren't the job's any more (edited on the host): never run.
                 e = {**entry, "prompt": "something else <!-- house: local -->"} if state == "changed" else entry
+                if retried:
+                    e = {**e, "delivery": kept, "fails": 1}
                 if state == "changed":
                     run.return_value = subprocess.CompletedProcess([], 0, "on\n", "")
                 (Path(td) / "spool.jsonl").write_text(wake_cli.json.dumps(e) + "\n")
                 wake_cli.cmd_fire(mock.Mock(id="w-aaaaaa"))
                 checks = [c.args[0] for c in run.call_args_list if "standing" in c.args[0]]
                 if state != "changed":
-                    self.assertEqual(checks[0][checks[0].index("standing"):][:3], ["standing", "--check", "s-0123abcd"], state)
-                self.assertEqual(delivered.called, runs, state)
+                    self.assertEqual(checks[0][checks[0].index("standing"):][:3], ["standing", "--check", "s-0123abcd"], (state, retried))
+                self.assertEqual(delivered.called, runs, (state, retried))
                 dispatch.assert_not_called()
                 if runs:
                     self.assertIs(delivered.call_args.kwargs["local"], True)
@@ -1437,6 +1442,24 @@ class Clocks(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 wake_cli.cmd_fire(mock.Mock(id="w-c0ffee"))
         self.assertFalse(any(e["id"] == "w-c0ffee" or e.get("_firing") for e in self.spool()), "dropped, not looped")
+
+    def test_a_failed_continuation_wake_is_not_retried_and_old_fire_locks_are_pruned(self):
+        cont = {"id": "w-c0ffe1", "kind": "wake", "at": "2026-01-01 00:00:00", "prompt": "p", "created": "x",
+                "continuation": {"handle": "cont-" + "a" * 64, "wake": "w-c0ffe1", "expiresAt": 9999999999999}}
+        with mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"body": "failed", "reason": "already bound to another firing"})), \
+             mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "retry") as retry:
+            wake_cli.deliver_wake(dict(cont), "p", "ada", False)
+        retry.assert_not_called()
+        self.assertIn("not retried", self.wake_log())
+        old = self.td / "clocks" / "ada" / "w-0ld0ld.fire.lock"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text("")
+        os.utime(old, (0, 0))
+        fresh = self.td / "clocks" / "ada" / "w-fre5h0.fire.lock"
+        fresh.write_text("")
+        wake_cli.prune_fire_locks()
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
 
     def test_a_continuation_refuses_a_lane_file(self):
         self.assertIn("-f", self.cli("in", "1h", "-f", str(self.lane), "--continuation", "cont-" + "c" * 64) or "")

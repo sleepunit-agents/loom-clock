@@ -2351,6 +2351,11 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         return None
     entry.pop("delivery", None)
     as_retry(entry)
+    if status == 200 and ans.get("body") == "failed" and entry.get("continuation"):
+        # Its report authority is bound to that one firing: a new delivery id would only be refused as another
+        # firing. Said once, not retried into a row of alerts.
+        log("fire-refused", f"{entry['id']} continuation wake{via} failed in the runtime: {err or 'failed'}; not retried")
+        return None
     if status == 200 and ans.get("body") == "failed":
         # loom keeps that answer a day: the same id would only be told `failed` again. A new delivery, same place.
         if ans.get("code") == "quota" or "out of quota" in err:
@@ -2391,6 +2396,18 @@ def finish_firing(wid):
     with Spool() as spool:
         spool.entries = [e for e in spool.entries if e.get("_firing") != wid or e.get("held")]
         ensure_deadman(spool)
+    prune_fire_locks()
+
+
+def prune_fire_locks(older_s=86400):
+    """Firing locks are per firing id and never reused: one a day old belongs to no live firing."""
+    cutoff = time.time() - older_s
+    for f in WAKE_DIR.glob("*.fire.lock"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
 
 
 def _cmd_fire(args):
@@ -2453,8 +2470,10 @@ def _cmd_fire(args):
                 spool.entries.append(nxt)
                 arm_timer(nxt)
                 log("schedule-next", f"{entry['schedule']}: {nxt['id']} at {nxt['at']}")
-    if entry.get("delivery"):
-        # Recovery uses the sealed wire body, even if the lane file/settings changed or disappeared.
+    if entry.get("delivery") and entry.get("continuation"):
+        # A continuation firing's recovery uses its sealed wire body, even if the lane file/settings changed or
+        # disappeared. Only a continuation: an ordinary retried wake goes through every check below again
+        # (its standing job, its lane file, its mode), as it always did.
         agent = origin.split(":", 1)[1] if origin else AGENT
         deliver_wake(entry, "", agent, False, local=bool(entry["delivery"].get("local")))
         return
