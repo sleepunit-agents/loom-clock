@@ -154,11 +154,14 @@ inline prompt.
   delivered is never another wake's. A run verifies once and uses that answer
   for the wake, its approval and its spend.
 - **Whose to change.** Over the piece API a body replaces, removes or
-  cancels only a schedule or wake its own conversation set (`for_in`, the
-  runtime's word from its own house, t-2137). The owner's own (set on loom's
-  machine or on his page), another conversation's, or one from before
-  `for_in` was kept is his to change, on loom's page (t-2131). On loom's
-  machine, as before, anything.
+  cancels a schedule or wake a house set only from the conversation that set
+  it (`for_in`, the runtime's word from its own house, t-2137), or when it
+  works for the owner (a lane's own run retiring or moving its schedule). The
+  owner's own (set on loom's machine or on his page) is his alone to change,
+  and a house's schedule never stands in for his lane's re-arm. Houses
+  together hold at most 40 pending one-offs (20 a conversation) and 20
+  schedules, so he always has room (t-2131). On loom's machine, as before,
+  anything.
 - **Here, and set again.** On loom's machine a wake is the owner's, except
   one set by a body the runtime runs here (a local wake, in a conversation:
   `LOOM_BODY_CONVERSATION`): it fetches its own statement and is whom that

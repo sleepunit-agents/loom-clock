@@ -438,14 +438,25 @@ _LAST_IN = [None]
 
 def api_may_change(rec):
     """Whether this run may replace, remove or cancel `rec` (a schedule or a spool entry, t-2131). On loom's machine
-    (no API caller): yes, as ever. Over the piece API, only what a body set over the API from this same conversation,
-    by the runtime's word (its verified statement, from its own house since t-2137): never the owner's own (set here or
-    on loom's page: no origin), and never another conversation's, whatever the body says it is."""
+    (no API caller): yes, as ever. Over the piece API never the owner's own (set here or on loom's page: no origin).
+    One a house set: from the conversation that set it, or by a body working for the owner (the runtime's word, from its
+    own house since t-2137: a lane's own run, retiring or moving its schedule); never by one working for someone else
+    or for no one loom can name."""
     if not os.environ.get("WAKE_ORIGIN", "").strip():
         return True
-    principal_for()
+    if rec.get("origin") != os.environ.get("WAKE_ORIGIN", "").strip():
+        return False
+    f = principal_for()
     cv = principal_in()
-    return bool(rec.get("origin")) and bool(cv) and rec.get("for_in") == cv
+    return (bool(cv) and rec.get("for_in") == cv) or f == "owner"
+
+
+def not_yours(what, does):
+    return (f"wake: {what} wasn't set from this conversation, nor by a body working for the owner; only the owner (on "
+            f"loom's page) or the conversation that set it {does} it")
+
+
+MAX_SCHEDULES_API = 20
 
 
 def pending_full(entries, kinds=("wake", "parked")):
@@ -821,8 +832,12 @@ def schedule_entry(name, sched, at):
 
 
 def schedule_for_file(path):
-    """The schedule that already runs this lane file, if any."""
+    """The schedule that already runs this lane file, if any. The owner's own covers anyone's re-arm; one a house set
+    covers only a house's (t-2131): a house's schedule for an owner's lane never stands in for his re-arm."""
+    origin = os.environ.get("WAKE_ORIGIN", "").strip()
     for name, sc in load_schedules().items():
+        if sc.get("origin") and sc.get("origin") != origin:
+            continue
         # A loom lane set from a file counts too: its run's own "re-arm yourself" is answered, not doubled.
         for f in (sc.get("prompt_file"), sc.get("lane_file")):
             if f and Path(f).resolve() == Path(path).resolve():
@@ -1683,7 +1698,7 @@ def cmd_schedule(args):
             if principal_in():
                 entry["for_in"] = principal_in()
         with Spool() as spool:
-            full = pending_full(spool.entries, ("wake",))
+            full = pending_full(spool.entries)
             if full:
                 sys.exit(full)
             spool.entries.append(entry)
@@ -1695,8 +1710,7 @@ def cmd_schedule(args):
         if args.name not in scheds:
             sys.exit(f"wake: {AGENT} has no schedule {args.name}")
         if not api_may_change(scheds[args.name]):
-            sys.exit(f"wake: {args.name} wasn't set from this conversation; only the owner (on loom's page) or the "
-                     "conversation that set it removes it")
+            sys.exit(not_yours(args.name, "removes"))
         with Spool() as spool:
             for e in [e for e in spool.entries if e.get("schedule") == args.name]:
                 disarm_timer(e["id"])
@@ -1731,9 +1745,11 @@ def cmd_schedule(args):
     # set for Loren keeps it Loren's (remove it and set it anew to make it yours).
     stamp_for(sc)
     prev = load_schedules().get(args.name)
+    if prev is None and origin and sum(1 for x in load_schedules().values()
+                                       if isinstance(x, dict) and x.get("origin")) >= MAX_SCHEDULES_API:
+        sys.exit(f"wake: {AGENT}'s houses have set {MAX_SCHEDULES_API} schedules already, their most; remove some first")
     if prev is not None and not api_may_change(prev if isinstance(prev, dict) else {}):
-        sys.exit(f"wake: {args.name} wasn't set from this conversation; only the owner (on loom's page) or the "
-                 "conversation that set it replaces it (pick another name for your own)")
+        sys.exit(not_yours(args.name, "replaces"))
     if isinstance(prev, dict):      # one from before t-1943 has no `for`: entry_for reads it by where it was set
         was = sc["for"]
         sc["for"] = narrower(entry_for(prev), sc["for"])
@@ -1920,8 +1936,7 @@ def cmd_cancel(args):
         if not match:
             sys.exit(f"wake: no spool entry {args.id}")
         if not api_may_change(match[0]):
-            sys.exit(f"wake: {args.id} wasn't set from this conversation; only the owner (on loom's page) or the "
-                     "conversation that set it cancels it")
+            sys.exit(not_yours(args.id, "cancels"))
         spool.entries.remove(match[0])
         disarm_timer(args.id)
         # Cancelling one occurrence of a schedule skips just that one.
