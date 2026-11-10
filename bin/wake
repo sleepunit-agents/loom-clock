@@ -1149,8 +1149,7 @@ def resumed_words(state):
 
 
 def cmd_list(_args):
-    with Spool() as spool:
-        entries = sorted(spool.entries, key=lambda e: e["at"])
+    entries = sorted(read_spool(), key=lambda e: e["at"])
     if not entries:
         print("spool empty (this should not happen — dead-man missing; run: wake rearm)")
         return
@@ -1569,8 +1568,7 @@ def cmd_schedule(args):
     """Recurring wakes: set (create or replace), rm, list."""
     scheds = load_schedules()
     if args.action == "list":
-        with Spool() as spool:
-            nxt = {e["schedule"]: e["at"] for e in spool.entries if e.get("schedule")}
+        nxt = {e["schedule"]: e["at"] for e in read_spool() if e.get("schedule")}
         if not scheds:
             print(f"{AGENT} has no schedules")
         for name, sc in sorted(scheds.items()):
@@ -3075,7 +3073,11 @@ def cmd_api(_args):
 
 
 def read_spool():
-    """The spool as it stands, without the lock (a page reads; it never writes)."""
+    """Read one complete snapshot without creating files or taking a write lock.
+
+    Writers hold the spool lock and atomically replace SPOOL: an open reader
+    sees either the old or new inode, never a partially written transaction.
+    """
     try:
         return [json.loads(l) for l in SPOOL.read_text().splitlines() if l.strip()]
     except (OSError, ValueError):
