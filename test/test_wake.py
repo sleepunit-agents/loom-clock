@@ -374,6 +374,25 @@ class PieceApi(unittest.TestCase):
         self.assertEqual(self.ask(["list"], WAKE_AGENTS="bo")["status"], 403)
         self.assertEqual(self.ran, [])
 
+    def test_an_agent_the_grants_authority_allowed_needs_no_place_on_the_list(self):
+        # agent-runtime.md section 6 "Done" (t-1746): core marks an agent caller the grants authority allowed granted,
+        # and a piece with its own list skips it for that caller. Only core sets it; WAKE_AGENTS stays the fallback.
+        agents = []
+        def run(a, origin, agent):
+            agents.append((agent, origin))
+            return 0, "", ""
+        ask = lambda caller, argv=["list"]: wake_cli.api_answer({"caller": caller, "path": "run", "body": {"argv": argv}}, run)
+        with mock.patch.dict(wake_cli.os.environ, {"WAKE_AGENTS": "ada"}):
+            self.assertEqual(ask({"kind": "agent", "agent": "bo"})["status"], 403)
+            for not_granted in ["true", 1, "yes", None]:
+                self.assertEqual(ask({"kind": "agent", "agent": "bo", "granted": not_granted})["status"], 403)
+            self.assertEqual(ask({"kind": "agent", "agent": "Bad!", "granted": True})["status"], 403)
+            self.assertEqual(ask({"kind": "piece", "subject": "box/thor", "granted": True})["status"], 403)
+            self.assertEqual(ask({"kind": "agent", "agent": "bo", "granted": True})["status"], 200)
+            # Granted, it's still only its own clock.
+            self.assertEqual(ask({"kind": "agent", "agent": "bo", "granted": True}, ["--agent", "ada", "list"])["status"], 403)
+        self.assertEqual(agents, [("bo", "agent:bo")])
+
     def test_malformed_requests(self):
         self.assertEqual(wake_cli.api_answer(None, None)["status"], 400)
         self.assertEqual(self.ask([])["status"], 400)
