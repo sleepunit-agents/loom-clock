@@ -971,6 +971,10 @@ def cmd_set(args, when):
             sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
         if entry.get("continuation") and int(datetime.now().timestamp() * 1000) >= entry["continuation"]["expiresAt"]:
             sys.exit("wake: continuation expired before scheduling committed")
+        # A continuation's replay uses its sealed body and skips a standing job's or an approval's checks at
+        # fire time, so it is never one of those: a local wake on the owner's say reports through its own run.
+        if entry.get("continuation") and (entry.get("standing") or entry.get("approval") or entry.get("local")):
+            sys.exit("wake: a continuation can't ride a standing job, an approval or a local wake")
         if entry.get("standing_target") and any(e.get("standing_target") == entry["standing_target"] for e in spool.entries):
             # Two sets at once both got past the check above: the second waits for the first to run.
             sys.exit("wake: this job is set already, under the owner's standing job; it can be set again once that one has run")
@@ -2351,7 +2355,7 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         return None
     entry.pop("delivery", None)
     as_retry(entry)
-    if status == 200 and ans.get("body") == "failed" and entry.get("continuation"):
+    if status == 200 and ans.get("body") == "failed" and entry.get("continuation") and not (ans.get("code") == "quota" or "out of quota" in err):
         # Its report authority is bound to that one firing: a new delivery id would only be refused as another
         # firing. Said once, not retried into a row of alerts.
         log("fire-refused", f"{entry['id']} continuation wake{via} failed in the runtime: {err or 'failed'}; not retried")

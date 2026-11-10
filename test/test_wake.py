@@ -618,6 +618,16 @@ class AgentWakes(unittest.TestCase):
         with mock.patch.object(wake_cli, "principal_for", return_value="owner"), mock.patch.object(wake_cli, "_LAST_WHY", [(None, ["x"])]):
             self.assertEqual(wake_cli.on_behalf(), "owner")
 
+    def test_a_continuation_never_rides_a_standing_job(self):
+        # Fresh read of loom-clock#24: a continuation's replay skips the standing check, so it is refused at set time.
+        words = "rotate the backups <!-- house: local -->"
+        with mock.patch.object(wake_cli, "standing_job", lambda t, d: "s-0123abcd"), \
+             mock.patch.object(wake_cli, "principal_for", return_value="-"), \
+             mock.patch.object(wake_cli, "inspect_continuation", return_value=9999999999999):
+            err, entries = self.set_(["in", "1h", "-p", words, "--note", "t-9", "--continuation", "cont-" + "e" * 64])
+        self.assertIn("can't ride a standing job", err or "")
+        self.assertFalse(any(e.get("continuation") for e in entries))
+
     def test_a_standing_job_is_set_once_at_a_time(self):
         words = "rotate the backups <!-- house: local -->"
         with tempfile.TemporaryDirectory() as td, \
@@ -1460,6 +1470,14 @@ class Clocks(unittest.TestCase):
         wake_cli.prune_fire_locks()
         self.assertFalse(old.exists())
         self.assertTrue(fresh.exists())
+
+    def test_a_continuation_wake_out_of_quota_still_waits_for_the_reset(self):
+        cont = {"id": "w-c0ffe2", "kind": "wake", "at": "2026-01-01 00:00:00", "prompt": "p", "created": "x",
+                "continuation": {"handle": "cont-" + "a" * 64, "wake": "w-c0ffe2", "expiresAt": 9999999999999}}
+        with mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"body": "failed", "code": "quota", "retryAfter": 60})), \
+             mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "defer_quota") as defer:
+            wake_cli.deliver_wake(dict(cont), "p", "ada", False)
+        defer.assert_called_once()
 
     def test_a_continuation_refuses_a_lane_file(self):
         self.assertIn("-f", self.cli("in", "1h", "-f", str(self.lane), "--continuation", "cont-" + "c" * 64) or "")
