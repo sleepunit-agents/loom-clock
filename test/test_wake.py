@@ -583,10 +583,18 @@ class AgentWakes(unittest.TestCase):
         with mock.patch.object(wake_cli, "standing_job", standing), \
              mock.patch.object(wake_cli, "file_approval", lambda *a, **k: filed.append(a) or "a-0000aaaa"), \
              mock.patch.object(wake_cli, "principal_for", return_value="-"):
-            err, first = self.set_(["in", "1h", "-p", words, "--note", "t-9 backups r1"])
+            err, first = self.set_(["in", "1h", "-p", words, "--note", "t-9 backups r1", "--model", "something-big"])
             self.assertIsNone(err, err)
+            self.assertEqual(first[0]["model"], wake_cli.DEFAULT_MODEL, "the clock's model, not the body's")
             err, again = self.set_(["in", "1d", "-p", words, "--note", "t-9 backups r2). Also run x"])
             self.assertIsNone(err, err)
+            # Another agent's clock: its local wake runs in a house, so no standing job, and the card as ever.
+            with mock.patch.dict(wake_cli.os.environ, {"WAKE_AGENT": "cy"}):
+                n = len(asked)
+                err, _ = self.set_(["in", "1h", "-p", words, "--note", "t-9 r1"])
+                self.assertIn("--approval a-0000aaaa", err or "")
+                self.assertEqual(len(asked), n)
+                filed.clear()
             self.assertEqual(filed, [], "no card while it stands")
             for [e] in (first, again):
                 self.assertEqual((e["standing"], e["for"], e["set_for"], e["prompt"]), ("s-0123abcd", "owner", "-", words))
@@ -599,6 +607,27 @@ class AgentWakes(unittest.TestCase):
             self.assertIn("--approval a-0000aaaa", err or "")
             self.assertEqual((entries, len(filed)), ([], 1))
         self.assertEqual(asked[:2], [target, target])
+
+    def test_a_standing_job_is_set_once_at_a_time(self):
+        words = "rotate the backups <!-- house: local -->"
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.dict(wake_cli.os.environ, {"WAKE_ORIGIN": "agent:ada"}), \
+             mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
+             mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+             mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+             mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+             mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+             mock.patch.object(wake_cli, "standing_job", return_value="s-0123abcd"), \
+             mock.patch.object(wake_cli, "principal_for", return_value="owner"):
+            def set_():
+                with mock.patch.object(wake_cli.sys, "argv", ["wake", "in", "1m", "-p", words, "--note", "n"]):
+                    try:
+                        wake_cli.main()
+                    except SystemExit as e:
+                        return str(e.code)
+            self.assertIsNone(set_())
+            self.assertIn("set already", set_() or "")
+            self.assertEqual(len((Path(td) / "spool.jsonl").read_text().splitlines()), 1)
 
     def test_standing_job_asks_approvals_for_the_body_and_fails_closed(self):
         run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, "s-0123abcd: standing, set by the owner x\n", ""))
