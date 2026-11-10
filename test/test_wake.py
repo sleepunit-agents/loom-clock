@@ -599,6 +599,7 @@ class AgentWakes(unittest.TestCase):
             self.assertEqual(filed, [], "no card while it stands")
             for [e] in (first, again):
                 self.assertEqual((e["standing"], e["for"], e["set_for"], e["prompt"]), ("s-0123abcd", "owner", "-", words))
+                self.assertEqual(e["standing_digest"], digest)
                 self.assertEqual(e["note"], "standing job s-0123abcd, allowed every time by the owner")
                 self.assertNotIn("local_approval", e)
                 self.assertNotIn("for_why", e)
@@ -680,7 +681,8 @@ class AgentWakes(unittest.TestCase):
         entry = {"id": "w-aaaaaa", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "standing job s-0123abcd",
                  "prompt": "do it <!-- house: local -->", "model": "m", "created": "x", "origin": "agent:ada",
                  "standing": "s-0123abcd", "for": "owner"}
-        entry["standing_target"] = "ada:" + wake_cli.hashlib.sha256(entry["prompt"].encode()).hexdigest()[:16]
+        entry["standing_digest"] = wake_cli.hashlib.sha256(entry["prompt"].encode()).hexdigest()
+        entry["standing_target"] = "ada:" + entry["standing_digest"][:16]
         for state, runs in (("on", True), ("off", False), ("none", False), (None, False), ("changed", False)):
             with tempfile.TemporaryDirectory() as td, \
                  mock.patch.dict(wake_cli.os.environ, {"WAKE_FIRE": "mixed"}), \

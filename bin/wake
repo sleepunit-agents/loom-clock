@@ -862,6 +862,7 @@ def cmd_set(args, when):
                 # it's read into the session's opening words, and his yes was for the words that run, not new ones.
                 log("standing-set", f"{sid} target={target} set_for={entry['for']} note={args.note!r}")
                 entry["standing"], entry["standing_target"], entry["set_for"] = sid, target, entry["for"]
+                entry["standing_digest"] = digest
                 for k in ("for_why", "for_people"):
                     entry.pop(k, None)
                 entry["for"], entry["note"] = "owner", f"standing job {sid}, allowed every time by the owner"
@@ -2359,8 +2360,9 @@ def cmd_fire(args):
     mode = "house" if origin or AGENT != LOCAL_AGENT else fire_mode()
     if entry.get("standing"):
         # Set under the owner's standing job (t-2013): it runs, as his work, only while that's still on.
-        words = f"{AGENT}:{hashlib.sha256(str(entry.get('prompt', '')).encode()).hexdigest()[:16]}"
-        if not entry.get("origin") or entry.get("standing_target") != words or not standing_still_on(entry):
+        whole = hashlib.sha256(str(entry.get("prompt", "")).encode()).hexdigest()
+        if not entry.get("origin") or entry.get("standing_digest") != whole or entry.get("standing_target") != f"{AGENT}:{whole[:16]}" \
+                or not standing_still_on(entry):
             log("fire-refused", f"{entry['id']}: standing job {entry['standing']} is off (or can't be read); not run")
             return
         if AGENT == LOCAL_AGENT:
