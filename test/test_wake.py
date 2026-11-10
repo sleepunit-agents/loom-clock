@@ -3392,6 +3392,14 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
             self.assertIsNone(self.cli("in", "1h", "-f", str(lane), "--note", "reflect re-arm", over_api=False))
         self.assertEqual(len(self.spool()), before + 1, "the owner's re-arm is armed")
         self.assertNotIn("origin", self.spool()[-1])
+        # Nor another house's re-arm, when the schedule is another conversation's for someone else.
+        loren = dict(statement="stmt-l", answer={**self.verified("ada", "loren"), "conversation": "cv-dddddddddddd"})
+        with mock.patch.object(wake_cli, "lane_file", return_value=lane), mock.patch.object(wake_cli.Path, "is_file", return_value=True):
+            self.assertIsNone(self.cli("schedule", "set", "yy", "--at", "00:00,06:00,12:00,18:00", "-f", str(lane), **loren))
+            self.cli("schedule", "rm", "zz", **mine)
+            before = len(self.spool())
+            self.assertIsNone(self.cli("in", "1h", "-f", str(lane), "--note", "b's re-arm", **mine))
+        self.assertEqual(len(self.spool()), before + 1, "house B's re-arm is armed, not answered by Loren's yy")
 
     def test_houses_set_at_most_their_share_of_schedules(self):
         mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))

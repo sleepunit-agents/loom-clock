@@ -836,7 +836,13 @@ def schedule_for_file(path):
     covers only a house's (t-2131): a house's schedule for an owner's lane never stands in for his re-arm."""
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     for name, sc in load_schedules().items():
-        if sc.get("origin") and sc.get("origin") != origin:
+        if not isinstance(sc, dict):
+            continue
+        if sc.get("origin") and not origin:
+            continue
+        # From a house, only one this run could change and that runs for whom this run works: another conversation's
+        # schedule for someone else never takes over its re-arm (and can then be removed under it).
+        if sc.get("origin") and (not api_may_change(sc) or entry_for(sc) != principal_for()):
             continue
         # A loom lane set from a file counts too: its run's own "re-arm yourself" is answered, not doubled.
         for f in (sc.get("prompt_file"), sc.get("lane_file")):
