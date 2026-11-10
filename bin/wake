@@ -193,6 +193,8 @@ PARK_CHECK = timedelta(minutes=5)
 PARK_FOR = timedelta(hours=24)
 PARK_ON = re.compile(r"^(q|a)-[0-9a-f]{8}$")
 MAX_PENDING = 50
+# One conversation's share over the piece API (t-2131): one house filling the clock's 50 would lock out the owner's.
+MAX_PENDING_API = 20
 SCHEDULE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
 SLOT_NAME = re.compile(r"^[a-z][a-z0-9-]{0,39}$")
 DAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
@@ -442,6 +444,21 @@ def api_may_change(rec):
     principal_for()
     cv = principal_in()
     return bool(rec.get("origin")) and bool(cv) and rec.get("for_in") == cv
+
+
+def pending_full(entries, kinds=("wake", "parked")):
+    """Why one more one-off wake can't be set, or None: the clock's own cap, and over the piece API, one
+    conversation's share of it (by the runtime's word; a body it can't name shares one share with every such body)."""
+    pending = [e for e in entries if e["kind"] in kinds]
+    if len(pending) >= MAX_PENDING:
+        return f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)"
+    if os.environ.get("WAKE_ORIGIN", "").strip():
+        principal_for()
+        cv = principal_in()
+        if sum(1 for e in pending if e.get("origin") and e.get("for_in") == cv) >= MAX_PENDING_API:
+            return (f"wake: this conversation has {MAX_PENDING_API} one-off wakes pending already, its most; cancel some "
+                    "first (wake list)")
+    return None
 
 
 def on_behalf():
@@ -892,8 +909,9 @@ def cmd_set(args, when):
         args.note = filed["note"]
         # The spool's limit before the spend: a refusal after it would use up the owner's yes for nothing.
         with Spool() as spool:
-            if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
-                sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
+            full = pending_full(spool.entries)
+            if full:
+                sys.exit(full)
         if filed.get("target") != f"{AGENT}:{hashlib.sha256(args.prompt.encode()).hexdigest()[:16]}":
             sys.exit(f"wake: the words this clock kept for {args.approval} don't match what it filed; set the wake again with -p")
     if bool(args.prompt) == bool(args.prompt_file):
@@ -1040,8 +1058,9 @@ def cmd_set(args, when):
             entry["approval"] = card
         entry["until"] = (datetime.now() + PARK_FOR).strftime(TIME_FMT)
     with Spool() as spool:
-        if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
-            sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
+        full = pending_full(spool.entries)
+        if full:
+            sys.exit(full)
         if entry.get("continuation") and int(datetime.now().timestamp() * 1000) >= entry["continuation"]["expiresAt"]:
             sys.exit("wake: continuation expired before scheduling committed")
         # A continuation's replay uses its sealed body and skips a standing job's or an approval's checks at
@@ -1659,8 +1678,9 @@ def cmd_schedule(args):
             if principal_in():
                 entry["for_in"] = principal_in()
         with Spool() as spool:
-            if sum(1 for e in spool.entries if e["kind"] == "wake") >= MAX_PENDING:
-                sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
+            full = pending_full(spool.entries, ("wake",))
+            if full:
+                sys.exit(full)
             spool.entries.append(entry)
             arm_timer(entry)
         log("set", f"{entry['id']} at {entry['at']} note={entry['note']!r}")
@@ -1712,7 +1732,8 @@ def cmd_schedule(args):
     if isinstance(prev, dict):      # one from before t-1943 has no `for`: entry_for reads it by where it was set
         was = sc["for"]
         sc["for"] = narrower(entry_for(prev), sc["for"])
-        if sc["for"] != was:
+        # Narrowed, it's no longer what this run vouched for, but it's still this conversation's to change (t-2131).
+        if sc["for"] != was and not (sc.get("for_in") and sc.get("for_in") == prev.get("for_in")):
             sc.pop("for_in", None)
     if args.slot:
         if not SLOT_NAME.match(args.slot):
@@ -1735,8 +1756,10 @@ def cmd_schedule(args):
     with Spool() as spool:
         # It replaces its own pending occurrence, and any one-off wake for the same lane
         # (a lane that re-armed itself before it had a schedule).
+        # Over the API, only what this conversation set itself (t-2131): never the owner's wake for the same lane.
         for e in [e for e in spool.entries if e.get("schedule") == args.name
-                  or (sc.get("prompt_file") and e["kind"] == "wake" and e.get("prompt_file") == sc["prompt_file"])]:
+                  or (sc.get("prompt_file") and e["kind"] == "wake" and e.get("prompt_file") == sc["prompt_file"]
+                      and api_may_change(e))]:
             disarm_timer(e["id"])
             spool.entries.remove(e)
             log("schedule-replaces", f"{args.name}: {e['id']}")

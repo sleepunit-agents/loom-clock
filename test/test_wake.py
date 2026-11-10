@@ -3365,6 +3365,34 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         # The owner here changes anything, as ever.
         self.assertIsNone(self.cli("schedule", "rm", "nightly", **here))
 
+    def test_a_house_s_schedule_never_displaces_another_s_wake_for_the_same_lane(self):
+        # t-2131 cold review: a new schedule replaced every pending one-off wake for its lane file, the owner's too.
+        lane = wake_cli.REPO / "routines" / "reflect.md"
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        with mock.patch.object(wake_cli, "lane_file", return_value=lane), mock.patch.object(wake_cli.Path, "is_file", return_value=True):
+            self.assertIsNone(self.cli("in", "1h", "-f", str(lane), "--note", "owner's reflect", over_api=False))
+            owners = self.spool()[-1]["id"]
+            self.cli("schedule", "set", "zz", "--at", "23:59", "-f", str(lane), **mine)
+        self.assertIn(owners, [e["id"] for e in self.spool()], "the owner's wake for that lane stays")
+
+    def test_one_conversation_holds_at_most_its_share_of_the_spool(self):
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        other = dict(statement="stmt-b", answer={**self.verified("ada", "jonathan-barket", True), "conversation": "cv-bbbbbbbbbbbb"})
+        with mock.patch.object(wake_cli, "MAX_PENDING_API", 2):
+            self.assertIsNone(self.cli("in", "1h", "-p", "a", "--note", "t-1", **mine))
+            self.assertIsNone(self.cli("in", "1h", "-p", "b", "--note", "t-1", **mine))
+            self.assertIn("this conversation has 2 one-off wakes pending already", self.cli("in", "1h", "-p", "c", "--note", "t-1", **mine) or "")
+            self.assertIsNone(self.cli("in", "1h", "-p", "d", "--note", "t-1", **other))
+            self.assertIsNone(self.cli("in", "1h", "-p", "e", "--note", "t-1", over_api=False), "the owner's own: the clock's cap only")
+
+    def test_a_schedule_narrowed_on_a_re_set_stays_its_conversation_s(self):
+        mine_owner = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        mine_loren = dict(statement="stmt-a2", answer=self.verified("ada", "loren"))
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:00", "-p", "a", **mine_loren))
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:30", "-p", "b", **mine_owner))
+        self.assertEqual(wake_cli.load_schedules()["mine"]["for"], "loren")
+        self.assertIsNone(self.cli("schedule", "rm", "mine", **mine_owner), "still this conversation's to remove")
+
     def test_a_park_is_for_whom_its_body_works_too(self):
         with mock.patch.object(wake_cli, "approval_card", return_value=None):
             self.assertIsNone(self.cli("park", "--on", "a-0000aaaa", "-p", "next", "--note", "t-1 r2",
