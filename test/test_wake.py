@@ -938,6 +938,27 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
                     server.shutdown()
                     thread.join(5)
 
+    def test_continuation_inspection_finds_the_runtime_without_it_on_path(self):
+        # t-2095: a house's wake runs inside loom-http, whose PATH has no pieces bin.
+        with tempfile.TemporaryDirectory() as td:
+            pieces = Path(td) / "pieces"
+            (pieces / "clock").mkdir(parents=True)
+            (pieces / "bin").mkdir()
+            runtime = pieces / "bin" / "loom-runtime"
+            runtime.write_text("#!/bin/sh\n")
+            runtime.chmod(0o755)
+            self.assertEqual(wake_cli.runtime_bin(piece_home=pieces / "clock", loom_home=td + "/elsewhere"), str(runtime))
+            self.assertEqual(wake_cli.runtime_bin(piece_home=False, loom_home=td), str(runtime))
+            handle = "cont-" + "b" * 64
+            when = wake_cli.datetime.now() + wake_cli.timedelta(hours=1)
+            good = {"handle": handle, "expiresAt": int(when.timestamp() * 1000) + 1}
+            with mock.patch.dict(os.environ, {"WAKE_PRINCIPAL_STATEMENT": "signed-issuer", "PATH": "/usr/bin:/bin"}), \
+                 mock.patch.object(wake_cli, "PIECE_HOME", pieces / "clock"), \
+                 mock.patch.object(wake_cli, "setting", side_effect=lambda k, *a: None), \
+                 mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(good))) as call:
+                wake_cli.inspect_continuation(handle, when)
+                self.assertEqual(call.call_args.args[0][0], str(runtime))
+
     def test_continuation_inspection_requires_runtime_deadline_before_any_commit(self):
         handle = "cont-" + "a" * 64
         when = wake_cli.datetime.now() + wake_cli.timedelta(hours=1)

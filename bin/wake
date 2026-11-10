@@ -779,6 +779,20 @@ def continuation_refusal(stderr, handle):
     return re.sub(r"[^\x20-\x7e…]", "", line)[:200]
 
 
+def runtime_bin(piece_home=None, loom_home=None):
+    """loom's runtime piece, by its absolute path beside this one (`$LOOM_HOME/pieces/bin/loom-runtime`), as
+    stable_self finds this piece's own link. Never by bare name alone: a house's wake runs inside loom-http, whose
+    PATH has no pieces bin, so `loom-runtime` wasn't found and every continuation was refused (t-2095)."""
+    home = piece_home if piece_home is not None else PIECE_HOME
+    bins = [home.parent / "bin"] if home else []
+    lh = loom_home if loom_home is not None else os.environ.get("LOOM_HOME")
+    bins.append(Path(lh or HOME / ".config" / "loom") / "pieces" / "bin")
+    for b in bins:
+        if os.access(b / "loom-runtime", os.X_OK):
+            return str(b / "loom-runtime")
+    return shutil.which("loom-runtime") or "loom-runtime"
+
+
 def inspect_continuation(handle, when):
     """Ask the local runtime, with the issuer's signed statement, before any timer/spool write."""
     statement = os.environ.get("WAKE_PRINCIPAL_STATEMENT", "")
@@ -791,7 +805,7 @@ def inspect_continuation(handle, when):
     try:
         # Call the managed binary directly: `loom runtime` would dispatch it
         # with LOOM_PIECE_NAME=runtime, losing this clock's local context.
-        inspect_argv = argv_setting("WAKE_PRINCIPAL", ["loom-runtime", "principal"])
+        inspect_argv = argv_setting("WAKE_PRINCIPAL", [runtime_bin(), "principal"])
         r = subprocess.run([*inspect_argv, "--inspect-continuation", handle, "--agent", AGENT,
                             "--scheduled-at", str(scheduled_at)], input=statement, capture_output=True, text=True,
                            timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
