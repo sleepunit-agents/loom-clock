@@ -3200,6 +3200,11 @@ def api_answer(request, run):
         pass
     elif caller.get("kind") == "agent" and caller.get("agent") in agents:
         pass
+    elif caller.get("kind") == "agent" and caller.get("granted") is True and isinstance(caller.get("agent"), str) \
+            and AGENT_NAME.match(caller["agent"]):
+        # loom's grants authority already said this agent may use the clock (agent-runtime.md section 6, "Done";
+        # t-1746): core marks such a caller granted, and WAKE_AGENTS is only the fallback for a household without one.
+        pass
     else:
         return refuse(403, "only the owner and this clock's agents set wakes here")
     if request.get("path") != "run":
