@@ -438,7 +438,7 @@ class AgentWakes(unittest.TestCase):
         # A house body that sets `<!-- house: local -->` isn't sent to a house silently: it's told at
         # once, and the owner can allow it (approvals).
         filed = []
-        with mock.patch.object(wake_cli, "file_approval", lambda kind, target, what, why, plain=None: filed.append((kind, target, what, why, plain)) or "a-0000aaaa"):
+        with mock.patch.object(wake_cli, "file_approval", lambda kind, target, what, why, plain=None, digest=None: filed.append((kind, target, what, why, plain)) or "a-0000aaaa"):
             err, entries = self.set_(["in", "1h", "-p", "push the agent <!-- house: local -->", "--note", "t-1 r1"])
             self.assertIn("--approval a-0000aaaa", err or "")
             self.assertEqual(entries, [])
@@ -579,7 +579,8 @@ class AgentWakes(unittest.TestCase):
         words = "rotate the backups <!-- house: local -->"
         target = "ada:" + wake_cli.hashlib.sha256(words.encode()).hexdigest()[:16]
         asked, filed = [], []
-        standing = lambda t: asked.append(t) or ("s-0123abcd" if t == target else None)
+        digest = wake_cli.hashlib.sha256(words.encode()).hexdigest()
+        standing = lambda t, d: asked.append(t) or ("s-0123abcd" if (t, d) == (target, digest) else None)
         with mock.patch.object(wake_cli, "standing_job", standing), \
              mock.patch.object(wake_cli, "file_approval", lambda *a, **k: filed.append(a) or "a-0000aaaa"), \
              mock.patch.object(wake_cli, "principal_for", return_value="-"):
@@ -607,6 +608,14 @@ class AgentWakes(unittest.TestCase):
             self.assertIn("--approval a-0000aaaa", err or "")
             self.assertEqual((entries, len(filed)), ([], 1))
         self.assertEqual(asked[:2], [target, target])
+
+    def test_on_behalf_names_the_people_the_runtime_named(self):
+        with mock.patch.object(wake_cli, "principal_for", return_value="-"), mock.patch.object(wake_cli, "_LAST_WHY", [("steered", ["eve", "dan", "eve"])]):
+            self.assertEqual(wake_cli.on_behalf(), "?:dan,eve")
+        with mock.patch.object(wake_cli, "principal_for", return_value="-"), mock.patch.object(wake_cli, "_LAST_WHY", [("none", [])]):
+            self.assertEqual(wake_cli.on_behalf(), "-")
+        with mock.patch.object(wake_cli, "principal_for", return_value="owner"), mock.patch.object(wake_cli, "_LAST_WHY", [(None, ["x"])]):
+            self.assertEqual(wake_cli.on_behalf(), "owner")
 
     def test_a_standing_job_is_set_once_at_a_time(self):
         words = "rotate the backups <!-- house: local -->"
@@ -654,23 +663,25 @@ class AgentWakes(unittest.TestCase):
         with mock.patch.dict(wake_cli.os.environ, {"WAKE_CALLER": '{"kind": "agent", "agent": "ada", "house": "h-3"}'}), \
              mock.patch.object(wake_cli, "principal_for", return_value="owner"), \
              mock.patch.object(wake_cli.subprocess, "run", run):
-            self.assertEqual(wake_cli.standing_job("ada:0123456789abcdef"), "s-0123abcd")
+            self.assertEqual(wake_cli.standing_job("ada:0123456789abcdef", "0123456789abcdef" + "0" * 48), "s-0123abcd")
             argv = run.call_args.args[0]
             self.assertEqual(argv[argv.index("standing"):], ["standing", "--kind", "local-wake", "--target", "ada:0123456789abcdef",
+                             "--digest", "0123456789abcdef" + "0" * 48,
                              "--as", '{"kind": "agent", "agent": "ada", "house": "h-3"}', "--on-behalf", "owner"])
             for out in (subprocess.CompletedProcess([], 1, "", "no standing job"), subprocess.CompletedProcess([], 0, "s-zz: standing", "")):
                 run.return_value = out
-                self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef"))
+                self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef", "0" * 64))
             run.side_effect = subprocess.TimeoutExpired("approvals", 8)
-            self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef"))
+            self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef", "0" * 64))
         with mock.patch.dict(wake_cli.os.environ, {"WAKE_CALLER": ""}):
-            self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef"), "no body to ask for")
+            self.assertIsNone(wake_cli.standing_job("ada:0123456789abcdef", "0" * 64), "no body to ask for")
 
     def test_a_wake_set_under_a_standing_job_runs_only_while_it_is_on(self):
         entry = {"id": "w-aaaaaa", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "standing job s-0123abcd",
                  "prompt": "do it <!-- house: local -->", "model": "m", "created": "x", "origin": "agent:ada",
                  "standing": "s-0123abcd", "for": "owner"}
-        for state, runs in (("on", True), ("off", False), ("none", False), (None, False)):
+        entry["standing_target"] = "ada:" + wake_cli.hashlib.sha256(entry["prompt"].encode()).hexdigest()[:16]
+        for state, runs in (("on", True), ("off", False), ("none", False), (None, False), ("changed", False)):
             with tempfile.TemporaryDirectory() as td, \
                  mock.patch.dict(wake_cli.os.environ, {"WAKE_FIRE": "mixed"}), \
                  mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
@@ -684,10 +695,15 @@ class AgentWakes(unittest.TestCase):
                 run.return_value = subprocess.CompletedProcess([], 0 if state else 1, (state or "") + "\n", "")
                 dispatch.return_value.returncode = 0
                 dispatch.return_value.stdout = ""
-                (Path(td) / "spool.jsonl").write_text(wake_cli.json.dumps(entry) + "\n")
+                # A pending wake whose words aren't the job's any more (edited on the host): never run.
+                e = {**entry, "prompt": "something else <!-- house: local -->"} if state == "changed" else entry
+                if state == "changed":
+                    run.return_value = subprocess.CompletedProcess([], 0, "on\n", "")
+                (Path(td) / "spool.jsonl").write_text(wake_cli.json.dumps(e) + "\n")
                 wake_cli.cmd_fire(mock.Mock(id="w-aaaaaa"))
                 checks = [c.args[0] for c in run.call_args_list if "standing" in c.args[0]]
-                self.assertEqual(checks[0][checks[0].index("standing"):][:3], ["standing", "--check", "s-0123abcd"], state)
+                if state != "changed":
+                    self.assertEqual(checks[0][checks[0].index("standing"):][:3], ["standing", "--check", "s-0123abcd"], state)
                 self.assertEqual(delivered.called, runs, state)
                 dispatch.assert_not_called()
                 if runs:

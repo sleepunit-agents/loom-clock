@@ -406,6 +406,14 @@ _LAST_WHY = [(None, [])]
 _LAST_IN = [None]
 
 
+def on_behalf():
+    """Whom this run acts for, as approvals reads --on-behalf: the owner, a person, or "-" with the people the runtime
+    named ("?:eve,dan", t-2013: not "-", which argparse would read as a flag), so a card asked while Eve steered is filed, spent and matched only for that."""
+    f = principal_for()
+    people = [p for p in (_LAST_WHY[0][1] if f == "-" else []) if PRINCIPAL_SLUG.match(p)]
+    return f"?:{','.join(sorted(set(people)))}" if people else f
+
+
 def principal_in():
     """The conversation the last principal_for() of this run was vouched for in (cv-…), or None."""
     return _LAST_IN[0]
@@ -843,7 +851,11 @@ def cmd_set(args, when):
                 if already:
                     sys.exit(f"wake: this job is set already ({already}, under the owner's standing job); it can be set "
                              "again once that one has run")
-            sid = standing_job(target) if standing_ok else None
+            # Matched on the words' whole hash (the target is its first 16 hex digits), and only words the card could
+            # have shown whole: two prompts made to share a short hash never pass for each other.
+            digest = hashlib.sha256(args.prompt.encode()).hexdigest()
+            shown = args.prompt.replace(HOUSE_LOCAL, "").strip()
+            sid = standing_job(target, digest) if standing_ok and len(shown) <= LOCAL_WAKE_MAX and not shown_as_run(shown) else None
             if sid:
                 # The owner's Allow every time for exactly these words, this agent and whom it's set for (t-2013): set
                 # with no card, as his work ("runs on this box as me"). The note is the clock's own, never the body's:
@@ -868,7 +880,7 @@ def cmd_set(args, when):
                 if odd:
                     sys.exit(f"wake: a local wake's prompt is shown to the owner exactly as it runs, and this one can't be: {odd}")
                 aid = file_approval("local-wake", target, f"run on loom's machine: {body}", f"set from a house, note: {args.note}",
-                                    plain=local_wake_card(body, args.note))
+                                    plain=local_wake_card(body, args.note), digest=hashlib.sha256(args.prompt.encode()).hexdigest())
                 remember_filed(aid, target, args.prompt, args.note)
                 sys.exit("wake: a wake set from a house runs in a house; <!-- house: local --> needs the owner's approval. "
                          + f"Asked them ({aid}, a card on loom's Home with this prompt). Park on it "
@@ -1956,7 +1968,7 @@ def shown_as_run(body):
     return ""
 
 
-def file_approval(kind, target, what, why, plain=None):
+def file_approval(kind, target, what, why, plain=None, digest=None):
     """File an approval request (loom's approvals piece) for the body this runs for; its id, or None. With `plain`
     (ask, why, if_yes, if_no, details), the card asks a plain question; its why replaces `why`."""
     argv = [*approvals_argv(), "request", "--kind", kind, "--target", target, "--what", what]
@@ -1969,7 +1981,9 @@ def file_approval(kind, target, what, why, plain=None):
     if caller:
         # And on whose behalf (t-1943): the approval names them on its card and is spent only for them, so filing and
         # spending say the same (the caller's verified principal; "-" reads as someone loom can't name).
-        argv += ["--as", caller, "--on-behalf", principal_for()]
+        argv += ["--as", caller, "--on-behalf", on_behalf()]
+    if kind == "local-wake" and digest:
+        argv += ["--digest", digest]
     env = {k: v for k, v in os.environ.items() if k != "HOUSE_ID"}
     try:
         r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
@@ -1982,15 +1996,15 @@ def file_approval(kind, target, what, why, plain=None):
     sys.exit(f"wake: couldn't ask the owner: {(r.stderr or r.stdout).strip()[:600]}")
 
 
-def standing_job(target):
+def standing_job(target, digest):
     """The owner's standing job (Allow every time, t-2013) for this local wake: its id (s-…), or None, so it asks. Asked
     for the body this runs for, on whose behalf it sets it, exactly as a card would be filed: anything the piece can't
     say is no standing job (it fails closed, to a card)."""
     caller = os.environ.get("WAKE_CALLER", "").strip()
     if not caller:
         return None
-    argv = [*approvals_argv(), "standing", "--kind", "local-wake", "--target", target, "--as", caller,
-            "--on-behalf", principal_for()]
+    argv = [*approvals_argv(), "standing", "--kind", "local-wake", "--target", target, "--digest", digest,
+            "--as", caller, "--on-behalf", on_behalf()]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=8,
                            env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
@@ -2022,7 +2036,7 @@ def spend_approval(aid, kind, target):
     if caller:
         # And on whose behalf (t-1943): the approval names them on its card and is spent only for them, so filing and
         # spending say the same (the caller's verified principal; "-" reads as someone loom can't name).
-        argv += ["--as", caller, "--on-behalf", principal_for()]
+        argv += ["--as", caller, "--on-behalf", on_behalf()]
     env = {k: v for k, v in os.environ.items() if k != "HOUSE_ID"}
     try:
         r = subprocess.run(argv, capture_output=True, text=True, env=env, timeout=30)
@@ -2345,7 +2359,8 @@ def cmd_fire(args):
     mode = "house" if origin or AGENT != LOCAL_AGENT else fire_mode()
     if entry.get("standing"):
         # Set under the owner's standing job (t-2013): it runs, as his work, only while that's still on.
-        if not entry.get("origin") or not standing_still_on(entry):
+        words = f"{AGENT}:{hashlib.sha256(str(entry.get('prompt', '')).encode()).hexdigest()[:16]}"
+        if not entry.get("origin") or entry.get("standing_target") != words or not standing_still_on(entry):
             log("fire-refused", f"{entry['id']}: standing job {entry['standing']} is off (or can't be read); not run")
             return
         if AGENT == LOCAL_AGENT:
