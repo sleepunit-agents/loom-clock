@@ -543,8 +543,16 @@ class Spool:
         # recording what actually happened: a retry that was armed and
         # then vanished from the spool.
         tmp = SPOOL.with_suffix(".tmp")
-        tmp.write_text("".join(json.dumps(e) + "\n" for e in self.entries))
+        with tmp.open("w") as f:
+            f.write("".join(json.dumps(e) + "\n" for e in self.entries))
+            f.flush()
+            os.fsync(f.fileno())
         tmp.replace(SPOOL)
+        directory = os.open(WAKE_DIR, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
         fcntl.flock(self._lock, fcntl.LOCK_UN)
         self._lock.close()
         return False
@@ -762,7 +770,36 @@ def schedule_for_file(path):
     return None
 
 
+def inspect_continuation(handle, when):
+    """Ask the local runtime, with the issuer's signed statement, before any timer/spool write."""
+    statement = os.environ.get("WAKE_PRINCIPAL_STATEMENT", "")
+    if not statement and not os.environ.get("WAKE_ORIGIN"):
+        statement = fetch_principal(os.environ.get("LOOM_BODY_CONVERSATION", ""))
+    if not statement:
+        sys.exit("wake: a continuation needs its authenticated issuer statement")
+    scheduled_at = int(when.timestamp() * 1000)
+    try:
+        # Call the managed binary directly: `loom runtime` would dispatch it
+        # with LOOM_PIECE_NAME=runtime, losing this clock's local context.
+        inspect_argv = argv_setting("WAKE_PRINCIPAL", ["loom-runtime", "principal"])
+        r = subprocess.run([*inspect_argv, "--inspect-continuation", handle, "--agent", AGENT,
+                            "--scheduled-at", str(scheduled_at)], input=statement, capture_output=True, text=True,
+                           timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+        answer = json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError, SystemExit):
+        answer = None
+    deadline = answer.get("expiresAt") if isinstance(answer, dict) else None
+    if (not isinstance(answer, dict) or answer.get("handle") != handle or type(deadline) is not int or
+            deadline <= int(datetime.now().timestamp() * 1000) or scheduled_at >= deadline):
+        sys.exit("wake: runtime refused continuation scheduling or returned no valid deadline")
+    return deadline
+
+
 def cmd_set(args, when):
+    # First, before anything is looked up, asked or spent: a continuation's replay uses its sealed body and skips a
+    # standing job's or an approval's fire-time checks, so it never rides one (a `house: local` prompt or --approval).
+    if vars(args).get("continuation", "") and (getattr(args, "approval", "") or HOUSE_LOCAL in (getattr(args, "prompt", "") or "")):
+        sys.exit("wake: a continuation can't ride a standing job, an approval or a local wake")
     if getattr(args, "approval", ""):
         # A local wake the owner allowed is set with the words this clock filed for it, byte for byte, and only those:
         # a continuation in a later house can't be trusted to retype them, and a body that brings its own words could
@@ -812,6 +849,14 @@ def cmd_set(args, when):
         "model": args.model,
         "created": datetime.now().strftime(TIME_FMT),
     }
+    continuation = vars(args).get("continuation", "")
+    if continuation:
+        if not re.fullmatch(r"cont-[0-9a-f]{64}", continuation):
+            sys.exit("wake: --continuation is an opaque runtime capability")
+        if args.slot or getattr(args, "place", "") or getattr(args, "prompt_file", None):
+            sys.exit("wake: a continuation needs its own delivered conversation, without --slot, --place or -f")
+        entry["continuation"] = {"handle": continuation, "wake": entry["id"],
+                                 "expiresAt": inspect_continuation(continuation, when)}
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
     if origin:
         entry["origin"] = origin
@@ -928,6 +973,12 @@ def cmd_set(args, when):
     with Spool() as spool:
         if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
             sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
+        if entry.get("continuation") and int(datetime.now().timestamp() * 1000) >= entry["continuation"]["expiresAt"]:
+            sys.exit("wake: continuation expired before scheduling committed")
+        # A continuation's replay uses its sealed body and skips a standing job's or an approval's checks at
+        # fire time, so it is never one of those: a local wake on the owner's say reports through its own run.
+        if entry.get("continuation") and (entry.get("standing") or entry.get("local_approval") or entry.get("approval")):
+            sys.exit("wake: a continuation can't ride a standing job, an approval or a local wake")
         if entry.get("standing_target") and any(e.get("standing_target") == entry["standing_target"] for e in spool.entries):
             # Two sets at once both got past the check above: the second waits for the first to run.
             sys.exit("wake: this job is set already, under the owner's standing job; it can be set again once that one has run")
@@ -1776,6 +1827,24 @@ def cmd_cancel(args):
     print(f"cancelled {args.id}")
 
 
+def arm_pending(entry):
+    if not entry.get("_firing"):
+        return arm_timer(entry)
+    # A timer whose service died may still be loaded. Recover under a new timer id,
+    # preserving the sealed delivery id, body and original continuation wake.
+    with (WAKE_DIR / (entry["id"] + ".fire.lock")).open("w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "firing"
+        old = entry["id"]
+        entry["id"] = "w-" + secrets.token_hex(3)
+        entry["_firing"] = entry["id"]
+        result = arm_timer(entry)
+        log("fire-recover", f"{old} as {entry['id']}; exact delivery retained")
+        return result
+
+
 def cmd_rearm(args):
     # At boot (the piece's `run` service, or a plain `wake rearm`) every clock comes back,
     # not only the local agent's: the timers are transient, and another agent's lanes would stop silently.
@@ -1785,7 +1854,7 @@ def cmd_rearm(args):
             configure(agent)
         with Spool() as spool:
             for e in spool.entries:
-                print(f"{agent} {e['id']}: {arm_timer(e)}")
+                print(f"{agent} {e['id']}: {arm_pending(e)}")
             ensure_deadman(spool)
         log("rearm", f"{len(spool.entries)} entries")
 
@@ -2251,6 +2320,13 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
       - failed: the turn stands and no body took it: retried later as a new delivery (a new id, the same place);
       - no answer, a 5xx or a 429: retried later with the same id and body, which loom answers once;
       - any other refusal (400, 403, 409, 413): said loudly, never retried: a retry would be refused the same way."""
+    continuation = entry.get("continuation")
+    if continuation:
+        deadline = continuation.get("expiresAt")
+        if (type(deadline) is not int or deadline <= int(datetime.now().timestamp() * 1000) or
+                (entry.get("delivery") and entry["delivery"].get("continuation") != continuation)):
+            log("fire-refused", f"{entry['id']} continuation expired, legacy, or changed; not delivered")
+            return None
     body = entry.get("delivery")
     if not body:
         # A local wake says so in the contract's own field (`local: true`), never by the words: its marker is this
@@ -2259,7 +2335,14 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         body = {"id": entry["id"][:DELIVER_ID_MAX], "agent": agent, "venue": "wake", "place": wake_place(entry, local),
                 "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text[:DELIVER_TEXT_MAX],
-                **({"local": True} if local else {})}
+                **({"local": True} if local else {}),
+                **({"continuation": dict(entry["continuation"])} if entry.get("continuation") else {})}
+    # Seal the exact wire body before either principal handover or delivery can reach runtime.
+    if entry.get("_firing"):
+        with Spool() as spool:
+            for pending in spool.entries:
+                if pending.get("_firing") == entry["_firing"]:
+                    pending["delivery"] = body
     # Whom it's for, handed to the runtime before the delivery it belongs to (t-1943). Not fatal: without it the
     # runtime treats the wake as unknown. (A wake that goes the old way, a spawned house or a session here, has no
     # runtime record to hand it to: there it's unknown.)
@@ -2276,6 +2359,11 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
         return None
     entry.pop("delivery", None)
     as_retry(entry)
+    if status == 200 and ans.get("body") == "failed" and entry.get("continuation") and not (ans.get("code") == "quota" or "out of quota" in err):
+        # Its report authority is bound to that one firing: a new delivery id would only be refused as another
+        # firing. Said once, not retried into a row of alerts.
+        log("fire-refused", f"{entry['id']} continuation wake{via} failed in the runtime: {err or 'failed'}; not retried")
+        return None
     if status == 200 and ans.get("body") == "failed":
         # loom keeps that answer a day: the same id would only be told `failed` again. A new delivery, same place.
         if ans.get("code") == "quota" or "out of quota" in err:
@@ -2294,6 +2382,43 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
 
 
 def cmd_fire(args):
+    # Serialize one firing across processes; the spool lock is released during HTTP.
+    WAKE_DIR.mkdir(parents=True, exist_ok=True)
+    with (WAKE_DIR / (args.id + ".fire.lock")).open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            _cmd_fire(args)
+        except SystemExit:
+            finish_firing(args.id)
+            raise
+        except Exception as e:
+            # An unexpected failure is not a crash to replay: re-arming it would fire the
+            # same past entry again at once, in a loop. Drop the firing and say so.
+            log("fire-failed", f"{args.id}: {type(e).__name__}: {str(e)[:200]}; not retried")
+            finish_firing(args.id)
+            raise
+        finish_firing(args.id)
+
+
+def finish_firing(wid):
+    with Spool() as spool:
+        spool.entries = [e for e in spool.entries if e.get("_firing") != wid or e.get("held")]
+        ensure_deadman(spool)
+    prune_fire_locks()
+
+
+def prune_fire_locks(older_s=86400):
+    """Firing locks are per firing id and never reused: one a day old belongs to no live firing."""
+    cutoff = time.time() - older_s
+    for f in WAKE_DIR.glob("*.fire.lock"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def _cmd_fire(args):
     # The fire gate (one writer): a standby never dispatches a lane.
     # Keep the entry, push it out an hour, re-check then.
     if not fire_gate_open():
@@ -2301,6 +2426,7 @@ def cmd_fire(args):
             for e in spool.entries:
                 if e["id"] == args.id:
                     # our own unit name is still loaded (we ARE it) — re-arm under a fresh id
+                    e.pop("_firing", None)
                     old_id, e["id"] = e["id"], "w-" + secrets.token_hex(3)
                     e["at"] = (datetime.now() + timedelta(hours=1)).strftime(TIME_FMT)
                     arm_timer(e)
@@ -2318,8 +2444,16 @@ def cmd_fire(args):
             entry["held"] = True
             log("fire-held", f"{entry['id']} paused")
             return
-        spool.entries.remove(entry)
-        ensure_deadman(spool)
+        # Only a continuation firing is retained for exact replay (its report authority is
+        # bound to that one sealed delivery). Every other entry keeps the old at-most-once
+        # rule: removed before it fires, so a crash never fires it twice.
+        if entry.get("kind") == "wake" and entry.get("continuation"):
+            entry["_firing"] = args.id
+            # A detached copy: changes become durable only through Spool's atomic commit.
+            entry = json.loads(json.dumps(entry))
+        else:
+            spool.entries.remove(entry)
+            ensure_deadman(spool)
     if entry.get("kind") == "watch":
         watch_house(entry)
         return
@@ -2339,11 +2473,18 @@ def cmd_fire(args):
         # The schedule's next occurrence first: the chain doesn't depend on this run.
         with Spool() as spool:
             sc = load_schedules().get(entry.get("schedule"))
-            if sc and not any(e.get("schedule") == entry["schedule"] for e in spool.entries):
+            if sc and not any(e.get("schedule") == entry["schedule"] and not e.get("_firing") for e in spool.entries):
                 nxt = schedule_entry(entry["schedule"], sc, next_occurrence(sc, datetime.now() + timedelta(minutes=1)))
                 spool.entries.append(nxt)
                 arm_timer(nxt)
                 log("schedule-next", f"{entry['schedule']}: {nxt['id']} at {nxt['at']}")
+    if entry.get("delivery") and entry.get("continuation"):
+        # A continuation firing's recovery uses its sealed wire body, even if the lane file/settings changed or
+        # disappeared. Only a continuation: an ordinary retried wake goes through every check below again
+        # (its standing job, its lane file, its mode), as it always did.
+        agent = origin.split(":", 1)[1] if origin else AGENT
+        deliver_wake(entry, "", agent, False, local=bool(entry["delivery"].get("local")))
+        return
     if "lane" in entry:
         body = (f"Your lane for this wake is the file `{entry['lane']}` in your own repo (your house's "
                 f"checkout). Read it and follow it.")
@@ -2464,6 +2605,9 @@ def defer_quota(entry, reset, err):
         for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
             disarm_timer(dm["id"])
             spool.entries.remove(dm)
+        firing = entry.pop("_firing", None)
+        if firing:
+            spool.entries = [e for e in spool.entries if e.get("_firing") != firing]
         spool.entries.append(entry)
         arm_timer(entry)
     log("quota-wait", f"{old_id} {err}; waiting as {entry['id']} until {entry['at']}")
@@ -2486,6 +2630,9 @@ def retry(entry, err, event):
         for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
             disarm_timer(dm["id"])
             spool.entries.remove(dm)
+        firing = entry.pop("_firing", None)
+        if firing:
+            spool.entries = [e for e in spool.entries if e.get("_firing") != firing]
         spool.entries.append(entry)
         arm_timer(entry)
     log(event, f"{old_id} {err} — retry {fails} as {entry['id']} {entry['at']}")
@@ -3880,7 +4027,7 @@ def keep_armed():
         with Spool() as spool:
             for e in spool.entries:
                 if not e.get("held") and not timer_active(e["id"]):
-                    if arm_timer(e) == "armed":
+                    if arm_pending(e) == "armed":
                         log("rearm", f"{e['id']} had no timer")
             ensure_deadman(spool)
         try:
@@ -3947,6 +4094,7 @@ def main():
         p.add_argument("-f", "--prompt-file")
         p.add_argument("--note", default="")
         p.add_argument("--model", default=DEFAULT_MODEL)
+        p.add_argument("--continuation", default="", help="opaque report capability issued by the current source holder")
         p.add_argument("--slot", default="", help="a house slot: its bookkeeping, restored and saved (one house at a time)")
         p.add_argument("--approval", default="", help="the owner's approval id, for a house's wake that must run on loom's machine")
         p.add_argument("--place", default="", help="the conversation it joins (delivery's place, like alert:host-watch): "

@@ -367,3 +367,17 @@ raise failure-streak alerts. Older runtimes saying “out of quota” get the sa
 The `alert:runtime-quota` triage wake is not retried: the runtime already leaves an
 owner notice, and running another model to investigate no available model repeats
 the failure. Other alert wakes remain scheduled for their reset.
+
+A continuation wake (`--continuation`, t-2004) stays in the atomic, fsynced spool while it fires, until its outcome
+is recorded. The clock seals the complete delivery JSON there before principal handover or HTTP; recovery reuses it
+even when prompt files or settings have changed. A per-firing lock prevents concurrent fire processes (locks a day
+old are pruned). After a killed process, the service's rearm pass uses a fresh timer id while keeping the exact
+delivery and continuation wake ids. A runtime answer of `failed` for a continuation wake is not retried: its report
+authority is bound to that one firing. An unexpected error drops the firing with `fire-failed` rather than re-arming it.
+Every other wake, schedule and deadman is removed before it fires (at most once), and a retry after a 5xx goes
+through its standing-job, lane and mode checks again.
+
+`--continuation` gets the immutable deadline from the local runtime, using the authenticated issuer statement,
+before anything is scheduled. A wake set at or past that deadline is refused, and one that fires past it is refused
+without delivery (`fire-refused`). It can't be combined with `--slot`, `--place` or `-f`. The lifetime is the
+runtime's (`LOOM_RUNTIME_CONTINUATION_DAYS`); the clock never chooses or extends it.

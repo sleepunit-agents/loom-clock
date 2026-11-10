@@ -618,6 +618,23 @@ class AgentWakes(unittest.TestCase):
         with mock.patch.object(wake_cli, "principal_for", return_value="owner"), mock.patch.object(wake_cli, "_LAST_WHY", [(None, ["x"])]):
             self.assertEqual(wake_cli.on_behalf(), "owner")
 
+    def test_a_continuation_never_rides_a_standing_job(self):
+        # Fresh read of loom-clock#24: a continuation's replay skips the standing check, so it is refused at set time.
+        words = "rotate the backups <!-- house: local -->"
+        with mock.patch.object(wake_cli, "standing_job", lambda t, d: "s-0123abcd"), \
+             mock.patch.object(wake_cli, "principal_for", return_value="-"), \
+             mock.patch.object(wake_cli, "inspect_continuation", return_value=9999999999999):
+            err, entries = self.set_(["in", "1h", "-p", words, "--note", "t-9", "--continuation", "cont-" + "e" * 64])
+        self.assertIn("can't ride a standing job", err or "")
+        self.assertFalse(any(e.get("continuation") for e in entries))
+        # Nor an approval, refused before it's spent.
+        with mock.patch.object(wake_cli, "spend_approval") as spend, \
+             mock.patch.object(wake_cli, "principal_for", return_value="-"), \
+             mock.patch.object(wake_cli, "inspect_continuation", return_value=9999999999999):
+            err, _ = self.set_(["in", "1m", "--approval", "a-0000aaaa", "-p", words, "--note", "t-9", "--continuation", "cont-" + "e" * 64])
+        self.assertIn("can't ride", err or "")
+        spend.assert_not_called()
+
     def test_a_standing_job_is_set_once_at_a_time(self):
         words = "rotate the backups <!-- house: local -->"
         with tempfile.TemporaryDirectory() as td, \
@@ -683,7 +700,10 @@ class AgentWakes(unittest.TestCase):
                  "standing": "s-0123abcd", "for": "owner"}
         entry["standing_digest"] = wake_cli.hashlib.sha256(entry["prompt"].encode()).hexdigest()
         entry["standing_target"] = "ada:" + entry["standing_digest"][:16]
-        for state, runs in (("on", True), ("off", False), ("none", False), (None, False), ("changed", False)):
+        # Also as a retry after a 5xx kept its delivery body (fresh read of loom-clock#24): still checked.
+        kept = {"id": "w-bbbbbb", "agent": "ada", "venue": "wake", "place": "wake:w-bbbbbb", "label": "x", "from": {"kind": "schedule"},
+                "kind": "wake", "at": "2026-01-01T00:00:00.000Z", "text": "do it", "local": True}
+        for state, runs, retried in [(st, r, rt) for st, r in (("on", True), ("off", False), ("none", False), (None, False), ("changed", False)) for rt in (False, True)]:
             with tempfile.TemporaryDirectory() as td, \
                  mock.patch.dict(wake_cli.os.environ, {"WAKE_FIRE": "mixed"}), \
                  mock.patch.object(wake_cli, "WAKE_DIR", Path(td)), \
@@ -699,14 +719,16 @@ class AgentWakes(unittest.TestCase):
                 dispatch.return_value.stdout = ""
                 # A pending wake whose words aren't the job's any more (edited on the host): never run.
                 e = {**entry, "prompt": "something else <!-- house: local -->"} if state == "changed" else entry
+                if retried:
+                    e = {**e, "delivery": kept, "fails": 1}
                 if state == "changed":
                     run.return_value = subprocess.CompletedProcess([], 0, "on\n", "")
                 (Path(td) / "spool.jsonl").write_text(wake_cli.json.dumps(e) + "\n")
                 wake_cli.cmd_fire(mock.Mock(id="w-aaaaaa"))
                 checks = [c.args[0] for c in run.call_args_list if "standing" in c.args[0]]
                 if state != "changed":
-                    self.assertEqual(checks[0][checks[0].index("standing"):][:3], ["standing", "--check", "s-0123abcd"], state)
-                self.assertEqual(delivered.called, runs, state)
+                    self.assertEqual(checks[0][checks[0].index("standing"):][:3], ["standing", "--check", "s-0123abcd"], (state, retried))
+                self.assertEqual(delivered.called, runs, (state, retried))
                 dispatch.assert_not_called()
                 if runs:
                     self.assertIs(delivered.call_args.kwargs["local"], True)
@@ -810,6 +832,162 @@ class Delivery(unittest.TestCase):
     "Delivery"), with the clock's own token; WAKE_DELIVERY=spawn keeps the old path."""
 
     base = {"id": "w-cccccc", "kind": "wake", "at": "2026-01-01 00:00:00", "note": "t-9 round 2", "model": "m", "created": "x"}
+
+    def test_real_kill_after_http_acceptance_replays_sealed_firing(self):
+        import signal
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        accepted, release = threading.Event(), threading.Event()
+        received = []
+
+        class Receiver(BaseHTTPRequestHandler):
+            def do_POST(self):
+                received.append(self.rfile.read(int(self.headers["Content-Length"])))
+                accepted.set()
+                if len(received) == 1:
+                    release.wait(10)
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(b'{"body":"started"}')
+                except BrokenPipeError:
+                    pass
+
+            def log_message(self, *args):
+                pass
+
+        with tempfile.TemporaryDirectory() as td, HTTPServer(("127.0.0.1", 0), Receiver) as server:
+            root = Path(td)
+            token = root / "token"
+            token.write_text("clock-test")
+            entry = dict(self.base, prompt="original words", continuation={"handle": "cont-" + "b" * 64, "expiresAt": 9999999999999, "wake": self.base["id"]})
+            with mock.patch.multiple(wake_cli, WAKE_DIR=root, SPOOL=root / "spool.jsonl", LOCK=root / "spool.lock", LOG=root / "wake.log"), \
+                 mock.patch.object(wake_cli, "arm_timer"), mock.patch.object(wake_cli, "ensure_deadman"), \
+                 mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "fire_mode", return_value="house"), \
+                 mock.patch.object(wake_cli, "paused", return_value=False), \
+                 mock.patch.dict(os.environ, {"WAKE_DELIVER_TOKEN_FILE": str(token), "WAKE_LOOM_URL": f"http://127.0.0.1:{server.server_port}"}):
+                with wake_cli.Spool() as spool:
+                    spool.entries.append(entry)
+
+                def start():
+                    # A new interpreter, with no inherited Python locks or mocked HTTP client.
+                    code = """
+import argparse, sys, types
+from pathlib import Path
+from unittest import mock
+m = types.ModuleType('clock_child')
+m.__file__ = sys.argv[1]
+exec(compile(Path(m.__file__).read_text(), m.__file__, 'exec'), m.__dict__)
+r = Path(sys.argv[2])
+with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.lock', LOG=r/'wake.log'), mock.patch.object(m, 'arm_timer'), mock.patch.object(m, 'ensure_deadman'), mock.patch.object(m, 'hand_over_principal'), mock.patch.object(m, 'fire_mode', return_value='house'), mock.patch.object(m, 'paused', return_value=False):
+    m.cmd_fire(argparse.Namespace(id=sys.argv[3]))
+"""
+                    return subprocess.Popen([sys.executable, "-c", code, str(SCRIPT), str(root), entry["id"]])
+
+                first = start()
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    self.assertTrue(accepted.wait(10), "first real HTTP request never arrived")
+                    first.kill()
+                    first.wait(timeout=10)
+                    pending = json.loads((root / "spool.jsonl").read_text())
+                    self.assertEqual(pending["delivery"], json.loads(received[0]))
+                    with wake_cli.Spool() as spool:
+                        recovered = spool.entries[0]
+                        recovered["prompt"] = "changed after crash"
+                        self.assertEqual(wake_cli.arm_pending(recovered), wake_cli.arm_timer.return_value)
+                        self.assertNotEqual(recovered["id"], entry["id"])
+                        entry["id"] = recovered["id"]
+                    self.assertEqual(recovered["delivery"], pending["delivery"])
+                    release.set()
+                    second = start()
+                    self.assertEqual(second.wait(timeout=10), 0)
+                    self.assertEqual(len(received), 2)
+                    self.assertEqual(received[0], received[1])
+                    self.assertEqual(json.loads(received[1])["continuation"], entry["continuation"])
+                    self.assertEqual((root / "spool.jsonl").read_text(), "")
+                finally:
+                    release.set()
+                    server.shutdown()
+                    thread.join(5)
+
+    def test_continuation_inspection_requires_runtime_deadline_before_any_commit(self):
+        handle = "cont-" + "a" * 64
+        when = wake_cli.datetime.now() + wake_cli.timedelta(hours=1)
+        deadline = int(when.timestamp() * 1000) + 1
+        good = {"handle": handle, "expiresAt": deadline}
+        with mock.patch.dict(os.environ, {"WAKE_PRINCIPAL_STATEMENT": "signed-issuer"}), \
+             mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(good))) as call:
+            self.assertEqual(wake_cli.inspect_continuation(handle, when), deadline)
+            self.assertEqual(call.call_args.kwargs["input"], "signed-issuer")
+            for bad in [{**good, "expiresAt": deadline - 1}, {**good, "expiresAt": str(deadline)},
+                        {**good, "handle": "other"}, {}]:
+                call.return_value.stdout = json.dumps(bad)
+                with self.assertRaises(SystemExit):
+                    wake_cli.inspect_continuation(handle, when)
+        args = mock.Mock(prompt="continue", prompt_file=None, note="follow up", model="m", slot="", approval="", place="", continuation=handle)
+        with mock.patch.object(wake_cli, "inspect_continuation", side_effect=SystemExit("refused")), \
+             mock.patch.object(wake_cli, "Spool") as spool, mock.patch.object(wake_cli, "arm_timer") as timer:
+            with self.assertRaises(SystemExit):
+                wake_cli.cmd_set(args, when)
+            spool.assert_not_called()
+            timer.assert_not_called()
+
+    def test_continuation_firing_holds_legacy_expired_and_changed_deadlines(self):
+        now = int(wake_cli.datetime.now().timestamp() * 1000)
+        for deadline in [None, now, now - 1, str(now + 999999)]:
+            entry = {**self.base, "continuation": {"handle": "cont-" + "a" * 64, "wake": self.base["id"], "expiresAt": deadline}}
+            with mock.patch.object(wake_cli, "post_delivery") as post, mock.patch.object(wake_cli, "log"):
+                wake_cli.deliver_wake(entry, "continue", "art", False)
+                post.assert_not_called()
+        grant = {"handle": "cont-" + "a" * 64, "wake": self.base["id"], "expiresAt": now + 999999}
+        entry = {**self.base, "continuation": grant, "delivery": {"continuation": {**grant, "expiresAt": now + 999998}}}
+        with mock.patch.object(wake_cli, "post_delivery") as post, mock.patch.object(wake_cli, "log"):
+            wake_cli.deliver_wake(entry, "continue", "art", False)
+            post.assert_not_called()
+
+    def test_setting_a_continuation_persists_opaque_handle_and_rejects_shared_places(self):
+        handle = "cont-" + "a" * 64
+        args = mock.Mock(prompt="continue", prompt_file=None, note="follow up", model="m", slot="", approval="", place="", park_on="", continuation=handle)
+        with tempfile.TemporaryDirectory() as td, \
+             mock.patch.object(wake_cli, "SPOOL", Path(td) / "spool.jsonl"), \
+             mock.patch.object(wake_cli, "LOCK", Path(td) / "spool.lock"), \
+             mock.patch.object(wake_cli, "LOG", Path(td) / "wake.log"), \
+             mock.patch.object(wake_cli, "arm_timer", return_value="armed"), \
+             mock.patch.object(wake_cli, "inspect_continuation", return_value=9999999999999):
+            wake_cli.cmd_set(args, wake_cli.datetime.now())
+            entries = [json.loads(l) for l in (Path(td) / "spool.jsonl").read_text().splitlines()]
+            entry = next(e for e in entries if e.get("continuation"))
+            self.assertEqual(entry["continuation"], {"handle": handle, "wake": entry["id"], "expiresAt": 9999999999999})
+            args.place = "alert:shared"
+            with self.assertRaises(SystemExit):
+                wake_cli.cmd_set(args, wake_cli.datetime.now())
+            args.place = ""
+            args.continuation = "cv-0123456789ab"
+            with self.assertRaises(SystemExit):
+                wake_cli.cmd_set(args, wake_cli.datetime.now())
+
+    def test_opaque_continuation_survives_retry_without_authority_from_origin(self):
+        grant = {"handle": "cont-" + "a" * 64, "expiresAt": 9999999999999, "wake": self.base["id"]}
+        entry = {**self.base, "continuation": grant, "for_in": "cv-0123456789ab"}
+        bodies = []
+        def post(body):
+            bodies.append(json.loads(json.dumps(body)))
+            return (503, {"error": "busy"}) if len(bodies) == 1 else (200, {"body": "queued"})
+        with mock.patch.object(wake_cli, "post_delivery", side_effect=post), \
+             mock.patch.object(wake_cli, "hand_over_principal"), \
+             mock.patch.object(wake_cli, "retry", side_effect=lambda e, *a: e.update(id="w-999999")), \
+             mock.patch.object(wake_cli, "log"):
+            wake_cli.deliver_wake(entry, "continue", "art", False)
+            wake_cli.deliver_wake(entry, "changed prompt must not change retry", "art", False)
+        self.assertEqual(bodies[0], bodies[1])
+        self.assertEqual(bodies[0]["continuation"], grant)
+        entry = {**self.base, "for_in": "cv-0123456789ab"}
+        with mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"body": "queued"})) as post, \
+             mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "log"):
+            wake_cli.deliver_wake(entry, "continue", "art", False)
+        self.assertNotIn("continuation", post.call_args.args[0])
 
     def test_delivery_hands_over_parent_conversation_only_for_one_off_continuations(self):
         for extra, expected in [({}, "cv-0123456789ab"), ({"kind": "schedule", "schedule": "nightly"}, None)]:
@@ -1249,6 +1427,68 @@ class Clocks(unittest.TestCase):
         self.assertEqual([e["kind"] for e in self.spool()], ["wake"])
         self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", str(self.lane))
         self.assertEqual([e["kind"] for e in self.spool()], ["schedule"])
+
+    def test_a_plain_wake_is_removed_before_it_fires_and_an_unexpected_failure_is_not_replayed(self):
+        # Review of loom-clock#24: only a continuation firing is retained for exact replay. A plain wake keeps
+        # at-most-once (gone from the spool before dispatch), and an unexpected exception drops the firing
+        # instead of leaving it for keep_armed to re-arm with its past time, in a loop.
+        self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", str(self.lane))
+        first = self.spool()[0]
+        seen = []
+        def dispatch(*a, **k):
+            seen.append([e for e in self.spool() if e["id"] == first["id"] or e.get("_firing")])
+            raise RuntimeError("bug after dispatch")
+        with mock.patch.object(wake_cli.subprocess, "run") as prime, mock.patch.object(wake_cli, "dispatch", side_effect=dispatch):
+            prime.return_value.returncode = 0
+            with self.assertRaises(RuntimeError):
+                wake_cli.cmd_fire(mock.Mock(id=first["id"]))
+        self.assertEqual(seen, [[]], "removed before it fired")
+        self.assertFalse(any(e.get("_firing") for e in self.spool()))
+        self.assertIn("fire-failed", self.wake_log())
+        cont = {"id": "w-c0ffee", "kind": "wake", "at": "2026-01-01 00:00:00", "prompt": "p", "created": "x",
+                "continuation": {"handle": "cont-" + "a" * 64, "wake": "w-c0ffee", "expiresAt": 9999999999999}}
+        with wake_cli.Spool() as sp:
+            sp.entries.append(cont)
+        def retained_then_bug(args):
+            with wake_cli.Spool() as sp:
+                for e in sp.entries:
+                    if e["id"] == args.id:
+                        e["_firing"] = args.id
+            raise RuntimeError("bug")
+        with mock.patch.object(wake_cli, "_cmd_fire", side_effect=retained_then_bug):
+            with self.assertRaises(RuntimeError):
+                wake_cli.cmd_fire(mock.Mock(id="w-c0ffee"))
+        self.assertFalse(any(e["id"] == "w-c0ffee" or e.get("_firing") for e in self.spool()), "dropped, not looped")
+
+    def test_a_failed_continuation_wake_is_not_retried_and_old_fire_locks_are_pruned(self):
+        cont = {"id": "w-c0ffe1", "kind": "wake", "at": "2026-01-01 00:00:00", "prompt": "p", "created": "x",
+                "continuation": {"handle": "cont-" + "a" * 64, "wake": "w-c0ffe1", "expiresAt": 9999999999999}}
+        with mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"body": "failed", "reason": "already bound to another firing"})), \
+             mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "retry") as retry:
+            wake_cli.deliver_wake(dict(cont), "p", "ada", False)
+        retry.assert_not_called()
+        self.assertIn("not retried", self.wake_log())
+        old = self.td / "clocks" / "ada" / "w-0ld0ld.fire.lock"
+        old.parent.mkdir(parents=True, exist_ok=True)
+        old.write_text("")
+        os.utime(old, (0, 0))
+        fresh = self.td / "clocks" / "ada" / "w-fre5h0.fire.lock"
+        fresh.write_text("")
+        wake_cli.prune_fire_locks()
+        self.assertFalse(old.exists())
+        self.assertTrue(fresh.exists())
+
+    def test_a_continuation_wake_out_of_quota_still_waits_for_the_reset(self):
+        cont = {"id": "w-c0ffe2", "kind": "wake", "at": "2026-01-01 00:00:00", "prompt": "p", "created": "x",
+                "continuation": {"handle": "cont-" + "a" * 64, "wake": "w-c0ffe2", "expiresAt": 9999999999999}}
+        with mock.patch.object(wake_cli, "post_delivery", return_value=(200, {"body": "failed", "code": "quota", "retryAfter": 60})), \
+             mock.patch.object(wake_cli, "hand_over_principal"), mock.patch.object(wake_cli, "defer_quota") as defer:
+            wake_cli.deliver_wake(dict(cont), "p", "ada", False)
+        defer.assert_called_once()
+
+    def test_a_continuation_refuses_a_lane_file(self):
+        self.assertIn("-f", self.cli("in", "1h", "-f", str(self.lane), "--continuation", "cont-" + "c" * 64) or "")
+        self.assertEqual(self.spool(), [])
 
     def test_firing_an_occurrence_arms_the_next_first_and_a_retry_is_a_one_off(self):
         self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", str(self.lane))
