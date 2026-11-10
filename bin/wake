@@ -2411,7 +2411,8 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
             return None
     body = entry.get("delivery")
     if body and not house_may_join(entry, body.get("place")):
-        # Sealed before t-2117 at a lane a house's wake may not join: built again, as its own conversation.
+        # Sealed before t-2117 at a lane a house's wake may not join: built again for its own conversation. (One loom
+        # already recorded under this id keeps its first answer: those words went before this rule, and nothing new goes.)
         entry.pop("deliver_place", None)
         body = None
     if not body:
