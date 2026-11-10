@@ -1610,6 +1610,12 @@ def cmd_schedule(args):
         entry["for"] = narrower(entry_for(scheds[args.name]), principal_for())
         if entry["for"] != entry_for(scheds[args.name]):
             entry.pop("for_in", None)
+        if caller:
+            # Run from a house, it's said from the caller's own conversation, never the schedule's (t-2117): wake_place
+            # joins the lane's conversation only from that one.
+            entry.pop("for_in", None)
+            if principal_in():
+                entry["for_in"] = principal_in()
         with Spool() as spool:
             if sum(1 for e in spool.entries if e["kind"] == "wake") >= MAX_PENDING:
                 sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
@@ -2282,6 +2288,39 @@ def loom_api():
 
 
 PLACE = re.compile(r"[a-z][a-z0-9-]{0,31}:[A-Za-z0-9][A-Za-z0-9._@:/-]{0,159}")
+CV = re.compile(r"cv-[0-9a-f]{12}")
+
+
+def places_path():
+    return WAKE_DIR / "places.json"
+
+
+def known_places():
+    """The conversation each lane place was last delivered into, as the runtime answered this clock: {place: cv}."""
+    try:
+        d = json.loads(places_path().read_text())
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in d.items() if isinstance(k, str) and isinstance(v, str) and CV.fullmatch(v)} if isinstance(d, dict) else {}
+
+
+def remember_place(place, cv):
+    """Keep the conversation a lane place's delivery went to (the runtime's answer to this clock's own post)."""
+    if not (isinstance(place, str) and place.startswith("lane:") and isinstance(cv, str) and CV.fullmatch(cv)):
+        return
+    try:
+        WAKE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(WAKE_DIR / "places.lock", "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            d = known_places()
+            if d.get(place) == cv:
+                return
+            d[place] = cv
+            tmp = places_path().with_suffix(".tmp")
+            tmp.write_text(json.dumps(d, sort_keys=True))
+            os.replace(tmp, places_path())
+    except OSError as e:
+        log("places-fail", f"couldn't keep {place}'s conversation: {e.strerror}")
 
 
 def wake_place(entry, local=False):
@@ -2290,6 +2329,9 @@ def wake_place(entry, local=False):
     schedule, else the lane file; `local-lane:<name>` for its runs on loom's machine (a conversation's bodies run in
     one place, and a lane can move). Anything else is its own: `wake:<id>`, by the id it was first fired under."""
     if entry.get("deliver_place"):
+        # One kept from before t-2117 that a house's wake may not have: its own conversation instead.
+        if not house_may_join(entry, entry["deliver_place"]):
+            return f"wake:{entry['id']}"
         return entry["deliver_place"]
     if entry.get("place"):
         return entry["place"]
@@ -2297,8 +2339,23 @@ def wake_place(entry, local=False):
     if not name and (entry.get("lane") or entry.get("prompt_file")):
         name = Path(entry.get("lane") or entry["prompt_file"]).stem
     if name:
-        return f"{'local-lane' if local else 'lane'}:{name}"[:200]
+        place = f"{'local-lane' if local else 'lane'}:{name}"[:200]
+        # One set from a house (t-2117) names its lane or schedule itself, so it joins that lane's conversation only
+        # when it was set from that same conversation (the one its verified statement was for: a lane's run re-arming
+        # itself). From any other, it's its own: a body never feeds its words to another conversation's body.
+        return place if local or house_may_join(entry, place) else f"wake:{entry['id']}"
     return f"wake:{entry['id']}"
+
+
+def house_may_join(entry, place):
+    """Whether a wake may land at `place` (t-2117). One set from a house (`origin`) names its lane or schedule itself, so it
+    joins a lane's conversation only when it was set from that same conversation: its verified statement's (`for_in`),
+    the one the runtime last delivered that place into (a lane re-arming itself). From any other, or unproven, it's its
+    own conversation: a body never feeds words to another conversation's body by naming its lane. A lane set from a
+    house that the clock never delivered to runs fresh each time (no house seeds a lane's conversation)."""
+    if not entry.get("origin") or not str(place).startswith("lane:"):
+        return True
+    return bool(entry.get("for_in")) and known_places().get(place) == entry["for_in"]
 
 
 def wake_label(entry):
@@ -2353,6 +2410,11 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
             log("fire-refused", f"{entry['id']} continuation expired, legacy, or changed; not delivered")
             return None
     body = entry.get("delivery")
+    if body and not house_may_join(entry, body.get("place")):
+        # Sealed before t-2117 at a lane a house's wake may not join: built again for its own conversation. (One loom
+        # already recorded under this id keeps its first answer: those words went before this rule, and nothing new goes.)
+        entry.pop("deliver_place", None)
+        body = None
     if not body:
         # A local wake says so in the contract's own field (`local: true`), never by the words: its marker is this
         # clock's input syntax only, and goes. The runtime trusts the field from this piece alone.
@@ -2377,6 +2439,8 @@ def deliver_wake(entry, prompt, agent, auto, local=False):
     err = str(ans.get("error") or ans.get("reason") or "")[:200]
     # What every retry keeps: the conversation it belongs to.
     entry["deliver_place"], entry["deliver_label"] = body["place"], body["label"]
+    if status == 200 and isinstance(ans, dict):
+        remember_place(body["place"], ans.get("conversation"))
     via = "" if body["id"] == entry["id"] else f" as {body['id']}"
     if status == 200 and ans.get("body") in BODY_STATES:
         why = f" ({str(ans['reason'])[:120]})" if ans.get("reason") else ""
