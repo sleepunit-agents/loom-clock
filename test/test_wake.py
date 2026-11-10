@@ -3339,6 +3339,99 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         # A local body on loom's machine (no API caller): no --house.
         self.assertIsNone(wake_cli.caller_house())
 
+    def test_a_house_changes_only_what_its_own_conversation_set(self):
+        # t-2131: over the API, a schedule or wake is replaced, removed or cancelled only by the conversation that set
+        # it (the runtime's word, from its own house); the owner's own (set here, or on his page) never.
+        here = dict(over_api=False)
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        # Another conversation, its body working for Loren: never another's. (One working for the owner may: below.)
+        other = dict(statement="stmt-b", answer={**self.verified("ada", "loren"), "conversation": "cv-bbbbbbbbbbbb"})
+        owners_body = dict(statement="stmt-c", answer={**self.verified("ada", "jonathan-barket", True), "conversation": "cv-cccccccccccc"})
+        self.assertIsNone(self.cli("schedule", "set", "nightly", "--at", "22:44", "-p", "the owner's", **here))
+        owners = [e["id"] for e in self.spool() if e.get("schedule") == "nightly"][0]
+        for argv in (("schedule", "set", "nightly", "--at", "03:00", "-p", "mine now"), ("schedule", "rm", "nightly"), ("cancel", owners)):
+            err = self.cli(*argv, **mine)
+            self.assertIn("wasn't set from this conversation", err or "", argv)
+        self.assertEqual(wake_cli.load_schedules()["nightly"]["prompt"], "the owner's")
+        self.assertIn(owners, [e["id"] for e in self.spool()])
+        # One a house set: its own conversation changes it; another conversation, or no statement, doesn't.
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:00", "-p", "a", **mine))
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:30", "-p", "b", **mine))
+        self.assertIn("wasn't set from this conversation", self.cli("schedule", "rm", "mine", **other) or "")
+        self.assertIn("wasn't set from this conversation", self.cli("schedule", "rm", "mine") or "")
+        self.assertIsNone(self.cli("in", "1h", "-p", "later", "--note", "t-1 r1", **mine))
+        w = self.spool()[-1]["id"]
+        self.assertIn("wasn't set from this conversation", self.cli("cancel", w, **other) or "")
+        self.assertIsNone(self.cli("cancel", w, **mine))
+        # A body working for the owner in another conversation (a lane's own run, retiring its schedule) may.
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "06:00", "-p", "c", **owners_body))
+        self.assertIsNone(self.cli("schedule", "rm", "mine", **owners_body))
+        # But the owner's own stays his, whoever the body works for.
+        self.assertIn("wasn't set from this conversation", self.cli("schedule", "rm", "nightly", **owners_body) or "")
+        # The owner here changes anything, as ever.
+        self.assertIsNone(self.cli("schedule", "rm", "nightly", **here))
+
+    def test_a_house_s_schedule_never_displaces_another_s_wake_for_the_same_lane(self):
+        # t-2131 cold review: a new schedule replaced every pending one-off wake for its lane file, the owner's too.
+        lane = wake_cli.REPO / "routines" / "reflect.md"
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        with mock.patch.object(wake_cli, "lane_file", return_value=lane), mock.patch.object(wake_cli.Path, "is_file", return_value=True):
+            self.assertIsNone(self.cli("in", "1h", "-f", str(lane), "--note", "owner's reflect", over_api=False))
+            owners = self.spool()[-1]["id"]
+            self.cli("schedule", "set", "zz", "--at", "23:59", "-f", str(lane), **mine)
+        self.assertIn(owners, [e["id"] for e in self.spool()], "the owner's wake for that lane stays")
+
+    def test_a_house_s_schedule_never_stands_in_for_the_owner_s_re_arm(self):
+        # Fresh read of #34: a house's schedule for the owner's lane answered his re-arm ("already scheduled"), so
+        # removing it killed his lane. Only his own schedule covers his re-arm.
+        lane = wake_cli.REPO / "routines" / "reflect.md"
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        with mock.patch.object(wake_cli, "lane_file", return_value=lane), mock.patch.object(wake_cli.Path, "is_file", return_value=True):
+            self.assertIsNone(self.cli("schedule", "set", "zz", "--at", "00:00,06:00,12:00,18:00", "-f", str(lane), **mine))
+            before = len(self.spool())
+            self.assertIsNone(self.cli("in", "1h", "-f", str(lane), "--note", "reflect re-arm", over_api=False))
+        self.assertEqual(len(self.spool()), before + 1, "the owner's re-arm is armed")
+        self.assertNotIn("origin", self.spool()[-1])
+        # Nor another house's re-arm, when the schedule is another conversation's for someone else.
+        loren = dict(statement="stmt-l", answer={**self.verified("ada", "loren"), "conversation": "cv-dddddddddddd"})
+        with mock.patch.object(wake_cli, "lane_file", return_value=lane), mock.patch.object(wake_cli.Path, "is_file", return_value=True):
+            self.assertIsNone(self.cli("schedule", "set", "yy", "--at", "00:00,06:00,12:00,18:00", "-f", str(lane), **loren))
+            self.cli("schedule", "rm", "zz", **mine)
+            before = len(self.spool())
+            self.assertIsNone(self.cli("in", "1h", "-f", str(lane), "--note", "b's re-arm", **mine))
+        self.assertEqual(len(self.spool()), before + 1, "house B's re-arm is armed, not answered by Loren's yy")
+
+    def test_houses_set_at_most_their_share_of_schedules(self):
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        with mock.patch.object(wake_cli, "MAX_SCHEDULES_API", 2):
+            self.assertIsNone(self.cli("schedule", "set", "a1", "--at", "05:00", "-p", "a", **mine))
+            self.assertIsNone(self.cli("schedule", "set", "a2", "--at", "05:00", "-p", "a", **mine))
+            self.assertIn("have set 2 schedules already", self.cli("schedule", "set", "a3", "--at", "05:00", "-p", "a", **mine) or "")
+            self.assertIsNone(self.cli("schedule", "set", "a2", "--at", "06:00", "-p", "b", **mine), "replacing its own is no new one")
+            self.assertIsNone(self.cli("schedule", "set", "o1", "--at", "05:00", "-p", "a", over_api=False), "the owner's own: no cap")
+
+    def test_one_conversation_holds_at_most_its_share_of_the_spool(self):
+        mine = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        other = dict(statement="stmt-b", answer={**self.verified("ada", "jonathan-barket", True), "conversation": "cv-bbbbbbbbbbbb"})
+        with mock.patch.object(wake_cli, "MAX_PENDING_API", 2):
+            self.assertIsNone(self.cli("in", "1h", "-p", "a", "--note", "t-1", **mine))
+            self.assertIsNone(self.cli("in", "1h", "-p", "b", "--note", "t-1", **mine))
+            self.assertIn("this conversation has 2 one-off wakes pending already", self.cli("in", "1h", "-p", "c", "--note", "t-1", **mine) or "")
+            self.assertIsNone(self.cli("in", "1h", "-p", "d", "--note", "t-1", **other))
+            self.assertIsNone(self.cli("in", "1h", "-p", "e", "--note", "t-1", over_api=False), "the owner's own: the clock's cap only")
+        with mock.patch.object(wake_cli, "MAX_PENDING_API_ALL", 3):
+            third = dict(statement="stmt-c", answer={**self.verified("ada", "jonathan-barket", True), "conversation": "cv-cccccccccccc"})
+            self.assertIn("houses have 3 one-off wakes pending already", self.cli("in", "1h", "-p", "f", "--note", "t-1", **third) or "")
+            self.assertIsNone(self.cli("in", "1h", "-p", "g", "--note", "t-1", over_api=False), "the owner keeps his room")
+
+    def test_a_schedule_narrowed_on_a_re_set_stays_its_conversation_s(self):
+        mine_owner = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
+        mine_loren = dict(statement="stmt-a2", answer=self.verified("ada", "loren"))
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:00", "-p", "a", **mine_loren))
+        self.assertIsNone(self.cli("schedule", "set", "mine", "--at", "05:30", "-p", "b", **mine_owner))
+        self.assertEqual(wake_cli.load_schedules()["mine"]["for"], "loren")
+        self.assertIsNone(self.cli("schedule", "rm", "mine", **mine_owner), "still this conversation's to remove")
+
     def test_a_park_is_for_whom_its_body_works_too(self):
         with mock.patch.object(wake_cli, "approval_card", return_value=None):
             self.assertIsNone(self.cli("park", "--on", "a-0000aaaa", "-p", "next", "--note", "t-1 r2",
