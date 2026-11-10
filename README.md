@@ -59,6 +59,14 @@ inline prompt.
   this clock filed no wake for is refused before anything is spent (filed
   words only: the approval's key is a short hash of them). This needs the
   [approvals piece](https://github.com/sleepunit-agents/loom-approvals).
+- **Standing jobs.** When the owner said **Allow every time** on a local
+  wake's card (t-2013), the clock sets that job again with no card: before
+  filing one it asks approvals for a standing job for exactly that agent,
+  words and principal (`approvals standing`). The wake is the owner's work
+  (`for: owner`, `standing: s-…`, `set_for` keeps whom the body acted for),
+  and its note is the clock's own, not the body's. It fires only while the
+  job is still on (`approvals standing --check`): one the owner turned off
+  since is dropped and logged (`fire-refused`).
 - **Parking.** A body blocked on the owner's answer (a secret request `q-…`
   from loom-secrets, an approval `a-…`) parks instead of polling: the clock
   checks the request every 5 minutes with no body running, and wakes the

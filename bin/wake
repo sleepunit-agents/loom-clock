@@ -832,7 +832,17 @@ def cmd_set(args, when):
         # With --approval the approval is spent here too (on loom's machine as well), so one Allow runs it once.
         if (origin or getattr(args, "approval", "")) and HOUSE_LOCAL in args.prompt:
             target = f"{AGENT}:{hashlib.sha256(args.prompt.encode()).hexdigest()[:16]}"
-            if not getattr(args, "approval", ""):
+            sid = None if getattr(args, "approval", "") or getattr(args, "park_on", "") else standing_job(target)
+            if sid:
+                # The owner's Allow every time for exactly these words, this agent and whom it's set for (t-2013): set
+                # with no card, as his work ("runs on this box as me"). The note is the clock's own, never the body's:
+                # it's read into the session's opening words, and his yes was for the words that run, not new ones.
+                log("standing-set", f"{sid} target={target} set_for={entry['for']} note={args.note!r}")
+                entry["standing"], entry["set_for"] = sid, entry["for"]
+                for k in ("for_why", "for_people"):
+                    entry.pop(k, None)
+                entry["for"], entry["note"] = "owner", f"standing job {sid}, allowed every time by the owner"
+            elif not getattr(args, "approval", ""):
                 # The clock files the ask itself, with the prompt as its words: the owner approves what
                 # will run, not the body's own description of it.
                 body = args.prompt.replace(HOUSE_LOCAL, "").strip()
@@ -852,10 +862,11 @@ def cmd_set(args, when):
                            f"(wake park --on {aid} -p \"<what to do next>\" --note …) and end: once it's allowed, the "
                            f"continuation sets it with `wake in 1m --approval {aid}`, no -p, and the clock uses these exact words."
                          + " Most work needs no host: a house can do it.")
-            no = spend_approval(args.approval, "local-wake", target)
-            if no:
-                sys.exit(f"wake: approval {args.approval} isn't allowed for this local wake: {no}")
-            entry["local_approval"] = args.approval
+            else:
+                no = spend_approval(args.approval, "local-wake", target)
+                if no:
+                    sys.exit(f"wake: approval {args.approval} isn't allowed for this local wake: {no}")
+                entry["local_approval"] = args.approval
     elif AGENT != LOCAL_AGENT:
         # Another agent's lane files are in its own repo, not here: the house reads it.
         if not re.fullmatch(r"[A-Za-z0-9._/-]{1,200}\.md", args.prompt_file) or ".." in args.prompt_file.split("/"):
@@ -1955,6 +1966,37 @@ def file_approval(kind, target, what, why, plain=None):
     sys.exit(f"wake: couldn't ask the owner: {(r.stderr or r.stdout).strip()[:600]}")
 
 
+def standing_job(target):
+    """The owner's standing job (Allow every time, t-2013) for this local wake: its id (s-…), or None, so it asks. Asked
+    for the body this runs for, on whose behalf it sets it, exactly as a card would be filed: anything the piece can't
+    say is no standing job (it fails closed, to a card)."""
+    caller = os.environ.get("WAKE_CALLER", "").strip()
+    if not caller:
+        return None
+    argv = [*approvals_argv(), "standing", "--kind", "local-wake", "--target", target, "--as", caller,
+            "--on-behalf", principal_for()]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=8,
+                           env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.match(r"(s-[0-9a-f]{8}): standing", r.stdout or "")
+    return m.group(1) if r.returncode == 0 and m else None
+
+
+def standing_still_on(entry):
+    """Whether the standing job a wake was set under is still on, asked as the house that set it: the owner may have
+    turned it off since. Anything but "on" (off, gone, the piece unreadable) doesn't run it."""
+    argv = [*approvals_argv(), "standing", "--check", entry["standing"], "--as",
+            json.dumps({"kind": "agent", "agent": entry["origin"].split(":", 1)[1], "house": "loom's clock"})]
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=8,
+                           env={k: v for k, v in os.environ.items() if k not in ("HOUSE_ID", "WAKE_CALLER")})
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and r.stdout.strip() == "on"
+
+
 def spend_approval(aid, kind, target):
     """Spend an approval (loom's approvals piece) for the body this runs for: over the clock's
     piece API that's the caller loom named (WAKE_CALLER); run here, loom's machine.
@@ -2285,6 +2327,13 @@ def cmd_fire(args):
     # An agent's own wake never runs as a session on loom's machine.
     # Another agent's clock, or an agent's own wake: always a house, never a session here.
     mode = "house" if origin or AGENT != LOCAL_AGENT else fire_mode()
+    if entry.get("standing"):
+        # Set under the owner's standing job (t-2013): it runs, as his work, only while that's still on.
+        if not entry.get("origin") or not standing_still_on(entry):
+            log("fire-refused", f"{entry['id']}: standing job {entry['standing']} is off (or can't be read); not run")
+            return
+        if AGENT == LOCAL_AGENT:
+            mode = "local"
     if entry.get("local_approval") and AGENT == LOCAL_AGENT:
         mode = "local"  # the owner allowed this one wake on loom's machine (cmd_set)
     if mode == "mixed":
