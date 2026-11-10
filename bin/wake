@@ -849,8 +849,8 @@ def cmd_set(args, when):
     if continuation:
         if not re.fullmatch(r"cont-[0-9a-f]{64}", continuation):
             sys.exit("wake: --continuation is an opaque runtime capability")
-        if args.slot or getattr(args, "place", ""):
-            sys.exit("wake: a continuation needs its own delivered conversation, without --slot or --place")
+        if args.slot or getattr(args, "place", "") or getattr(args, "prompt_file", None):
+            sys.exit("wake: a continuation needs its own delivered conversation, without --slot, --place or -f")
         entry["continuation"] = {"handle": continuation, "wake": entry["id"],
                                  "expiresAt": inspect_continuation(continuation, when)}
     origin = os.environ.get("WAKE_ORIGIN", "").strip()
@@ -2378,6 +2378,12 @@ def cmd_fire(args):
         except SystemExit:
             finish_firing(args.id)
             raise
+        except Exception as e:
+            # An unexpected failure is not a crash to replay: re-arming it would fire the
+            # same past entry again at once, in a loop. Drop the firing and say so.
+            log("fire-failed", f"{args.id}: {type(e).__name__}: {str(e)[:200]}; not retried")
+            finish_firing(args.id)
+            raise
         finish_firing(args.id)
 
 
@@ -2413,7 +2419,10 @@ def _cmd_fire(args):
             entry["held"] = True
             log("fire-held", f"{entry['id']} paused")
             return
-        if entry.get("kind") in ("wake", "schedule", "deadman"):
+        # Only a continuation firing is retained for exact replay (its report authority is
+        # bound to that one sealed delivery). Every other entry keeps the old at-most-once
+        # rule: removed before it fires, so a crash never fires it twice.
+        if entry.get("kind") == "wake" and entry.get("continuation"):
             entry["_firing"] = args.id
             # A detached copy: changes become durable only through Spool's atomic commit.
             entry = json.loads(json.dumps(entry))

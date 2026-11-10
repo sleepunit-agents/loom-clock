@@ -1406,6 +1406,42 @@ class Clocks(unittest.TestCase):
         self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", str(self.lane))
         self.assertEqual([e["kind"] for e in self.spool()], ["schedule"])
 
+    def test_a_plain_wake_is_removed_before_it_fires_and_an_unexpected_failure_is_not_replayed(self):
+        # Review of loom-clock#24: only a continuation firing is retained for exact replay. A plain wake keeps
+        # at-most-once (gone from the spool before dispatch), and an unexpected exception drops the firing
+        # instead of leaving it for keep_armed to re-arm with its past time, in a loop.
+        self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", str(self.lane))
+        first = self.spool()[0]
+        seen = []
+        def dispatch(*a, **k):
+            seen.append([e for e in self.spool() if e["id"] == first["id"] or e.get("_firing")])
+            raise RuntimeError("bug after dispatch")
+        with mock.patch.object(wake_cli.subprocess, "run") as prime, mock.patch.object(wake_cli, "dispatch", side_effect=dispatch):
+            prime.return_value.returncode = 0
+            with self.assertRaises(RuntimeError):
+                wake_cli.cmd_fire(mock.Mock(id=first["id"]))
+        self.assertEqual(seen, [[]], "removed before it fired")
+        self.assertFalse(any(e.get("_firing") for e in self.spool()))
+        self.assertIn("fire-failed", self.wake_log())
+        cont = {"id": "w-c0ffee", "kind": "wake", "at": "2026-01-01 00:00:00", "prompt": "p", "created": "x",
+                "continuation": {"handle": "cont-" + "a" * 64, "wake": "w-c0ffee", "expiresAt": 9999999999999}}
+        with wake_cli.Spool() as sp:
+            sp.entries.append(cont)
+        def retained_then_bug(args):
+            with wake_cli.Spool() as sp:
+                for e in sp.entries:
+                    if e["id"] == args.id:
+                        e["_firing"] = args.id
+            raise RuntimeError("bug")
+        with mock.patch.object(wake_cli, "_cmd_fire", side_effect=retained_then_bug):
+            with self.assertRaises(RuntimeError):
+                wake_cli.cmd_fire(mock.Mock(id="w-c0ffee"))
+        self.assertFalse(any(e["id"] == "w-c0ffee" or e.get("_firing") for e in self.spool()), "dropped, not looped")
+
+    def test_a_continuation_refuses_a_lane_file(self):
+        self.assertIn("-f", self.cli("in", "1h", "-f", str(self.lane), "--continuation", "cont-" + "c" * 64) or "")
+        self.assertEqual(self.spool(), [])
+
     def test_firing_an_occurrence_arms_the_next_first_and_a_retry_is_a_one_off(self):
         self.cli("schedule", "set", "nightly", "--at", "22:44", "-f", str(self.lane))
         first = self.spool()[0]
