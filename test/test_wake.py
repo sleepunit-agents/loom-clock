@@ -3384,6 +3384,10 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
             self.assertIn("this conversation has 2 one-off wakes pending already", self.cli("in", "1h", "-p", "c", "--note", "t-1", **mine) or "")
             self.assertIsNone(self.cli("in", "1h", "-p", "d", "--note", "t-1", **other))
             self.assertIsNone(self.cli("in", "1h", "-p", "e", "--note", "t-1", over_api=False), "the owner's own: the clock's cap only")
+        with mock.patch.object(wake_cli, "MAX_PENDING_API_ALL", 3):
+            third = dict(statement="stmt-c", answer={**self.verified("ada", "jonathan-barket", True), "conversation": "cv-cccccccccccc"})
+            self.assertIn("houses have 3 one-off wakes pending already", self.cli("in", "1h", "-p", "f", "--note", "t-1", **third) or "")
+            self.assertIsNone(self.cli("in", "1h", "-p", "g", "--note", "t-1", over_api=False), "the owner keeps his room")
 
     def test_a_schedule_narrowed_on_a_re_set_stays_its_conversation_s(self):
         mine_owner = dict(statement="stmt-a", answer=self.verified("ada", "jonathan-barket", True))
