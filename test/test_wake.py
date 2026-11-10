@@ -626,7 +626,27 @@ class AgentWakes(unittest.TestCase):
                     except SystemExit as e:
                         return str(e.code)
             self.assertIsNone(set_())
+            wake_cli.standing_job.reset_mock()
             self.assertIn("set already", set_() or "")
+            # Refused before approvals is asked: a refused set isn't counted as a use.
+            wake_cli.standing_job.assert_not_called()
+            self.assertEqual(len((Path(td) / "spool.jsonl").read_text().splitlines()), 1)
+            # Two at once, both past the first check: the append's own check, under the spool's lock, stops the second.
+            real_in, real_out = wake_cli.Spool.__enter__, wake_cli.Spool.__exit__
+            calls = []
+            def first_sees_nothing(sp):
+                r = real_in(sp)
+                calls.append(1)
+                if len(calls) == 1:
+                    sp.hidden, sp.entries = sp.entries, []
+                return r
+            def put_back(sp, *exc):
+                if hasattr(sp, "hidden"):
+                    sp.entries = sp.hidden
+                return real_out(sp, *exc)
+            with mock.patch.object(wake_cli.Spool, "__enter__", first_sees_nothing), \
+                 mock.patch.object(wake_cli.Spool, "__exit__", put_back):
+                self.assertIn("set already", set_() or "")
             self.assertEqual(len((Path(td) / "spool.jsonl").read_text().splitlines()), 1)
 
     def test_standing_job_asks_approvals_for_the_body_and_fails_closed(self):

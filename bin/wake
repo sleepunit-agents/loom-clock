@@ -834,20 +834,22 @@ def cmd_set(args, when):
             target = f"{AGENT}:{hashlib.sha256(args.prompt.encode()).hexdigest()[:16]}"
             # Only the household's own clock (loom's machine is its agent's): another agent's local wake runs in a house,
             # where a standing job would only make it the owner's work.
-            sid = None if getattr(args, "approval", "") or getattr(args, "park_on", "") or AGENT != LOCAL_AGENT \
-                else standing_job(target)
-            if sid:
-                # One at a time: a job the owner allows every time is set again once it has run, never piled up.
+            standing_ok = not (getattr(args, "approval", "") or getattr(args, "park_on", "")) and AGENT == LOCAL_AGENT
+            if standing_ok:
+                # One at a time: a job the owner allows every time is set again once it has run, never piled up. Before
+                # asking approvals, so a refused set isn't counted as a use (and again under the append's lock, below).
                 with Spool() as spool:
-                    already = next((e["id"] for e in spool.entries if e.get("standing") == sid), None)
+                    already = next((e["id"] for e in spool.entries if e.get("standing_target") == target), None)
                 if already:
-                    sys.exit(f"wake: this job is set already ({already}, the owner's standing job {sid}); it can be set "
+                    sys.exit(f"wake: this job is set already ({already}, under the owner's standing job); it can be set "
                              "again once that one has run")
+            sid = standing_job(target) if standing_ok else None
+            if sid:
                 # The owner's Allow every time for exactly these words, this agent and whom it's set for (t-2013): set
                 # with no card, as his work ("runs on this box as me"). The note is the clock's own, never the body's:
                 # it's read into the session's opening words, and his yes was for the words that run, not new ones.
                 log("standing-set", f"{sid} target={target} set_for={entry['for']} note={args.note!r}")
-                entry["standing"], entry["set_for"] = sid, entry["for"]
+                entry["standing"], entry["standing_target"], entry["set_for"] = sid, target, entry["for"]
                 for k in ("for_why", "for_people"):
                     entry.pop(k, None)
                 entry["for"], entry["note"] = "owner", f"standing job {sid}, allowed every time by the owner"
@@ -913,6 +915,9 @@ def cmd_set(args, when):
     with Spool() as spool:
         if sum(1 for e in spool.entries if e["kind"] in ("wake", "parked")) >= MAX_PENDING:
             sys.exit(f"wake: {AGENT} has {MAX_PENDING} one-off wakes pending already; cancel some first (wake list)")
+        if entry.get("standing_target") and any(e.get("standing_target") == entry["standing_target"] for e in spool.entries):
+            # Two sets at once both got past the check above: the second waits for the first to run.
+            sys.exit("wake: this job is set already, under the owner's standing job; it can be set again once that one has run")
         # A real wake replaces any pending dead-man.
         for dm in [e for e in spool.entries if e["kind"] == "deadman"]:
             disarm_timer(dm["id"])
