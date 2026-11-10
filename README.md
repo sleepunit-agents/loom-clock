@@ -368,18 +368,16 @@ The `alert:runtime-quota` triage wake is not retried: the runtime already leaves
 owner notice, and running another model to investigate no available model repeats
 the failure. Other alert wakes remain scheduled for their reset.
 
-Delivered firings stay in the atomic, fsynced spool until their outcome is recorded.
-The clock seals the complete delivery JSON there before principal handover or HTTP;
-recovery reuses it even when prompt files or settings have changed. A per-firing lock
-prevents concurrent fire processes. After a killed process, the service's rearm pass
-uses a fresh timer id while retaining the exact delivery and continuation wake ids.
-A transient retry atomically replaces its firing entry; a successful or permanent
-outcome removes it. This is clock transport durability; runtime outbox acceptance
-and final conversation receipts have their own separate gates.
+A continuation wake (`--continuation`, t-2004) stays in the atomic, fsynced spool while it fires, until its outcome
+is recorded. The clock seals the complete delivery JSON there before principal handover or HTTP; recovery reuses it
+even when prompt files or settings have changed. A per-firing lock prevents concurrent fire processes (locks a day
+old are pruned). After a killed process, the service's rearm pass uses a fresh timer id while keeping the exact
+delivery and continuation wake ids. A runtime answer of `failed` for a continuation wake is not retried: its report
+authority is bound to that one firing. An unexpected error drops the firing with `fire-failed` rather than re-arming it.
+Every other wake, schedule and deadman is removed before it fires (at most once), and a retry after a 5xx goes
+through its standing-job, lane and mode checks again.
 
-Continuation cutoff staging: `--continuation` obtains the immutable deadline
-from the local runtime using the authenticated issuer statement before scheduling.
-The spool and sealed firing retain that exact deadline; expired, legacy or changed
-firings are refused without delivery. This requires the companion draft core/runtime
-protocol. Production issuance remains held; native host admission and cutoff crash
-reconciliation remain shipping gates. This does not approve any lifetime policy.
+`--continuation` gets the immutable deadline from the local runtime, using the authenticated issuer statement,
+before anything is scheduled. A wake set at or past that deadline is refused, and one that fires past it is refused
+without delivery (`fire-refused`). It can't be combined with `--slot`, `--place` or `-f`. The lifetime is the
+runtime's (`LOOM_RUNTIME_CONTINUATION_DAYS`); the clock never chooses or extends it.
