@@ -243,6 +243,32 @@ class CmdRearmSurvivesAnAlreadyArmedEntry(unittest.TestCase):
         self.assertEqual(calls, ["w-first", "w-second"])
 
 
+class ReadOnlyClock(unittest.TestCase):
+    def test_lists_never_create_or_replace_files(self):
+        for populated in (False, True):
+            with self.subTest(populated=populated), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "clock"
+                spool = root / "spool.jsonl"
+                lock = root / "spool.lock"
+                if populated:
+                    root.mkdir()
+                    spool.write_text(json.dumps({"id": "w-test", "at": "2099-01-01 12:00:00",
+                                                 "kind": "wake", "schedule": "nightly"}) + "\n")
+                    lock.write_text("lock contents must survive")
+                def state():
+                    return {p.name: (p.read_bytes(), p.stat().st_ino, p.stat().st_mtime_ns)
+                            for p in root.iterdir()} if root.exists() else None
+                before = state()
+                with mock.patch.object(wake_cli, "SPOOL", spool), \
+                     mock.patch.object(wake_cli, "LOCK", lock), \
+                     mock.patch.object(wake_cli, "WAKE_DIR", root), \
+                     mock.patch.object(wake_cli, "load_schedules", return_value={}), \
+                     mock.patch.object(wake_cli.subprocess, "run"), contextlib.redirect_stdout(io.StringIO()):
+                    wake_cli.cmd_list(argparse.Namespace())
+                    wake_cli.cmd_schedule(argparse.Namespace(action="list"))
+                self.assertEqual(state(), before)
+
+
 class SpoolCommitsOnException(unittest.TestCase):
     """Spool.__exit__ must write what's in self.entries even when the body
     raises partway through: any irreversible side
