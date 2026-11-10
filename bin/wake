@@ -314,11 +314,37 @@ def caller_agent():
     return caller.get("agent") if isinstance(caller, dict) and caller.get("kind") == "agent" else None
 
 
+def caller_house():
+    """The house the piece API says this call came from (core's word, from the house's own token; t-2137, as approvals
+    does since t-2136): "-" for an agent's call from no house, None off the API (loom's machine itself), False for a
+    house id that isn't one or a houseless service's call (verify_principal then says no)."""
+    if not os.environ.get("WAKE_ORIGIN", "").strip():
+        return None
+    try:
+        caller = json.loads(os.environ.get("WAKE_CALLER") or "{}")
+    except ValueError:
+        return False
+    if not isinstance(caller, dict) or caller.get("kind") != "agent":
+        return False
+    h = caller.get("house")
+    if h is None:
+        # A service's token with no house (a bridge on loom's machine) is no body's: it never presents a statement.
+        return False if caller.get("service") is not None else "-"
+    return h if isinstance(h, str) and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", h) else False
+
+
 def verify_principal(statement):
     """The runtime's reading of a principal statement (`<cmd> --verify`, the statement on stdin): its verified fields,
-    or None when it's invalid or can't be read. The statement itself is never logged or printed: only these fields."""
+    or None when it's invalid or can't be read. The statement itself is never logged or printed: only these fields.
+    Over the piece API the runtime is told the caller's house (`--house`): a statement is a bearer word for its 5
+    minutes, so it holds only from the house running its conversation's body, never shown to another (t-2137)."""
+    house = caller_house()
+    if house is False:
+        log("principal-none", "a caller with no house loom can read: taken as unknown")
+        return None
     try:
-        r = subprocess.run([*principal_argv(), "--verify"], input=statement, capture_output=True, text=True,
+        r = subprocess.run([*principal_argv(), "--verify", *(["--house", house] if house else [])], input=statement,
+                           capture_output=True, text=True,
                            timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
         v = json.loads(r.stdout) if r.returncode == 0 else None
     except (OSError, subprocess.SubprocessError, ValueError, SystemExit) as e:  # SystemExit: WAKE_PRINCIPAL malformed
@@ -802,12 +828,16 @@ def inspect_continuation(handle, when):
         sys.exit("wake: a continuation needs its authenticated issuer statement")
     scheduled_at = int(when.timestamp() * 1000)
     reason = ""
+    # Over the piece API, the caller's house too (t-2137): the issuer's statement holds only from its body's house.
+    house = caller_house()
+    if house is False:
+        sys.exit("wake: a continuation needs its authenticated issuer statement")
     try:
         # Call the managed binary directly: `loom runtime` would dispatch it
         # with LOOM_PIECE_NAME=runtime, losing this clock's local context.
         inspect_argv = argv_setting("WAKE_PRINCIPAL", [runtime_bin(), "principal"])
         r = subprocess.run([*inspect_argv, "--inspect-continuation", handle, "--agent", AGENT,
-                            "--scheduled-at", str(scheduled_at)], input=statement, capture_output=True, text=True,
+                            "--scheduled-at", str(scheduled_at), *(["--house", house] if house else [])], input=statement, capture_output=True, text=True,
                            timeout=PRINCIPAL_TIMEOUT_S, env={k: v for k, v in os.environ.items() if k != "HOUSE_ID"})
         reason = continuation_refusal(r.stderr, handle) if r.returncode != 0 else ""
         answer = json.loads(r.stdout) if r.returncode == 0 else None

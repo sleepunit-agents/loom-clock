@@ -982,6 +982,16 @@ with mock.patch.multiple(m, WAKE_DIR=r, SPOOL=r/'spool.jsonl', LOCK=r/'spool.loc
              mock.patch.object(wake_cli.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(good))) as call:
             self.assertEqual(wake_cli.inspect_continuation(handle, when), deadline)
             self.assertEqual(call.call_args.kwargs["input"], "signed-issuer")
+            self.assertNotIn("--house", call.call_args.args[0], "the clock's own call on loom's machine: no house")
+            # t-2137: over the piece API, the caller's house goes with the issuer's statement; a bad one never asks.
+            with mock.patch.dict(os.environ, {"WAKE_ORIGIN": "agent:ada", "WAKE_CALLER": json.dumps({"kind": "agent", "agent": "ada", "house": "h-7"})}):
+                wake_cli.inspect_continuation(handle, when)
+                self.assertEqual(call.call_args.args[0][-2:], ["--house", "h-7"])
+                n = call.call_count
+                with mock.patch.dict(os.environ, {"WAKE_CALLER": json.dumps({"kind": "agent", "agent": "ada", "house": "-"})}), \
+                        self.assertRaises(SystemExit):
+                    wake_cli.inspect_continuation(handle, when)
+                self.assertEqual(call.call_count, n)
             for bad in [{**good, "expiresAt": deadline - 1}, {**good, "expiresAt": str(deadline)},
                         {**good, "handle": "other"}, {}]:
                 call.return_value.stdout = json.dumps(bad)
@@ -3288,7 +3298,8 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
     def test_a_wake_set_over_the_api_is_for_whom_its_verified_statement_says(self):
         self.assertEqual(self.set_for(statement="stmt-owner", answer=self.verified("ada", "jonathan-barket", True)), "owner")
         (call,) = self.calls()
-        self.assertEqual((call["argv"], call["stdin"]), (["--verify"], "stmt-owner"), "the statement goes on stdin")
+        self.assertEqual((call["argv"], call["stdin"]), (["--verify", "--house", "-"], "stmt-owner"),
+                         "the statement goes on stdin, with the caller's house (none: -)")
         self.assertEqual(self.set_for(statement="stmt-loren", answer=self.verified("ada", "loren")), "loren")
         # Another agent's statement, a missing one, a verifier that fails or says no, or a slug that isn't one: unknown.
         self.assertEqual(self.set_for(statement="stmt-bo", answer=self.verified("bo", "loren", True)), "-")
@@ -3304,6 +3315,29 @@ sys.exit(int(os.environ.get("PRINCIPAL_EXIT", "0")))
         # The statement itself is never written down: only what it verified to.
         logged = wake_cli.LOG.read_text() + wake_cli.SPOOL.read_text()
         self.assertNotIn("stmt-", logged)
+
+    def test_over_the_api_the_runtime_is_told_the_caller_s_house(self):
+        # t-2137: a statement holds only from the house running its conversation's body, so the runtime is told the
+        # caller's house (core's word, from its token, as approvals does since t-2136), never one the body typed.
+        def from_house(house, **kw):
+            with mock.patch.object(self, "ADA", {**self.ADA, "house": house}):
+                return self.set_for(**kw)
+        self.assertEqual(from_house("h-7", statement="stmt-owner", answer=self.verified("ada", "jonathan-barket", True)), "owner")
+        self.assertEqual(self.calls()[-1]["argv"], ["--verify", "--house", "h-7"])
+        # The runtime's no (its body isn't in that house): unknown.
+        self.assertEqual(from_house("h-8", statement="stmt-owner", answer={"ok": False}, exit_code=1), "-")
+        self.assertEqual(self.calls()[-1]["argv"], ["--verify", "--house", "h-8"])
+        # A house id that isn't one, or one named "-": unknown, and never handed on as if from no house.
+        n = len(self.calls())
+        for bad in ("h-7 --x", "-", "", 7):
+            self.assertEqual(from_house(bad, statement="stmt-owner", answer=self.verified("ada", "jonathan-barket", True)), "-", bad)
+        self.assertEqual(len(self.calls()), n)
+        # A service's houseless token (a bridge on loom's machine) is no body's: unknown, never asked as from no house.
+        with mock.patch.object(self, "ADA", {**self.ADA, "service": "slack"}):
+            self.assertEqual(self.set_for(statement="stmt-owner", answer=self.verified("ada", "jonathan-barket", True)), "-")
+        self.assertEqual(len(self.calls()), n)
+        # A local body on loom's machine (no API caller): no --house.
+        self.assertIsNone(wake_cli.caller_house())
 
     def test_a_park_is_for_whom_its_body_works_too(self):
         with mock.patch.object(wake_cli, "approval_card", return_value=None):
