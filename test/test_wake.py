@@ -627,6 +627,13 @@ class AgentWakes(unittest.TestCase):
             err, entries = self.set_(["in", "1h", "-p", words, "--note", "t-9", "--continuation", "cont-" + "e" * 64])
         self.assertIn("can't ride a standing job", err or "")
         self.assertFalse(any(e.get("continuation") for e in entries))
+        # Nor an approval, refused before it's spent.
+        with mock.patch.object(wake_cli, "spend_approval") as spend, \
+             mock.patch.object(wake_cli, "principal_for", return_value="-"), \
+             mock.patch.object(wake_cli, "inspect_continuation", return_value=9999999999999):
+            err, _ = self.set_(["in", "1m", "--approval", "a-0000aaaa", "-p", words, "--note", "t-9", "--continuation", "cont-" + "e" * 64])
+        self.assertIn("can't ride", err or "")
+        spend.assert_not_called()
 
     def test_a_standing_job_is_set_once_at_a_time(self):
         words = "rotate the backups <!-- house: local -->"
