@@ -13,7 +13,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "python3 test/test_wake.py && sh test/smoke.sh"
+    "test": "python3 test/test_wake.py && python3 test/test_watch_parks.py && sh test/smoke.sh"
   },
   "license": "AGPL-3.0-or-later",
   "loom": {

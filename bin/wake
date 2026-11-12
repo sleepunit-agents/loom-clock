@@ -244,7 +244,7 @@ FIRE_CONF = CLOCKS / "fire"
 # A remote caller's -f must name a lane file in the repo, never a path on
 # loom's machine at large: what -f names becomes a house's task.
 PROMPT_ROOTS = tuple(REPO / d for d in LANE_DIRS)
-REMOTE_VERBS = {"at", "in", "park", "list", "cancel", "log", "schedule", "relay", "relays", "lane", "ask-vouch"}
+REMOTE_VERBS = {"at", "in", "park", "list", "cancel", "log", "schedule", "relay", "relays", "lane", "ask-vouch", "watch"}
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 # The environment a timer's `wake fire` needs to find this clock and its tools again: the
 # transient unit starts from the user manager's environment, not ours.
@@ -459,7 +459,7 @@ def not_yours(what, does):
 MAX_SCHEDULES_API = 20
 
 
-def pending_full(entries, kinds=("wake", "parked")):
+def pending_full(entries, kinds=("wake", "parked", "watch-park")):
     """Why one more one-off wake can't be set, or None: the clock's own cap, and over the piece API, one
     conversation's share of it (by the runtime's word; a body it can't name shares one share with every such body)."""
     pending = [e for e in entries if e["kind"] in kinds]
@@ -1111,8 +1111,190 @@ def cmd_set(args, when):
         print(f"{entry['id']} will wake at {entry['at']}")
 
 
+# Watch-set parking: the role's reservation lives in the fsynced spool, including
+# the exact delivery, before any external side effect. No observation is consumed
+# until a body presents the unguessable token it was shown.
+WATCH_HEARTBEAT = timedelta(hours=12)
+WATCH_STALE = timedelta(hours=3)
+
+
+def watch_targets(values):
+    out = []
+    for value in values:
+        m = re.fullmatch(r"watch:([a-z][a-z0-9-]*\.[a-z][a-z0-9-]*):([^\x00-\x1f]{1,300})", value)
+        if not m:
+            sys.exit("wake: use only watch:<kind>:<id> targets in a watch set")
+        target = {"kind": m[1], "id": m[2]}
+        if target not in out:
+            out.append(target)
+    if not 1 <= len(out) <= 20:
+        sys.exit("wake: a watch set has 1-20 distinct targets")
+    return out
+
+
+def watch_key(target):
+    return json.dumps([target["kind"], target["id"]], separators=(",", ":"))
+
+
+def read_watch_set(entry):
+    """One fresh read of core's registry; never probe a producer a second way."""
+    tf = setting("WAKE_DELIVER_TOKEN_FILE")
+    if not tf:
+        raise ValueError("WAKE_DELIVER_TOKEN_FILE is required for watch reads")
+    token = Path(tf).expanduser().read_text().strip()
+    body = {"agent": AGENT, "principal": entry_for(entry), "targets": entry["targets"]}
+    req = urllib.request.Request(f"{loom_api()}/api/loom/watches/observe", data=json.dumps(body).encode(),
+                                 headers={"content-type": "application/json", "authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(req, timeout=30) as response:
+        result = json.loads(response.read(256 * 1024))
+    rows = result.get("observations")
+    if not isinstance(rows, list) or len(rows) != len(entry["targets"]):
+        raise ValueError("invalid watch registry response")
+    observations, errors = {}, []
+    for target, row in zip(entry["targets"], rows):
+        if not isinstance(row, dict) or any(row.get(k) != target[k] for k in ("kind", "id")):
+            raise ValueError("watch registry target mismatch")
+        if row.get("error"):
+            errors.append(target)
+        elif not isinstance(row.get("identity"), str) or not isinstance(row.get("value"), str):
+            raise ValueError("invalid watch observation")
+        else:
+            observations[watch_key(target)] = {"identity": row["identity"], "value": row["value"]}
+    return observations, errors
+
+
+def probe_watch_set(entry):
+    try:
+        return read_watch_set(entry)
+    except (OSError, ValueError, urllib.error.URLError):
+        # No transport or provider error can masquerade as an observation.
+        return {}, list(entry["targets"])
+
+
+def cmd_watch_park(args):
+    if not SLOT_NAME.fullmatch(args.role or ""):
+        sys.exit("wake: watch parking needs --role <lowercase-name>")
+    if not args.prompt or not args.note.strip() or len(args.prompt) > 12000 or HOUSE_LOCAL in args.prompt:
+        sys.exit("wake: watch parking needs a house prompt up to 12000 characters and a note")
+    if args.slot:
+        sys.exit("wake: watch parking uses a role, not --slot")
+    targets = watch_targets(args.park_on)
+    entry = {"id": "w-" + secrets.token_hex(3), "kind": "watch-park", "role": args.role,
+             "targets": targets, "prompt": args.prompt, "note": args.note, "model": args.model,
+             "at": (datetime.now() + PARK_CHECK).strftime(TIME_FMT), "created": datetime.now().strftime(TIME_FMT)}
+    origin = os.environ.get("WAKE_ORIGIN", "").strip()
+    if origin:
+        entry["origin"] = origin
+    stamp_for(entry)
+    if entry_for(entry) == "-":
+        sys.exit("wake: watch parking needs a verified principal")
+    with Spool() as spool:
+        old = next((e for e in spool.entries if e.get("kind") == "watch-park" and e.get("role") == args.role), None)
+        if old:
+            if entry_for(old) != entry_for(entry):
+                sys.exit("wake: this role belongs to another principal")
+            # Update the watch set but retain the frozen pending batch and its
+            # exact prompt. Re-adding during that batch keeps its old baseline.
+            prior = {**(old.get("pending") or {}).get("baseline", {}), **old.get("baseline", {})}
+            entry["baseline"] = {watch_key(t): prior[watch_key(t)] for t in targets if watch_key(t) in prior}
+            entry["heartbeat"] = old["heartbeat"]
+            if old.get("pending"):
+                entry["pending"] = old["pending"]
+            disarm_timer(old["id"])
+            spool.entries.remove(old)
+        else:
+            full = pending_full(spool.entries)
+            if full:
+                sys.exit(full)
+            entry["baseline"], entry["errors"] = probe_watch_set(entry)
+            entry["heartbeat"] = datetime.now().strftime(TIME_FMT)
+        spool.entries.append(entry)
+        arm_timer(entry)
+    print(f"{entry['id']} watches {len(targets)} targets for {args.role}; heartbeat after 12h. End this session.")
+
+
+def cmd_watch_finish(args):
+    with Spool() as spool:
+        entry = next((e for e in spool.entries if e.get("kind") == "watch-park"
+                      and (e.get("pending") or {}).get("token") == args.token), None)
+        if not entry:
+            sys.exit("wake: no reserved watch batch with that token")
+        if entry_for(entry) != principal_for():
+            sys.exit("wake: this role belongs to another principal")
+        pending = entry["pending"]
+        if args.action == "finish":
+            for key, shown in pending["shown"].items():
+                if key in {watch_key(t) for t in entry["targets"]}:
+                    entry["baseline"][key] = shown
+            if pending["heartbeat"]:
+                entry["heartbeat"] = datetime.now().strftime(TIME_FMT)
+        del entry["pending"]
+    print("watch batch finished" if args.action == "finish" else "watch batch released")
+
+
+def fire_watch_set(wid):
+    # The spool lock serializes role updates, finish and simultaneous timers.
+    # A crash after reservation leaves the role stuck and periodically alerting,
+    # never acknowledged or blindly dispatched twice.
+    body, stale_alert = None, None
+    with Spool() as spool:
+        entry = next((e for e in spool.entries if e["id"] == wid and e.get("kind") == "watch-park"), None)
+        if not entry:
+            return
+        at = datetime.now()
+        pending = entry.get("pending")
+        if not paused():
+            if pending:
+                stale = at - datetime.strptime(pending["at"], TIME_FMT) >= WATCH_STALE
+                last = pending.get("alerted")
+                if stale and (not last or at - datetime.strptime(last, TIME_FMT) >= WATCH_STALE):
+                    stale_alert = f"wake: watch role {entry['role']} is still reserved; finish or release its batch"
+                    pending["alerted"] = at.strftime(TIME_FMT)
+            else:
+                observed, errors = probe_watch_set(entry)
+                entry["errors"] = errors
+                shown = {k: v for k, v in observed.items() if entry["baseline"].get(k) != v}
+                heartbeat = at - datetime.strptime(entry["heartbeat"], TIME_FMT) >= WATCH_HEARTBEAT
+                if shown or heartbeat:
+                    token = secrets.token_hex(32)
+                    batch = {"token": token, "at": at.strftime(TIME_FMT), "baseline": dict(entry["baseline"]),
+                             "shown": shown, "heartbeat": heartbeat, "errors": errors}
+                    text = entry["prompt"] + "\n\nWatch batch (acknowledge only after completing this work):\n" + json.dumps(batch)
+                    text += f"\nFinish: wake watch finish {token}\nIf this body cannot finish, leave the reservation; do not acknowledge it."
+                    body = {"id": "watch-" + token, "agent": AGENT, "venue": "wake", "place": f"wake:watch-{token}",
+                            "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
+                            "at": at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text}
+                    # Refuse truncation: the acknowledgement must cover exactly what the body sees.
+                    if len(text) > DELIVER_TEXT_MAX:
+                        entry["errors"] = list(entry["targets"])
+                        body = None
+                    else:
+                        batch["delivery"] = body
+                        entry["pending"] = batch
+        # Fresh timer id: the current transient timer is still loaded.
+        entry["id"] = "w-" + secrets.token_hex(3)
+        entry["at"] = (at + PARK_CHECK).strftime(TIME_FMT)
+        arm_timer(entry)
+        principal, origin = entry_for(entry), entry.get("for_in")
+    if stale_alert:
+        alert(stale_alert)  # outside the spool lock: an alert may itself set a wake
+    if body:
+        hand_over_principal(AGENT, body["place"], body["id"], principal, origin=origin)
+        status, answer = post_delivery(body)
+        # A refusal, outage or ambiguous timeout stays reserved. The normal
+        # retry path must not create a second role wake or consume its batch.
+        log("watch-dispatch", f"watch role dispatch status={status} body={answer.get('body', 'unknown')}; reserved until finish/release")
+
+
 def cmd_park(args):
     """Park on a request (a secret's q-…, an approval's a-…): the continuation wakes on the answer."""
+    values = args.park_on if isinstance(args.park_on, list) else [args.park_on]
+    if any(v.startswith("watch:") for v in values):
+        args.park_on = values
+        return cmd_watch_park(args)
+    if len(values) != 1 or getattr(args, "role", ""):
+        sys.exit("wake: request parking takes one request and no --role")
+    args.park_on = values[0]
     if not PARK_ON.match(args.park_on or ""):
         sys.exit("wake: park on a secret request (q-…) or an approval (a-…), by its id")
     cmd_set(args, datetime.now() + PARK_CHECK)
@@ -1937,6 +2119,9 @@ def household_agents():
 
 
 def cmd_cancel(args):
+    if any(e["id"] == args.id and e.get("kind") == "watch-park" for e in read_spool()):
+        fire_watch_set(args.id)
+        return
     with Spool() as spool:
         match = [e for e in spool.entries if e["id"] == args.id]
         if not match:
@@ -2627,6 +2812,9 @@ def _cmd_fire(args):
                     e["at"] = (datetime.now() + timedelta(hours=1)).strftime(TIME_FMT)
                     arm_timer(e)
                     log("fire-standby", f"{old_id} not prime — deferred as {e['id']} at {e['at']}")
+        return
+    if any(e["id"] == args.id and e.get("kind") == "watch-park" for e in read_spool()):
+        fire_watch_set(args.id)
         return
     with Spool() as spool:
         match = [e for e in spool.entries if e["id"] == args.id]
@@ -4309,12 +4497,17 @@ def main():
     add_set("at", "wake at a clock time", parse_at)
     add_set("in", "wake after a duration", parse_in)
     p = sub.add_parser("park", help="blocked on the owner's answer (q-… or a-…): wake when they answer, then end", allow_abbrev=False)
-    p.add_argument("--on", dest="park_on", required=True, help="the request's id: a secret's q-…, an approval's a-…")
+    p.add_argument("--role", default="", help="role name for watch-set parking")
+    p.add_argument("--on", dest="park_on", required=True, action="append", help="the request's id: a secret's q-…, an approval's a-…")
     p.add_argument("-p", "--prompt", required=True, help="what to do next, told what they answered")
     p.add_argument("--note", default="")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--slot", default="")
     p.set_defaults(fn=cmd_park, prompt_file=None, approval="")
+    p = sub.add_parser("watch", help="acknowledge or release a reserved watch batch", allow_abbrev=False)
+    p.add_argument("action", choices=["finish", "release"])
+    p.add_argument("token")
+    p.set_defaults(fn=cmd_watch_finish)
     sub.add_parser("list", help="show pending wakes").set_defaults(fn=cmd_list)
     p = sub.add_parser("log", help="the clock's record since a while ago", allow_abbrev=False)
     p.add_argument("--since", default="24h")
