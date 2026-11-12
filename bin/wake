@@ -1122,7 +1122,7 @@ def watch_targets(values):
     out = []
     for value in values:
         m = re.fullmatch(r"watch:([a-z][a-z0-9-]*\.[a-z][a-z0-9-]*):([^\x00-\x1f]{1,300})", value)
-        if not m:
+        if not m or len(m[1]) > 80:
             sys.exit("wake: use only watch:<kind>:<id> targets in a watch set")
         target = {"kind": m[1], "id": m[2]}
         if target not in out:
@@ -1150,10 +1150,18 @@ def read_watch_set(entry):
     rows = result.get("observations")
     if not isinstance(rows, list) or len(rows) != len(entry["targets"]):
         raise ValueError("invalid watch registry response")
-    observations, errors = {}, []
-    for target, row in zip(entry["targets"], rows):
-        if not isinstance(row, dict) or any(row.get(k) != target[k] for k in ("kind", "id")):
+    expected = {watch_key(target) for target in entry["targets"]}
+    by_target = {}
+    for row in rows:
+        if not isinstance(row, dict) or not all(isinstance(row.get(k), str) for k in ("kind", "id")):
             raise ValueError("watch registry target mismatch")
+        key = watch_key(row)
+        if key not in expected or key in by_target:
+            raise ValueError("watch registry target mismatch")
+        by_target[key] = row
+    observations, errors = {}, []
+    for target in entry["targets"]:
+        row = by_target[watch_key(target)]
         if row.get("error"):
             errors.append(target)
         elif not isinstance(row.get("identity"), str) or not isinstance(row.get("value"), str):
@@ -1165,7 +1173,16 @@ def read_watch_set(entry):
 
 def probe_watch_set(entry):
     try:
-        return read_watch_set(entry)
+        observed, errors = read_watch_set(entry)
+        # Large normalized observations are represented by stable fingerprints,
+        # just as report-backed lane observations use a report hash. This keeps
+        # both persisted baselines and heartbeat batches bounded.
+        for value in observed.values():
+            for field in ("identity", "value"):
+                if len(value[field]) > 512:
+                    value[field] = "sha256:" + hashlib.sha256(value[field].encode()).hexdigest()
+                    value[field + "_sha256"] = True  # distinguish a literal hash-looking source value
+        return observed, errors
     except (OSError, ValueError, urllib.error.URLError):
         # No transport or provider error can masquerade as an observation.
         return {}, list(entry["targets"])
@@ -1174,8 +1191,8 @@ def probe_watch_set(entry):
 def cmd_watch_park(args):
     if not SLOT_NAME.fullmatch(args.role or ""):
         sys.exit("wake: watch parking needs --role <lowercase-name>")
-    if not args.prompt or not args.note.strip() or len(args.prompt) > 12000 or HOUSE_LOCAL in args.prompt:
-        sys.exit("wake: watch parking needs a house prompt up to 12000 characters and a note")
+    if not args.prompt or not args.note.strip() or len(args.prompt) > 8000 or HOUSE_LOCAL in args.prompt:
+        sys.exit("wake: watch parking needs a house prompt up to 8000 characters and a note")
     if args.slot:
         sys.exit("wake: watch parking uses a role, not --slot")
     targets = watch_targets(args.park_on)
@@ -1193,12 +1210,31 @@ def cmd_watch_park(args):
         if old:
             if entry_for(old) != entry_for(entry):
                 sys.exit("wake: this role belongs to another principal")
+            full = pending_full([e for e in spool.entries if e is not old])
+            if full:
+                sys.exit(full)
             # Update the watch set but retain the frozen pending batch and its
             # exact prompt. Re-adding during that batch keeps its old baseline.
-            prior = {**(old.get("pending") or {}).get("baseline", {}), **old.get("baseline", {})}
+            history = dict(old.get("retained", {})) if old.get("pending") else {}
+            for target in old["targets"] + (old.get("pending") or {}).get("targets", []):
+                key = watch_key(target)
+                history.setdefault(key, old.get("baseline", {}).get(key))
+            if old.get("pending") and len(set(history) | {watch_key(t) for t in targets}) > 100:
+                sys.exit("wake: a reserved role retains at most 100 targets; finish or release its batch before adding more")
+            prior = {**(old.get("pending") or {}).get("baseline", {}),
+                     **{k: v for k, v in history.items() if v is not None}, **old.get("baseline", {})}
             entry["baseline"] = {watch_key(t): prior[watch_key(t)] for t in targets if watch_key(t) in prior}
+            known = set(history)
+            initial, entry["errors"] = probe_watch_set(entry)
+            for key, value in initial.items():
+                if key not in known:
+                    entry["baseline"][key] = value
             entry["heartbeat"] = old["heartbeat"]
             if old.get("pending"):
+                for target in targets:
+                    key = watch_key(target)
+                    history.setdefault(key, entry["baseline"].get(key))
+                entry["retained"] = history
                 entry["pending"] = old["pending"]
             disarm_timer(old["id"])
             spool.entries.remove(old)
@@ -1208,6 +1244,9 @@ def cmd_watch_park(args):
                 sys.exit(full)
             entry["baseline"], entry["errors"] = probe_watch_set(entry)
             entry["heartbeat"] = datetime.now().strftime(TIME_FMT)
+        for deadman in [e for e in spool.entries if e.get("kind") == "deadman"]:
+            disarm_timer(deadman["id"])
+            spool.entries.remove(deadman)
         spool.entries.append(entry)
         arm_timer(entry)
     print(f"{entry['id']} watches {len(targets)} targets for {args.role}; heartbeat after 12h. End this session.")
@@ -1229,6 +1268,7 @@ def cmd_watch_finish(args):
             if pending["heartbeat"]:
                 entry["heartbeat"] = datetime.now().strftime(TIME_FMT)
         del entry["pending"]
+        entry.pop("retained", None)
     print("watch batch finished" if args.action == "finish" else "watch batch released")
 
 
@@ -1258,19 +1298,25 @@ def fire_watch_set(wid):
                 if shown or heartbeat:
                     token = secrets.token_hex(32)
                     batch = {"token": token, "at": at.strftime(TIME_FMT), "baseline": dict(entry["baseline"]),
-                             "shown": shown, "heartbeat": heartbeat, "errors": errors}
-                    text = entry["prompt"] + "\n\nWatch batch (acknowledge only after completing this work):\n" + json.dumps(batch)
+                             "shown": shown, "targets": list(entry["targets"]), "heartbeat": heartbeat, "errors": errors}
+                    display = {k: v for k, v in batch.items() if k != "baseline"}
+                    text = entry["prompt"] + "\n\nWatch batch (acknowledge only after completing this work):\n" + json.dumps(display)
                     text += f"\nFinish: wake watch finish {token}\nIf this body cannot finish, leave the reservation; do not acknowledge it."
-                    body = {"id": "watch-" + token, "agent": AGENT, "venue": "wake", "place": f"wake:watch-{token}",
+                    dispatch_id = secrets.token_hex(16)  # public bookkeeping, never the acknowledgement capability
+                    body = {"id": "watch-" + dispatch_id, "agent": AGENT, "venue": "wake", "place": f"wake:watch-{dispatch_id}",
                             "label": wake_label(entry), "from": {"kind": "schedule"}, "kind": "wake",
                             "at": at.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"), "text": text}
-                    # Refuse truncation: the acknowledgement must cover exactly what the body sees.
-                    if len(text) > DELIVER_TEXT_MAX:
-                        entry["errors"] = list(entry["targets"])
-                        body = None
-                    else:
-                        batch["delivery"] = body
-                        entry["pending"] = batch
+                    # No truncation and no silently suppressed heartbeat. The
+                    # bounded fallback shows the same snapshot as fingerprints.
+                    if len(text.encode("utf-16-le")) // 2 > DELIVER_TEXT_MAX:
+                        compact = {"token": token, "at": batch["at"], "heartbeat": heartbeat,
+                                   "targets": entry["targets"],
+                                   "shown": [{"target_sha256": hashlib.sha256(k.encode()).hexdigest(),
+                                              "observation_sha256": hashlib.sha256(json.dumps(v, sort_keys=True).encode()).hexdigest()} for k, v in shown.items()],
+                                   "errors": [hashlib.sha256(watch_key(t).encode()).hexdigest() for t in errors]}
+                        body["text"] = entry["prompt"] + "\nWatch batch as SHA256 fingerprints of the frozen observations (target keys are JSON [kind,id]):\n" + json.dumps(compact, ensure_ascii=False) + f"\nFinish after work: wake watch finish {token}"
+                    batch["delivery"] = body
+                    entry["pending"] = batch
         # Fresh timer id: the current transient timer is still loaded.
         entry["id"] = "w-" + secrets.token_hex(3)
         entry["at"] = (at + PARK_CHECK).strftime(TIME_FMT)
@@ -2119,15 +2165,17 @@ def household_agents():
 
 
 def cmd_cancel(args):
-    if any(e["id"] == args.id and e.get("kind") == "watch-park" for e in read_spool()):
-        fire_watch_set(args.id)
-        return
     with Spool() as spool:
         match = [e for e in spool.entries if e["id"] == args.id]
         if not match:
             sys.exit(f"wake: no spool entry {args.id}")
         if not api_may_change(match[0]):
             sys.exit(not_yours(args.id, "cancels"))
+        if match[0].get("kind") == "watch-park":
+            if entry_for(match[0]) != principal_for():
+                sys.exit("wake: this role belongs to another principal")
+            if match[0].get("pending"):
+                sys.exit("wake: a reserved role cannot be cancelled; finish its batch, or release only after its body is dead")
         spool.entries.remove(match[0])
         disarm_timer(args.id)
         # Cancelling one occurrence of a schedule skips just that one.
@@ -3398,9 +3446,11 @@ def api_answer(request, run):
     if request.get("path") != "run":
         return refuse(404, "the one call is run")
     argv = (request.get("body") or {}).get("argv")
-    if not isinstance(argv, list) or not 1 <= len(argv) <= 32 or \
+    is_park = isinstance(argv, list) and (argv[:1] == ["park"] or (len(argv) > 2 and argv[0] == "--agent" and argv[2] == "park"))
+    limit = 64 if is_park else 32
+    if not isinstance(argv, list) or not 1 <= len(argv) <= limit or \
             not all(isinstance(a, str) and len(a) <= 64 * 1024 and "\0" not in a for a in argv):
-        return refuse(400, "argv is a list of 1 to 32 plain strings")
+        return refuse(400, f"argv is a list of 1 to {limit} plain strings")
     # Whose clock: an agent's own, always; the owner may name any agent's.
     if caller.get("kind") == "agent":
         if "--agent" in argv or any(a.startswith("--agent=") for a in argv):

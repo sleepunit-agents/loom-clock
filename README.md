@@ -402,3 +402,44 @@ through its standing-job, lane and mode checks again.
 before anything is scheduled. A wake set at or past that deadline is refused, and one that fires past it is refused
 without delivery (`fire-refused`). It can't be combined with `--slot`, `--place` or `-f`. The lifetime is the
 runtime's (`LOOM_RUNTIME_CONTINUATION_DAYS`); the clock never chooses or extends it.
+
+### Watch sets (draft; requires core's watches/observe endpoint)
+
+`wake park --role coordinate --on watch:tasks.task:t-123 --on watch:runtime.lane:cv-123 -p 'Do the work' --note 'Coordinate work'`
+keeps one watch-set reservation per agent and role in the atomic spool. New
+watches start at their current baseline; a failed initial read has no baseline.
+Checks run without a body every five minutes, through core's existing registry,
+using the clock credential and the verified wake principal. Unknown principals
+are refused. Different principals cannot replace or finish each other's roles.
+Only a house prompt is supported; this does not authorize local execution.
+
+A change or a 12-hour heartbeat reserves a batch before delivery. The body sees
+its frozen changes, errors and acknowledgement token; after completing the work
+it calls `wake watch finish TOKEN`. Finish acknowledges exactly the shown
+observations for targets still watched. A later change (including a flip back)
+therefore triggers the next check. Replacing the set during a reservation retains
+the frozen batch and the acknowledged baselines for any re-added targets.
+`wake watch release TOKEN` releases without acknowledging anything; use it only
+when the original body is known to be dead. A reserved role cannot be cancelled.
+Replacement must fit the resulting conversation's quota. During one reservation,
+all encountered targets retain their baselines (including absent baselines), up
+to 100; a further new target is refused until finish/release, never evicted. Large observation values
+are stable SHA256 fingerprints; an oversized display uses fingerprints of the
+frozen snapshot plus its targets, so even an error heartbeat remains deliverable.
+Acknowledgement always applies that shown snapshot, never a new read.
+
+A reserved batch blocks further role dispatch even if delivery fails or times
+out. After three hours it alerts, again every three hours until finished or
+released. No automatic retry can turn an ambiguous delivery into two role bodies.
+Reservations and exact delivery bytes survive reboot in the fsynced spool.
+A pause or standby prevents dispatch. Other roles and ordinary wakes still run.
+
+Missing targets, unavailable sources and transient computing states are errors,
+never observations. The current registry's bounded page reports cannot establish
+terminal states by disappearance. Until authoritative per-target providers arrive,
+these watches remain errors and the heartbeat offers them for investigation.
+GitHub sources and complete membership are not implemented by this draft; step 2
+remains incomplete until authoritative observations (including closed/merged
+targets) are provided through the registry. Step 3 adds piece manifest declarations,
+manifest validation and source permissions. Do not retire the
+coordinator stopgap until those sources and end-to-end delivery have been verified.
